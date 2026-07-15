@@ -1,0 +1,4 @@
+interface:
+  display_name: "TREC Terminal Audit"
+  short_description: "Record every command in one conversation-scoped cast"
+  default_prompt: "Use $trec-terminal-audit to record every external command in one auditable cast for this conversation."

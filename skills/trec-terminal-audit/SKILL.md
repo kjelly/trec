@@ -1,9 +1,9 @@
 ---
-name: trec-audit
+name: trec-terminal-audit
 description: Record every external command, terminal input, and terminal output in one identifiable trec asciicast per conversation. Use for any task that may run shell commands, scripts, tests, builds, formatters, package managers, version-control commands, or CLI-based external services and must remain auditable.
 ---
 
-# TREC Audit
+# TREC Terminal Audit
 
 Run one persistent shell under `trec` for the whole conversation. Send every external
 command to that shell. Treat an unrecorded command as an audit failure.
