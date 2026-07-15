@@ -60,15 +60,16 @@ func promptCommand() []string {
 func topUsage() {
 	fmt.Fprintf(os.Stderr, `Usage:
   %s [record-options] [-- command [args...]]   Record a terminal session
+  %s drive -script s.txt [options] -- cmd ...  Drive a TUI from a keystroke script and record it
   %s play [play-options] <file.cast>           Play back a recording
   %s transcript <file.cast>                    Print a clean, agent-readable transcript
   %s annotate <file.cast> --import notes.json  Add markers to a recording
 
-Run '%s play --help', '%s transcript --help', or '%s annotate --help' for
-subcommand options.
+Run '%s drive --help', '%s play --help', '%s transcript --help', or
+'%s annotate --help' for subcommand options.
 
 Record options:
-`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 	pflag.PrintDefaults()
 	fmt.Fprintln(os.Stderr, "\nOutput is asciicast v2 format (also playable with: asciinema play <file>).")
 }
@@ -84,6 +85,9 @@ func main() {
 			return
 		case "annotate":
 			runAnnotate(os.Args[2:])
+			return
+		case "drive":
+			runDrive(os.Args[2:])
 			return
 		}
 	}
