@@ -8,7 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/spf13/pflag"
+	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
 
@@ -418,49 +418,42 @@ func fmtDur(sec float64) string {
 	return fmt.Sprintf("%d:%02d", t/60, t%60)
 }
 
-func runPlay(args []string) {
-	flags := pflag.NewFlagSet("play", pflag.ExitOnError)
-	speed := flags.Float64P("speed", "s", 1.0, "initial playback speed multiplier (e.g. 2.0 = double speed)")
-	idleLimit := flags.Float64P("idle-time-limit", "i", 5.0, "cap idle gaps between events to N seconds (0 = no cap)")
-	loop := flags.BoolP("loop", "l", false, "loop playback continuously")
-	tui := flags.Bool("tui", false, "enable interactive playback controls")
-	smartSpeed := flags.Bool("smart-speed", false, "adapt pauses to output size and cap long waits")
-	pauseOnMarker := flags.Bool("pause-on-marker", false, "automatically pause playback when a marker is reached")
-	forceSize := flags.Bool("force-size", false, "play even when the terminal is smaller than the recording (may corrupt TUI layout)")
-	flags.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: trec play [options] <file.cast>")
-		fmt.Fprintln(os.Stderr, "\nOptions:")
-		flags.PrintDefaults()
-		fmt.Fprintln(os.Stderr, `
-With --tui:
-  space          pause / resume
-  → . l          step forward one frame (pauses)
-  ← , h          step back one frame (pauses)
-  ↑ + = ]        speed up (×2, max 16)
-  ↓ - _ [        slow down (÷2, min 0.125)
-  n / N          jump to next / previous marker
-  g 0            restart from the beginning
-  q Ctrl-C       quit`)
-	}
-	flags.Parse(args)
+func newPlayCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "play <file.cast>", Short: "Play back a recording", Args: cobra.ExactArgs(1), Run: runPlay}
+	cmd.Flags().Float64P("speed", "s", 1.0, "initial playback speed multiplier (e.g. 2.0 = double speed)")
+	cmd.Flags().Float64P("idle-time-limit", "i", 5.0, "cap idle gaps between events to N seconds (0 = no cap)")
+	cmd.Flags().BoolP("loop", "l", false, "loop playback continuously")
+	cmd.Flags().Bool("tui", false, "enable interactive playback controls")
+	cmd.Flags().Bool("smart-speed", false, "adapt pauses to output size and cap long waits")
+	cmd.Flags().Bool("pause-on-marker", false, "automatically pause playback when a marker is reached")
+	cmd.Flags().Bool("force-size", false, "play even when the terminal is smaller than the recording (may corrupt TUI layout)")
+	return cmd
+}
 
-	files := flags.Args()
+func runPlay(cmd *cobra.Command, files []string) {
+	speed, _ := cmd.Flags().GetFloat64("speed")
+	idleLimit, _ := cmd.Flags().GetFloat64("idle-time-limit")
+	loop, _ := cmd.Flags().GetBool("loop")
+	tui, _ := cmd.Flags().GetBool("tui")
+	smartSpeed, _ := cmd.Flags().GetBool("smart-speed")
+	pauseOnMarker, _ := cmd.Flags().GetBool("pause-on-marker")
+	forceSize, _ := cmd.Flags().GetBool("force-size")
 	if len(files) == 0 {
-		flags.Usage()
+		cmd.Usage()
 		os.Exit(1)
 	}
 
-	if *pauseOnMarker && !*tui {
+	if pauseOnMarker && !tui {
 		fmt.Fprintln(os.Stderr, "trec play: --pause-on-marker requires --tui")
 		os.Exit(1)
 	}
 
 	var old *term.State
-	if *tui && !term.IsTerminal(int(os.Stdin.Fd())) {
+	if tui && !term.IsTerminal(int(os.Stdin.Fd())) {
 		fmt.Fprintln(os.Stderr, "trec play: stdin must be an interactive terminal")
 		os.Exit(1)
 	}
-	if *tui {
+	if tui {
 		var err error
 		old, err = term.MakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
@@ -470,18 +463,18 @@ With --tui:
 		defer term.Restore(int(os.Stdin.Fd()), old)
 	}
 
-	if *speed < minSpeed {
-		*speed = minSpeed
+	if speed < minSpeed {
+		speed = minSpeed
 	}
-	if *speed > maxSpeed {
-		*speed = maxSpeed
+	if speed > maxSpeed {
+		speed = maxSpeed
 	}
-	p := newPlayer(*speed, *idleLimit)
-	p.pauseOnMarker = *pauseOnMarker
-	p.loop = *loop
-	p.forceSize = *forceSize
-	p.tui = *tui
-	p.smartSpeed = *smartSpeed
+	p := newPlayer(speed, idleLimit)
+	p.pauseOnMarker = pauseOnMarker
+	p.loop = loop
+	p.forceSize = forceSize
+	p.tui = tui
+	p.smartSpeed = smartSpeed
 
 	if p.tui {
 		go p.readKeys()
@@ -501,7 +494,7 @@ With --tui:
 			goto done
 		default:
 		}
-		if !*loop {
+		if !loop {
 			break
 		}
 	}

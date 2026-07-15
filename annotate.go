@@ -6,7 +6,7 @@ import (
 	"os"
 	"sort"
 
-	"github.com/spf13/pflag"
+	"github.com/spf13/cobra"
 )
 
 // markerImport is one entry of the JSON array accepted by --import.
@@ -19,23 +19,20 @@ func markerKey(sec float64, label string) string {
 	return fmt.Sprintf("%.3f|%s", sec, label)
 }
 
-func runAnnotate(args []string) {
-	flags := pflag.NewFlagSet("annotate", pflag.ExitOnError)
-	importPath := flags.String("import", "", "JSON file with markers to add: [{\"time\":sec,\"label\":str}, ...]")
-	inPlace := flags.Bool("in-place", false, "overwrite the input file instead of writing <file>.annotated.cast")
-	output := flags.StringP("output", "o", "", "output file (default: <file>.annotated.cast, or the input file with --in-place)")
-	flags.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: trec annotate <file.cast> --import markers.json [options]")
-		fmt.Fprintln(os.Stderr, "\nMerges marker (\"m\") events into a recording, sorted by time, so they")
-		fmt.Fprintln(os.Stderr, "show up during 'trec play' and can be jumped to with n/N.")
-		fmt.Fprintln(os.Stderr, "\nOptions:")
-		flags.PrintDefaults()
-	}
-	flags.Parse(args)
+func newAnnotateCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "annotate <file.cast>", Short: "Add markers to a recording", Long: "Merges marker events into a recording, sorted by time.", Args: cobra.ExactArgs(1), Run: runAnnotate}
+	cmd.Flags().String("import", "", "JSON file with markers to add: [{\"time\":sec,\"label\":str}, ...]")
+	cmd.Flags().Bool("in-place", false, "overwrite the input file instead of writing <file>.annotated.cast")
+	cmd.Flags().StringP("output", "o", "", "output file (default: <file>.annotated.cast, or the input file with --in-place)")
+	return cmd
+}
 
-	files := flags.Args()
-	if len(files) != 1 || *importPath == "" {
-		flags.Usage()
+func runAnnotate(cmd *cobra.Command, files []string) {
+	importPath, _ := cmd.Flags().GetString("import")
+	inPlace, _ := cmd.Flags().GetBool("in-place")
+	output, _ := cmd.Flags().GetString("output")
+	if len(files) != 1 || importPath == "" {
+		cmd.Usage()
 		os.Exit(1)
 	}
 
@@ -45,14 +42,14 @@ func runAnnotate(args []string) {
 		os.Exit(1)
 	}
 
-	data, err := os.ReadFile(*importPath)
+	data, err := os.ReadFile(importPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error reading %s: %v\n", *importPath, err)
+		fmt.Fprintf(os.Stderr, "error reading %s: %v\n", importPath, err)
 		os.Exit(1)
 	}
 	var markers []markerImport
 	if err := json.Unmarshal(data, &markers); err != nil {
-		fmt.Fprintf(os.Stderr, "error parsing %s: %v\n", *importPath, err)
+		fmt.Fprintf(os.Stderr, "error parsing %s: %v\n", importPath, err)
 		os.Exit(1)
 	}
 
@@ -76,9 +73,9 @@ func runAnnotate(args []string) {
 
 	sort.SliceStable(events, func(i, j int) bool { return events[i].sec < events[j].sec })
 
-	outPath := *output
+	outPath := output
 	if outPath == "" {
-		if *inPlace {
+		if inPlace {
 			outPath = files[0]
 		} else {
 			outPath = files[0] + ".annotated.cast"

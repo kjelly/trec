@@ -9,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/spf13/pflag"
+	"github.com/spf13/cobra"
 )
 
 const htmlPlayerVersion = "3.17.0"
@@ -101,31 +101,28 @@ func htmlPageDataFromCast(path, title string) (htmlPageData, error) {
 	}, nil
 }
 
-func runHTML(args []string) {
-	flags := pflag.NewFlagSet("html", pflag.ExitOnError)
-	output := flags.StringP("output", "o", "", "output HTML file (default: <cast>.html)")
-	title := flags.String("title", "", "page title (default: cast title or filename)")
-	flags.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: trec html [options] <file.cast>")
-		fmt.Fprintln(os.Stderr, "\nGenerates one self-contained HTML file with the cast and asciinema-player embedded.")
-		fmt.Fprintln(os.Stderr, "\nOptions:")
-		flags.PrintDefaults()
-	}
-	flags.Parse(args)
+func newHTMLCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "html <file.cast>", Short: "Generate a self-contained HTML player", Args: cobra.ExactArgs(1), Run: runHTML}
+	cmd.Flags().StringP("output", "o", "", "output HTML file (default: <cast>.html)")
+	cmd.Flags().String("title", "", "page title (default: cast title or filename)")
+	return cmd
+}
 
-	files := flags.Args()
+func runHTML(cmd *cobra.Command, files []string) {
+	output, _ := cmd.Flags().GetString("output")
+	title, _ := cmd.Flags().GetString("title")
 	if len(files) != 1 {
-		flags.Usage()
+		cmd.Usage()
 		os.Exit(1)
 	}
 
-	data, err := htmlPageDataFromCast(files[0], *title)
+	data, err := htmlPageDataFromCast(files[0], title)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "trec html: %v\n", err)
 		os.Exit(1)
 	}
 
-	path := *output
+	path := output
 	if path == "" {
 		path = htmlOutputPath(files[0])
 	}

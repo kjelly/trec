@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/spf13/pflag"
+	"github.com/spf13/cobra"
 )
 
 // ansiRe matches CSI sequences (\x1b[...final byte), OSC sequences
@@ -26,19 +26,13 @@ func stripANSI(s string) string {
 	return s
 }
 
-func runTranscript(args []string) {
-	flags := pflag.NewFlagSet("transcript", pflag.ExitOnError)
-	flags.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: trec transcript <file.cast>")
-		fmt.Fprintln(os.Stderr, "\nPrints a clean, timestamped, ANSI-stripped transcript of the recording")
-		fmt.Fprintln(os.Stderr, "to stdout — meant to be read by an AI agent deciding where to place")
-		fmt.Fprintln(os.Stderr, "markers (see 'trec annotate --import').")
-	}
-	flags.Parse(args)
+func newTranscriptCommand() *cobra.Command {
+	return &cobra.Command{Use: "transcript <file.cast>", Short: "Print an ANSI-stripped transcript", Long: "Prints a clean, timestamped, ANSI-stripped transcript for reviewing a recording and placing markers.", Args: cobra.ExactArgs(1), Run: runTranscript}
+}
 
-	files := flags.Args()
+func runTranscript(cmd *cobra.Command, files []string) {
 	if len(files) != 1 {
-		flags.Usage()
+		cmd.Usage()
 		os.Exit(1)
 	}
 

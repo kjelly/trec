@@ -15,7 +15,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/hinshun/vt10x"
-	"github.com/spf13/pflag"
+	"github.com/spf13/cobra"
 )
 
 // driveStep is one instruction from a keystroke script, in the same format
@@ -439,69 +439,42 @@ func (ds *driveSession) respond(err error) {
 	}
 }
 
-func runDrive(args []string) {
-	flags := pflag.NewFlagSet("drive", pflag.ExitOnError)
-	scriptPath := flags.String("script", "", "path to keystroke script")
-	interactive := flags.Bool("interactive", false, "read ops from stdin one at a time, answering each with the rendered screen")
-	outputFile := flags.StringP("output", "o", "", "output file (default: record_TIMESTAMP.cast)")
-	width := flags.IntP("width", "W", 220, "terminal width")
-	height := flags.IntP("height", "H", 50, "terminal height")
-	title := flags.String("title", "", "session title stored in the cast file")
-	timeoutSec := flags.Int("timeout", 120, "overall timeout in seconds after the script finishes")
-	keyDelayMs := flags.Int("key-delay", 300, "milliseconds between keystrokes")
-	settleDelayMs := flags.Int("settle-delay", 700, "milliseconds to wait after ENTER for a prompt transition to settle")
-	expectTimeoutMs := flags.Int("expect-timeout", 10000, "default milliseconds EXPECT waits before failing")
-	pointer := flags.String("pointer", `^\s*(?:❯|▸|›|→|»|>)\s`, "regexp matching a menu's selection-pointer row, used by SELECT")
-	stepMarkers := flags.Bool("step-markers", true, "record a marker event per script step (jump with n/N in trec play)")
-	flags.Usage = func() {
-		fmt.Fprintln(os.Stderr, `Usage: trec drive -script steps.txt [options] -- <command> [args...]
-       trec drive --interactive [options] -- <command> [args...]
+func newDriveCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "drive --script steps.txt [options] -- <command> [args...]", Short: "Drive a TUI with a keystroke script", Args: cobra.ArbitraryArgs, Run: runDrive}
+	cmd.Flags().String("script", "", "path to keystroke script")
+	cmd.Flags().Bool("interactive", false, "read ops from stdin one at a time, answering each with the rendered screen")
+	cmd.Flags().StringP("output", "o", "", "output file (default: record_TIMESTAMP.cast)")
+	cmd.Flags().IntP("width", "W", 220, "terminal width")
+	cmd.Flags().IntP("height", "H", 50, "terminal height")
+	cmd.Flags().String("title", "", "session title stored in the cast file")
+	cmd.Flags().Int("timeout", 120, "overall timeout in seconds after the script finishes")
+	cmd.Flags().Int("key-delay", 300, "milliseconds between keystrokes")
+	cmd.Flags().Int("settle-delay", 700, "milliseconds to wait after ENTER for a prompt transition to settle")
+	cmd.Flags().Int("expect-timeout", 10000, "default milliseconds EXPECT waits before failing")
+	cmd.Flags().String("pointer", `^\s*(?:❯|▸|›|→|»|>)\s`, "regexp matching a menu selection-pointer row, used by SELECT")
+	cmd.Flags().Bool("step-markers", true, "record a marker event per script step")
+	return cmd
+}
 
-Drives an interactive TUI (promptui/bubbletea wizards, etc.) under a PTY by
-replaying a keystroke script, the way a human at a keyboard would — instead
-of bypassing the TUI. Every keystroke sent is recorded as a timed "i" event
-alongside the program's own "o" output, so the result is a normal asciicast
-v2 recording: play it back with 'trec play', read it with 'trec transcript',
-or mark it up with 'trec annotate', exactly like a human-recorded session.
-
-A VT emulator mirrors the child's screen, so scripts can wait on and assert
-what is actually rendered instead of guessing with delays and blind key
-counts. On EXPECT/ASSERT/SELECT failure the drive stops immediately, dumps
-the rendered screen to stderr, and exits 1 (the partial recording is kept).
-
-Script format, one instruction per line:
-  # comment
-  TEXT literal text typed character-by-character (no trailing Enter)
-  ENTER
-  DOWN [n] / UP [n]
-  SPACE / TAB / CTRLC
-  BACKSPACE [n]    send DEL (127) — clears a pre-filled Default value
-  WAIT ms
-  EXPECT text      wait until text appears on the rendered screen
-  EXPECT@ms text   same, with a per-step timeout in milliseconds
-  EXPECT_QUIET [ms]  wait until output has been quiet for ms (default 300)
-  ASSERT text      fail immediately unless text is on the screen right now
-  SELECT label     arrow up/down until the menu pointer row contains label
-  SNAPSHOT         dump the rendered screen to stderr
-  QUIT             stop the script / end the interactive session
-
-Interactive mode (--interactive): the same ops are read from stdin one line
-at a time. After each op a response is written to stdout:
-  OK | ERR <message>
-  CURSOR <row> <col>
-  SCREEN <rows> <cols>
-  <rows> lines of rendered screen
-The child's raw output is not echoed to stdout in this mode. Errors are
-reported but do not end the session; send QUIT (or close stdin) to finish.
-
-Options:`)
-		flags.PrintDefaults()
-	}
-	flags.Parse(args)
-
-	rest := flags.Args()
+func runDrive(cmd *cobra.Command, rest []string) {
+	scriptPathValue, _ := cmd.Flags().GetString("script")
+	interactiveValue, _ := cmd.Flags().GetBool("interactive")
+	outputFileValue, _ := cmd.Flags().GetString("output")
+	widthValue, _ := cmd.Flags().GetInt("width")
+	heightValue, _ := cmd.Flags().GetInt("height")
+	titleValue, _ := cmd.Flags().GetString("title")
+	timeoutSecValue, _ := cmd.Flags().GetInt("timeout")
+	keyDelayMsValue, _ := cmd.Flags().GetInt("key-delay")
+	settleDelayMsValue, _ := cmd.Flags().GetInt("settle-delay")
+	expectTimeoutMsValue, _ := cmd.Flags().GetInt("expect-timeout")
+	pointerValue, _ := cmd.Flags().GetString("pointer")
+	stepMarkersValue, _ := cmd.Flags().GetBool("step-markers")
+	scriptPath, interactive, outputFile := &scriptPathValue, &interactiveValue, &outputFileValue
+	width, height, title := &widthValue, &heightValue, &titleValue
+	timeoutSec, keyDelayMs, settleDelayMs := &timeoutSecValue, &keyDelayMsValue, &settleDelayMsValue
+	expectTimeoutMs, pointer, stepMarkers := &expectTimeoutMsValue, &pointerValue, &stepMarkersValue
 	if (*scriptPath == "" && !*interactive) || len(rest) == 0 {
-		flags.Usage()
+		cmd.Usage()
 		os.Exit(2)
 	}
 
@@ -547,13 +520,13 @@ Options:`)
 	hdrJSON, _ := json.Marshal(hdr)
 	fmt.Fprintln(bw, string(hdrJSON))
 
-	cmd := exec.Command(rest[0], rest[1:]...)
+	processCmd := exec.Command(rest[0], rest[1:]...)
 	// CI=1 + a fixed xterm term type keep bubbletea/promptui rendering
 	// deterministic under a driven, non-interactive PTY (no real human
 	// terminal behind it).
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "CI=1")
+	processCmd.Env = append(os.Environ(), "TERM=xterm-256color", "CI=1")
 
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(*height), Cols: uint16(*width)})
+	ptmx, err := pty.StartWithSize(processCmd, &pty.Winsize{Rows: uint16(*height), Cols: uint16(*width)})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "trec drive: pty start: %v\n", err)
 		os.Exit(1)
@@ -622,7 +595,7 @@ Options:`)
 			if ds.stepMarkers {
 				ds.marker(fmt.Sprintf("FAILED line %d: %s (%v)", st.line, st.raw, err))
 			}
-			_ = cmd.Process.Kill()
+			_ = processCmd.Process.Kill()
 			<-done
 			bw.Flush()
 			fmt.Fprintf(os.Stderr, "trec drive: recorded to %s — replay with: trec play %s\n", *outputFile, *outputFile)
@@ -659,7 +632,7 @@ Options:`)
 	}
 
 	exitCh := make(chan error, 1)
-	go func() { exitCh <- cmd.Wait() }()
+	go func() { exitCh <- processCmd.Wait() }()
 
 	waitDur := time.Duration(*timeoutSec) * time.Second
 	if *interactive {
@@ -685,7 +658,7 @@ Options:`)
 			fmt.Fprintln(os.Stderr, "trec drive: TIMEOUT — killing process")
 			failed = true
 		}
-		_ = cmd.Process.Kill()
+		_ = processCmd.Process.Kill()
 		<-done
 	}
 

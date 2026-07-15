@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/spf13/pflag"
+	"github.com/spf13/cobra"
 )
 
 var castIndexTemplate = template.Must(template.New("cast-index").Parse(`<!doctype html>
@@ -84,20 +84,18 @@ func newCastServer(dir string) http.Handler {
 	return mux
 }
 
-func runServe(args []string) {
-	flags := pflag.NewFlagSet("serve", pflag.ExitOnError)
-	host := flags.String("host", "127.0.0.1", "host address to listen on (use 0.0.0.0 for all interfaces)")
-	port := flags.IntP("port", "p", 8080, "TCP port to listen on")
-	flags.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: trec serve [options] [directory]")
-		fmt.Fprintln(os.Stderr, "\nServes .cast files in the current directory by default. It listens only on localhost unless --host is changed.")
-		fmt.Fprintln(os.Stderr, "\nOptions:")
-		flags.PrintDefaults()
-	}
-	flags.Parse(args)
-	dirs := flags.Args()
-	if len(dirs) > 1 || *port < 1 || *port > 65535 {
-		flags.Usage()
+func newServeCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "serve [directory]", Short: "Serve recordings in a web player", Args: cobra.MaximumNArgs(1), Run: runServe}
+	cmd.Flags().String("host", "127.0.0.1", "host address to listen on (use 0.0.0.0 for all interfaces)")
+	cmd.Flags().IntP("port", "p", 8080, "TCP port to listen on")
+	return cmd
+}
+
+func runServe(cmd *cobra.Command, dirs []string) {
+	host, _ := cmd.Flags().GetString("host")
+	port, _ := cmd.Flags().GetInt("port")
+	if len(dirs) > 1 || port < 1 || port > 65535 {
+		cmd.Usage()
 		os.Exit(1)
 	}
 	dir := "."
@@ -114,7 +112,7 @@ func runServe(args []string) {
 		fmt.Fprintf(os.Stderr, "trec serve: %s is not a directory\n", dir)
 		os.Exit(1)
 	}
-	addr := net.JoinHostPort(*host, strconv.Itoa(*port))
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	fmt.Fprintf(os.Stderr, "Serving %s at http://%s\n", dir, addr)
 	if err := http.ListenAndServe(addr, newCastServer(dir)); err != nil {
 		fmt.Fprintf(os.Stderr, "trec serve: %v\n", err)

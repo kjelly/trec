@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
-	"github.com/spf13/pflag"
+	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
 
@@ -57,64 +57,34 @@ func promptCommand() []string {
 	return []string{"sh", "-c", line}
 }
 
-func topUsage() {
-	fmt.Fprintf(os.Stderr, `Usage:
-  %s [record-options] [-- command [args...]]   Record a terminal session
-  %s drive -script s.txt [options] -- cmd ...  Drive a TUI from a keystroke script and record it
-  %s play [play-options] <file.cast>           Play back a recording
-  %s html [html-options] <file.cast>           Generate a deployable HTML player
-  %s serve [serve-options] [directory]          Serve .cast files in a web player
-  %s transcript <file.cast>                    Print a clean, agent-readable transcript
-  %s annotate <file.cast> --import notes.json  Add markers to a recording
-
-Run '%s drive --help', '%s play --help', '%s html --help', '%s serve --help', '%s transcript --help', or
-'%s annotate --help' for subcommand options.
-
-Record options:
-`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
-	pflag.PrintDefaults()
-	fmt.Fprintln(os.Stderr, "\nOutput is asciicast v2 format (also playable with: asciinema play <file>).")
+func main() {
+	if err := newRootCommand().Execute(); err != nil {
+		os.Exit(1)
+	}
 }
 
-func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "play":
-			runPlay(os.Args[2:])
-			return
-		case "transcript":
-			runTranscript(os.Args[2:])
-			return
-		case "annotate":
-			runAnnotate(os.Args[2:])
-			return
-		case "html":
-			runHTML(os.Args[2:])
-			return
-		case "serve":
-			runServe(os.Args[2:])
-			return
-		case "drive":
-			runDrive(os.Args[2:])
-			return
-		}
+func newRootCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:           "trec [record-options] [-- command [args...]]",
+		Short:         "Record, play, and inspect terminal sessions",
+		Long:          "trec records terminal sessions in asciicast v2 format, then plays, annotates, exports, and serves them.",
+		Args:          cobra.ArbitraryArgs,
+		Run:           runRecord,
+		SilenceErrors: true,
 	}
+	cmd.Flags().StringP("output", "o", "", "output file (default: record_TIMESTAMP.cast)")
+	cmd.Flags().IntP("width", "W", 0, "terminal width (default: current terminal width)")
+	cmd.Flags().IntP("height", "H", 0, "terminal height (default: current terminal height)")
+	cmd.Flags().String("title", "", "session title stored in the cast file")
+	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand())
+	return cmd
+}
 
-	var (
-		outputFile string
-		width      int
-		height     int
-		title      string
-	)
-
-	pflag.StringVarP(&outputFile, "output", "o", "", "output file (default: record_TIMESTAMP.cast)")
-	pflag.IntVarP(&width, "width", "W", 0, "terminal width (default: current terminal width)")
-	pflag.IntVarP(&height, "height", "H", 0, "terminal height (default: current terminal height)")
-	pflag.StringVar(&title, "title", "", "session title stored in the cast file")
-	pflag.Usage = topUsage
-	pflag.Parse()
-
-	args := pflag.Args()
+func runRecord(cmd *cobra.Command, args []string) {
+	outputFile, _ := cmd.Flags().GetString("output")
+	width, _ := cmd.Flags().GetInt("width")
+	height, _ := cmd.Flags().GetInt("height")
+	title, _ := cmd.Flags().GetString("title")
 
 	// Resolve terminal size.
 	curW, curH, err := term.GetSize(int(os.Stdin.Fd()))
@@ -168,8 +138,8 @@ func main() {
 	fmt.Fprintln(bw, string(hdrJSON))
 
 	// Start the command under a PTY.
-	cmd := exec.Command(args[0], args[1:]...)
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
+	processCmd := exec.Command(args[0], args[1:]...)
+	ptmx, err := pty.StartWithSize(processCmd, &pty.Winsize{
 		Rows: uint16(height),
 		Cols: uint16(width),
 	})
@@ -251,7 +221,7 @@ func main() {
 	}()
 
 	// Block until the recorded program exits.
-	cmd.Wait()
+	processCmd.Wait()
 	ptmx.Close()
 	wg.Wait()
 
