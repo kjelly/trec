@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -31,8 +30,11 @@ func parseCastLine(line []byte) (sec float64, typ, data string, err error) {
 }
 
 const (
-	minSpeed = 0.125
-	maxSpeed = 16.0
+	minSpeed        = 0.125
+	maxSpeed        = 16.0
+	smartShortHold  = 750 * time.Millisecond
+	smartMediumHold = time.Second
+	smartLongHold   = 1500 * time.Millisecond
 )
 
 // playCmd is a control action decoded from a keypress.
@@ -87,22 +89,21 @@ func (c *playClock) seek(sec float64) {
 	c.anchor = time.Now()
 }
 
-// player owns playback state: the clock, the control channels fed by the
-// keyboard goroutine, and the transient message shown in the status bar.
+// player owns playback state and, when tui is enabled, keyboard controls.
 type player struct {
 	clk           playClock
 	idleLimit     float64
 	pauseOnMarker bool
 	loop          bool
+	forceSize     bool
+	tui           bool
+	smartSpeed    bool
 
 	cmdCh  chan playCmd
 	quitCh chan struct{}
 
 	totalSec float64
 	atEnd    bool
-	msg      string // last keystroke / marker label shown in the status bar
-	msgStyle string // ANSI fg color for msg ("36" keystroke, "35" marker)
-	lastDraw time.Time
 }
 
 func newPlayer(speed, idleLimit float64) *player {
@@ -118,6 +119,105 @@ func (p *player) send(c playCmd) {
 	select {
 	case p.cmdCh <- c:
 	default:
+	}
+}
+
+// visibleOutputSize estimates how much printable content an output chunk
+// changes. ANSI control sequences are deliberately ignored: they describe
+// rendering, but do not themselves need reading time.
+func visibleOutputSize(data string) (chars int, hasNewline bool) {
+	for i := 0; i < len(data); {
+		if data[i] == 0x1b {
+			i++
+			if i >= len(data) {
+				break
+			}
+			switch data[i] {
+			case '[': // CSI, through its final byte
+				i++
+				for i < len(data) && (data[i] < 0x40 || data[i] > 0x7e) {
+					i++
+				}
+				if i < len(data) {
+					i++
+				}
+			case ']': // OSC, through BEL or ST
+				i++
+				for i < len(data) {
+					if data[i] == 0x07 {
+						i++
+						break
+					}
+					if data[i] == 0x1b && i+1 < len(data) && data[i+1] == '\\' {
+						i += 2
+						break
+					}
+					i++
+				}
+			default:
+				i++
+			}
+			continue
+		}
+		if data[i] == '\n' || data[i] == '\r' {
+			hasNewline = true
+			i++
+			continue
+		}
+		if data[i] < 0x20 || data[i] == 0x7f {
+			i++
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(data[i:])
+		chars++
+		i += size
+	}
+	return chars, hasNewline
+}
+
+// smartGap keeps output bursts responsive, caps time spent waiting for the
+// recorded operator, and gives substantial screen changes enough reading time.
+func smartGap(previous, current castEvent, gap float64) float64 {
+	if gap <= 0 {
+		return 0
+	}
+	maxHold := smartShortHold
+	if previous.typ == "o" {
+		chars, hasNewline := visibleOutputSize(previous.data)
+		switch {
+		case chars >= 160 || hasNewline:
+			maxHold = smartLongHold
+		case chars >= 40:
+			maxHold = smartMediumHold
+		}
+	} else if current.typ == "i" || current.typ == "m" {
+		// Waiting after non-visual metadata does not help comprehension.
+		maxHold = 350 * time.Millisecond
+	}
+	if gap > maxHold.Seconds() {
+		return maxHold.Seconds()
+	}
+	return gap
+}
+
+// adjustTiming applies the requested idle cap and optional content-aware
+// pacing without changing event order.
+func adjustTiming(events []castEvent, idleLimit float64, smart bool) {
+	previousSec, adjusted := 0.0, 0.0
+	for i := range events {
+		gap := events[i].sec - previousSec
+		if gap < 0 {
+			gap = 0
+		}
+		if idleLimit > 0 && gap > idleLimit {
+			gap = idleLimit
+		}
+		if smart && i > 0 {
+			gap = smartGap(events[i-1], events[i], gap)
+		}
+		adjusted += gap
+		previousSec = events[i].sec
+		events[i].sec = adjusted
 	}
 }
 
@@ -256,94 +356,9 @@ func (p *player) readKeys() {
 	}
 }
 
-func fmtSpeed(s float64) string {
-	return strconv.FormatFloat(s, 'f', -1, 64)
-}
-
-func runeTrunc(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	if utf8.RuneCountInString(s) <= n {
-		return s
-	}
-	return string([]rune(s)[:n])
-}
-
-// drawStatus renders the persistent control bar on the terminal's bottom
-// row: state, position/duration, speed, a progress bar, the last
-// keystroke/marker, and key hints. It uses only reverse video and the
-// terminal's own ANSI palette, so it stays readable on both light and dark
-// backgrounds. Redraws are throttled unless force is set.
-func (p *player) drawStatus(cur float64, force bool) {
-	if !force && time.Since(p.lastDraw) < 100*time.Millisecond {
-		return
-	}
-	p.lastDraw = time.Now()
-
-	w, _, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil || w <= 0 {
-		w = 80
-	}
-
-	state := "▶"
-	switch {
-	case p.atEnd:
-		state = "END"
-	case p.clk.paused:
-		state = "⏸"
-	}
-	left := fmt.Sprintf(" %s %s/%s ×%s ", state, fmtDur(cur), fmtDur(p.totalSec), fmtSpeed(p.clk.speed))
-	hints := " space:pause  ←/→:step  ↑/↓:speed  n/N:marker  g:restart  q:quit "
-	msg := p.msg
-	if msg != "" {
-		msg = " " + msg + " "
-	}
-
-	avail := w - 1 - utf8.RuneCountInString(left)
-	msg = runeTrunc(msg, avail)
-	avail -= utf8.RuneCountInString(msg)
-	if utf8.RuneCountInString(hints) > avail {
-		hints = ""
-	}
-	barW := avail - utf8.RuneCountInString(hints)
-	bar := ""
-	if barW > 0 {
-		frac := 0.0
-		if p.totalSec > 0 {
-			frac = cur / p.totalSec
-		}
-		if frac > 1 {
-			frac = 1
-		}
-		fill := int(frac * float64(barW))
-		bar = strings.Repeat("━", fill) + strings.Repeat(" ", barW-fill)
-	}
-
-	var b strings.Builder
-	b.WriteString("\033[s\033[999;1H\033[2K\033[7m")
-	b.WriteString(left)
-	b.WriteString(bar)
-	if msg != "" {
-		if p.msgStyle != "" {
-			b.WriteString("\033[" + p.msgStyle + "m")
-		}
-		b.WriteString(msg)
-		if p.msgStyle != "" {
-			b.WriteString("\033[39m")
-		}
-	}
-	b.WriteString(hints)
-	b.WriteString("\033[0m\033[u")
-	os.Stderr.WriteString(b.String())
-}
-
-func clearStatusLine() {
-	fmt.Fprint(os.Stderr, "\033[s\033[999;1H\033[2K\033[u")
-}
-
 // visualizeKeys renders raw stdin bytes ("i" events) as a human-readable
 // caret/symbol notation, e.g. Ctrl-C -> ^C, Enter -> ⏎, arrow keys -> ↑↓←→.
+// transcript.go shares this conversion when rendering input events.
 func visualizeKeys(data string) string {
 	var b strings.Builder
 	i := 0
@@ -408,13 +423,16 @@ func runPlay(args []string) {
 	speed := flags.Float64P("speed", "s", 1.0, "initial playback speed multiplier (e.g. 2.0 = double speed)")
 	idleLimit := flags.Float64P("idle-time-limit", "i", 5.0, "cap idle gaps between events to N seconds (0 = no cap)")
 	loop := flags.BoolP("loop", "l", false, "loop playback continuously")
+	tui := flags.Bool("tui", false, "enable interactive playback controls")
+	smartSpeed := flags.Bool("smart-speed", false, "adapt pauses to output size and cap long waits")
 	pauseOnMarker := flags.Bool("pause-on-marker", false, "automatically pause playback when a marker is reached")
+	forceSize := flags.Bool("force-size", false, "play even when the terminal is smaller than the recording (may corrupt TUI layout)")
 	flags.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: trec play [options] <file.cast>")
 		fmt.Fprintln(os.Stderr, "\nOptions:")
 		flags.PrintDefaults()
 		fmt.Fprintln(os.Stderr, `
-During playback:
+With --tui:
   space          pause / resume
   → . l          step forward one frame (pauses)
   ← , h          step back one frame (pauses)
@@ -432,17 +450,25 @@ During playback:
 		os.Exit(1)
 	}
 
-	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		fmt.Fprintln(os.Stderr, "trec play: stdin must be an interactive terminal")
+	if *pauseOnMarker && !*tui {
+		fmt.Fprintln(os.Stderr, "trec play: --pause-on-marker requires --tui")
 		os.Exit(1)
 	}
 
-	old, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "raw mode: %v\n", err)
+	var old *term.State
+	if *tui && !term.IsTerminal(int(os.Stdin.Fd())) {
+		fmt.Fprintln(os.Stderr, "trec play: stdin must be an interactive terminal")
 		os.Exit(1)
 	}
-	defer term.Restore(int(os.Stdin.Fd()), old)
+	if *tui {
+		var err error
+		old, err = term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "raw mode: %v\n", err)
+			os.Exit(1)
+		}
+		defer term.Restore(int(os.Stdin.Fd()), old)
+	}
 
 	if *speed < minSpeed {
 		*speed = minSpeed
@@ -453,12 +479,19 @@ During playback:
 	p := newPlayer(*speed, *idleLimit)
 	p.pauseOnMarker = *pauseOnMarker
 	p.loop = *loop
+	p.forceSize = *forceSize
+	p.tui = *tui
+	p.smartSpeed = *smartSpeed
 
-	go p.readKeys()
+	if p.tui {
+		go p.readKeys()
+	}
 
 	for {
 		if err := playFile(p, files[0]); err != nil {
-			term.Restore(int(os.Stdin.Fd()), old)
+			if old != nil {
+				term.Restore(int(os.Stdin.Fd()), old)
+			}
 			fmt.Fprintf(os.Stderr, "\r\nerror: %v\r\n", err)
 			os.Exit(1)
 		}
@@ -474,9 +507,10 @@ During playback:
 	}
 
 done:
-	clearStatusLine()
-	term.Restore(int(os.Stdin.Fd()), old)
-	fmt.Fprint(os.Stderr, "\r\n")
+	if old != nil {
+		term.Restore(int(os.Stdin.Fd()), old)
+		fmt.Fprint(os.Stderr, "\r\n")
+	}
 }
 
 // findMarkerIndex returns the index of the next ("m", dir=1) or previous
@@ -509,16 +543,12 @@ func fastForwardTo(events []castEvent, from, to int) {
 	}
 }
 
-// apply renders one event: output goes to the terminal, keystrokes and
-// markers become the status-bar message.
+// apply renders output events. Input and marker events carry timing and
+// navigation metadata, but must not write to the terminal grid: a cast owns
+// every cell in that grid while it is being replayed.
 func (p *player) apply(e castEvent) {
-	switch e.typ {
-	case "o":
+	if e.typ == "o" {
 		os.Stdout.WriteString(e.data)
-	case "i":
-		p.msg, p.msgStyle = "⌨ "+visualizeKeys(e.data), "36"
-	case "m":
-		p.msg, p.msgStyle = "⚑ "+e.data, "35"
 	}
 }
 
@@ -583,7 +613,6 @@ func (p *player) handleCmd(cmd playCmd, events []castEvent, i int) int {
 		}
 		target := findMarkerIndex(events, i, dir)
 		if target < 0 {
-			p.msg, p.msgStyle = "no marker", ""
 			return i
 		}
 		if dir < 0 {
@@ -594,14 +623,12 @@ func (p *player) handleCmd(cmd playCmd, events []castEvent, i int) int {
 		}
 		i = target
 		p.clk.seek(events[target].sec)
-		p.msg, p.msgStyle = "⚑ "+events[target].data, "35"
 
 	case cmdRestart:
 		i = 0
 		fmt.Fprint(os.Stdout, "\033[2J\033[H")
 		p.clk.seek(0)
 		p.clk.setPaused(false)
-		p.msg, p.msgStyle = "", ""
 	}
 	return i
 }
@@ -613,62 +640,37 @@ func playFile(p *player, path string) error {
 	}
 
 	var events []castEvent
-	markerCount := 0
 	for _, e := range allEvents {
 		if e.typ == "o" || e.typ == "i" || e.typ == "m" {
 			events = append(events, e)
-			if e.typ == "m" {
-				markerCount++
-			}
 		}
 	}
 	if len(events) == 0 {
 		return nil
 	}
 
-	// Cap idle gaps between events.
-	if p.idleLimit > 0 {
-		prev, adjusted := 0.0, 0.0
-		for i := range events {
-			gap := events[i].sec - prev
-			if gap > p.idleLimit {
-				gap = p.idleLimit
-			}
-			adjusted += gap
-			prev = events[i].sec
-			events[i].sec = adjusted
-		}
-	}
+	adjustTiming(events, p.idleLimit, p.smartSpeed)
 
 	p.totalSec = events[len(events)-1].sec
 	p.atEnd = false
-	p.msg, p.msgStyle = "", ""
 
-	// Warn when current terminal is smaller than the recording.
-	cw, ch, _ := term.GetSize(int(os.Stdin.Fd()))
-	if cw < hdr.Width || ch < hdr.Height {
-		fmt.Fprintf(os.Stderr, "\r\033[33m[warning] recording %dx%d, terminal %dx%d\033[0m\r\n",
-			hdr.Width, hdr.Height, cw, ch)
+	// ANSI recordings rely on the original grid dimensions for wrapping and
+	// relative cursor movement. Replaying into a smaller terminal cannot be
+	// faithful, so refuse by default rather than producing a corrupted TUI.
+	cw, ch, sizeErr := term.GetSize(int(os.Stdin.Fd()))
+	if sizeErr == nil && (cw < hdr.Width || ch < hdr.Height) {
+		if !p.forceSize {
+			return fmt.Errorf("recording requires at least %dx%d; current terminal is %dx%d (resize it or use --force-size)",
+				hdr.Width, hdr.Height, cw, ch)
+		}
 	}
 
-	// Info line + clear screen.
-	title := hdr.Title
-	if title == "" {
-		title = path
-	}
-	fmt.Fprintf(os.Stderr, "\033[2J\033[H\033[1m%s\033[0m  %s\r\n", title, fmtDur(p.totalSec))
-	if hdr.Command != "" {
-		fmt.Fprintf(os.Stderr, "\033[2m$ %s\033[0m\r\n", hdr.Command)
-	}
-	if markerCount > 0 {
-		fmt.Fprintf(os.Stderr, "\033[2m%d marker(s)\033[0m\r\n", markerCount)
-	}
-	fmt.Fprint(os.Stderr, "\r\n")
-
+	// Start the cast at its recorded origin. Do not draw metadata or a status
+	// bar: both alter cells the recorded program may subsequently address.
+	fmt.Fprint(os.Stdout, "\033[2J\033[H")
 	p.clk.seek(0)
 	p.clk.paused = false
 	p.clk.anchor = time.Now()
-	p.drawStatus(0, true)
 
 	i := 0
 	for {
@@ -684,10 +686,12 @@ func playFile(p *player, path string) error {
 			if p.loop {
 				return nil
 			}
+			if !p.tui {
+				return nil
+			}
 			p.atEnd = true
 			p.clk.setPaused(true)
 			p.clk.seek(p.totalSec)
-			p.drawStatus(p.totalSec, true)
 			select {
 			case <-p.quitCh:
 				return nil
@@ -696,20 +700,17 @@ func playFile(p *player, path string) error {
 				case cmdStepBack, cmdPrevMarker, cmdRestart:
 					p.atEnd = false
 					i = p.handleCmd(cmd, events, i)
-					p.drawStatus(p.clk.pos(), true)
 				}
 			}
 			continue
 		}
 
 		if p.clk.paused {
-			p.drawStatus(p.clk.pos(), true)
 			select {
 			case <-p.quitCh:
 				return nil
 			case cmd := <-p.cmdCh:
 				i = p.handleCmd(cmd, events, i)
-				p.drawStatus(p.clk.pos(), true)
 			}
 			continue
 		}
@@ -722,9 +723,7 @@ func playFile(p *player, path string) error {
 				return nil
 			case cmd := <-p.cmdCh:
 				i = p.handleCmd(cmd, events, i)
-				p.drawStatus(p.clk.pos(), true)
 			case <-time.After(wait):
-				p.drawStatus(p.clk.pos(), false)
 			}
 			continue
 		}
@@ -735,6 +734,5 @@ func playFile(p *player, path string) error {
 		if e.typ == "m" && p.pauseOnMarker {
 			p.clk.setPaused(true)
 		}
-		p.drawStatus(p.clk.pos(), e.typ != "o")
 	}
 }
