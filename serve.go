@@ -17,12 +17,31 @@ import (
 
 var castIndexTemplate = template.Must(template.New("cast-index").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>trec recordings</title><style>body{max-width:54rem;margin:3rem auto;padding:0 1rem;font-family:system-ui;background:#111;color:#eee}a{color:#8ab4f8}li{margin:.6rem 0}</style>
-</head><body><h1>trec recordings</h1>{{if .}}<ul>{{range .}}<li><a href="/play/{{.URL}}">{{.Name}}</a></li>{{end}}</ul>{{else}}<p>No .cast files in this directory.</p>{{end}}</body></html>`))
+<title>trec recordings</title><style>{{.PlayerCSS}}</style><style>body{max-width:70rem;margin:3rem auto;padding:0 1rem;font-family:system-ui;background:#111;color:#eee}a{color:#8ab4f8}.recording{margin:2.5rem 0}.recording h2{font-size:1.1rem;font-weight:600}.player{max-width:100%;margin:auto}</style>
+</head><body><h1>trec recordings</h1>{{if .HasFiles}}{{if .Casts}}<script>{{.PlayerJS}}</script>{{range .Casts}}<article class="recording"><h2><a href="/play/{{.URL}}">{{.Name}}</a></h2><div class="player" id="player-{{.ID}}"></div><script>(()=>{const cast=new TextDecoder().decode(Uint8Array.from(atob("{{.CastBase64}}"),byte=>byte.charCodeAt(0)));AsciinemaPlayer.create({data:cast},document.getElementById("player-{{.ID}}"),{autoPlay:false,preload:true,fit:"width",markers:JSON.parse(atob("{{.MarkersBase64}}"))});})();</script></article>{{end}}{{end}}{{range .Invalid}}<article class="recording"><h2>{{.Name}}</h2><p>Unable to load this recording: {{.Error}}</p></article>{{end}}{{else}}<p>No .cast files in this directory.</p>{{end}}</body></html>`))
 
 type castLink struct {
 	Name string
 	URL  string
+}
+
+type castOverviewItem struct {
+	castLink
+	ID int
+	htmlPageData
+}
+
+type castOverviewData struct {
+	Casts     []castOverviewItem
+	Invalid   []invalidCast
+	HasFiles  bool
+	PlayerJS  template.JS
+	PlayerCSS template.CSS
+}
+
+type invalidCast struct {
+	Name  string
+	Error string
 }
 
 func listCastFiles(dir string) ([]castLink, error) {
@@ -48,6 +67,33 @@ func castPath(dir, escapedName string) (string, error) {
 	return filepath.Join(dir, name), nil
 }
 
+func overviewDataFromCasts(dir string) (castOverviewData, error) {
+	links, err := listCastFiles(dir)
+	if err != nil {
+		return castOverviewData{}, err
+	}
+	overview := castOverviewData{
+		Casts:     make([]castOverviewItem, 0, len(links)),
+		Invalid:   make([]invalidCast, 0),
+		HasFiles:  len(links) > 0,
+		PlayerJS:  template.JS(asciinemaPlayerJS),
+		PlayerCSS: template.CSS(asciinemaPlayerCSS),
+	}
+	for _, link := range links {
+		data, err := htmlPageDataFromCast(filepath.Join(dir, link.Name), "")
+		if err != nil {
+			overview.Invalid = append(overview.Invalid, invalidCast{Name: link.Name, Error: err.Error()})
+			continue
+		}
+		overview.Casts = append(overview.Casts, castOverviewItem{
+			castLink:     link,
+			ID:           len(overview.Casts),
+			htmlPageData: data,
+		})
+	}
+	return overview, nil
+}
+
 func newCastServer(dir string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -55,13 +101,13 @@ func newCastServer(dir string) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		links, err := listCastFiles(dir)
+		overview, err := overviewDataFromCasts(dir)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := castIndexTemplate.Execute(w, links); err != nil {
+		if err := castIndexTemplate.Execute(w, overview); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	})

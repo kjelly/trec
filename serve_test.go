@@ -15,6 +15,12 @@ func TestCastServerListsAndPlaysCastFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "demo.cast"), []byte(cast), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "second.cast"), []byte(cast), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "broken.cast"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("not a cast"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +28,8 @@ func TestCastServerListsAndPlaysCastFiles(t *testing.T) {
 
 	index := httptest.NewRecorder()
 	h.ServeHTTP(index, httptest.NewRequest(http.MethodGet, "/", nil))
-	if index.Code != http.StatusOK || !strings.Contains(index.Body.String(), "demo.cast") || strings.Contains(index.Body.String(), "notes.txt") {
+	indexPage := index.Body.String()
+	if index.Code != http.StatusOK || !strings.Contains(indexPage, "href=\"/play/demo.cast\"") || !strings.Contains(indexPage, "href=\"/play/second.cast\"") || !strings.Contains(indexPage, "id=\"player-0\"") || !strings.Contains(indexPage, "id=\"player-1\"") || strings.Count(indexPage, "AsciinemaPlayer.create") != 2 || !strings.Contains(indexPage, "broken.cast") || !strings.Contains(indexPage, "Unable to load this recording") || strings.Contains(indexPage, "notes.txt") {
 		t.Fatalf("unexpected index response: status=%d body=%q", index.Code, index.Body.String())
 	}
 

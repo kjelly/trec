@@ -2,9 +2,7 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,21 +18,14 @@ import (
 
 // castHeader is the first line of an asciicast v2 file.
 type castHeader struct {
-	Version   int               `json:"version"`
-	Width     int               `json:"width"`
-	Height    int               `json:"height"`
-	Timestamp int64             `json:"timestamp"`
-	Command   string            `json:"command,omitempty"`
-	Title     string            `json:"title,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
-}
-
-func writeEvent(w io.Writer, mu *sync.Mutex, elapsed float64, eventType, data string) {
-	b, _ := json.Marshal([]any{elapsed, eventType, data})
-	mu.Lock()
-	w.Write(b)
-	w.Write([]byte("\n"))
-	mu.Unlock()
+	Version      int               `json:"version"`
+	Width        int               `json:"width"`
+	Height       int               `json:"height"`
+	Timestamp    int64             `json:"timestamp"`
+	Command      string            `json:"command,omitempty"`
+	CommandLabel string            `json:"command_label,omitempty"`
+	Title        string            `json:"title,omitempty"`
+	Env          map[string]string `json:"env,omitempty"`
 }
 
 func getenv(key, fallback string) string {
@@ -76,6 +67,10 @@ func newRootCommand() *cobra.Command {
 	cmd.Flags().IntP("width", "W", 0, "terminal width (default: current terminal width)")
 	cmd.Flags().IntP("height", "H", 0, "terminal height (default: current terminal height)")
 	cmd.Flags().String("title", "", "session title stored in the cast file")
+	cmd.PersistentFlags().StringArray("secret-env", nil, "environment variable whose value is redacted from the recording (repeatable)")
+	cmd.PersistentFlags().StringArray("secret-file", nil, "NAME=path whose file content is redacted from the recording (repeatable)")
+	cmd.PersistentFlags().Bool("record-command", false, "store the command in the cast header (redacted by --secret-env/--secret-file)")
+	cmd.PersistentFlags().String("command-label", "", "safe label stored in the cast header instead of the full command")
 	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand())
 	return cmd
 }
@@ -85,6 +80,19 @@ func runRecord(cmd *cobra.Command, args []string) {
 	width, _ := cmd.Flags().GetInt("width")
 	height, _ := cmd.Flags().GetInt("height")
 	title, _ := cmd.Flags().GetString("title")
+	secretEnv, _ := cmd.Flags().GetStringArray("secret-env")
+	secretFiles, _ := cmd.Flags().GetStringArray("secret-file")
+	recordCommand, _ := cmd.Flags().GetBool("record-command")
+	commandLabel, _ := cmd.Flags().GetString("command-label")
+	redactor, err := newSecretRedactor(secretEnv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "trec: %v\n", err)
+		os.Exit(2)
+	}
+	if err := addSecretFileSpecs(redactor, secretFiles); err != nil {
+		fmt.Fprintf(os.Stderr, "trec: %v\n", err)
+		os.Exit(2)
+	}
 
 	// Resolve terminal size.
 	curW, curH, err := term.GetSize(int(os.Stdin.Fd()))
@@ -120,6 +128,8 @@ func runRecord(cmd *cobra.Command, args []string) {
 	defer f.Close()
 
 	bw := bufio.NewWriterSize(f, 256*1024)
+	var bwMu sync.Mutex
+	recorder := newRecordingWriter(bw, &bwMu, redactor)
 
 	// Write asciicast v2 header.
 	hdr := castHeader{
@@ -127,15 +137,17 @@ func runRecord(cmd *cobra.Command, args []string) {
 		Width:     width,
 		Height:    height,
 		Timestamp: time.Now().Unix(),
-		Command:   strings.Join(args, " "),
 		Title:     title,
 		Env: map[string]string{
 			"TERM":  getenv("TERM", "xterm-256color"),
 			"SHELL": getenv("SHELL", "/bin/sh"),
 		},
 	}
-	hdrJSON, _ := json.Marshal(hdr)
-	fmt.Fprintln(bw, string(hdrJSON))
+	if recordCommand {
+		hdr.Command = strings.Join(args, " ")
+	}
+	hdr.CommandLabel = commandLabel
+	recorder.writeHeader(hdr)
 
 	// Start the command under a PTY.
 	processCmd := exec.Command(args[0], args[1:]...)
@@ -177,8 +189,6 @@ func runRecord(cmd *cobra.Command, args []string) {
 	}
 
 	startTime := time.Now()
-	var bwMu sync.Mutex
-
 	// Forward PTY output to our stdout and write timed events to the cast file.
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -190,10 +200,8 @@ func runRecord(cmd *cobra.Command, args []string) {
 			if n > 0 {
 				elapsed := time.Since(startTime).Seconds()
 				os.Stdout.Write(buf[:n])
-				writeEvent(bw, &bwMu, elapsed, "o", string(buf[:n]))
-				bwMu.Lock()
-				bw.Flush()
-				bwMu.Unlock()
+				recorder.output(elapsed, string(buf[:n]))
+				recorder.flush()
 			}
 			if err != nil {
 				break
@@ -209,10 +217,8 @@ func runRecord(cmd *cobra.Command, args []string) {
 			if n > 0 {
 				elapsed := time.Since(startTime).Seconds()
 				ptmx.Write(buf[:n])
-				writeEvent(bw, &bwMu, elapsed, "i", string(buf[:n]))
-				bwMu.Lock()
-				bw.Flush()
-				bwMu.Unlock()
+				recorder.event(elapsed, "i", string(buf[:n]))
+				recorder.flush()
 			}
 			if err != nil {
 				break
@@ -225,7 +231,8 @@ func runRecord(cmd *cobra.Command, args []string) {
 	ptmx.Close()
 	wg.Wait()
 
-	bw.Flush()
+	recorder.flushOutput()
+	recorder.flush()
 	signal.Stop(sigWinch)
 	close(sigWinch)
 
