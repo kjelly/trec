@@ -5,8 +5,8 @@ package main
 // stdout here: stdout is JSON-RPC only.
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +16,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/creack/pty"
+	"github.com/mark3labs/mcp-go/mcp"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/spf13/cobra"
 )
 
@@ -37,43 +40,58 @@ func newMCPCommand() *cobra.Command {
 
 func runMCP() {
 	s := &mcpServer{sessions: map[string]*mcpSession{}}
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 64*1024), 8*1024*1024)
-	enc := json.NewEncoder(os.Stdout)
-	for sc.Scan() {
-		var r struct {
-			JSONRPC string          `json:"jsonrpc"`
-			ID      json.RawMessage `json:"id"`
-			Method  string          `json:"method"`
-			Params  json.RawMessage `json:"params"`
-		}
-		if json.Unmarshal(sc.Bytes(), &r) != nil {
-			continue
-		}
-		if len(r.ID) == 0 {
-			continue
-		}
-		result, e := s.handle(r.Method, r.Params)
-		resp := map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(r.ID)}
-		if e != nil {
-			resp["error"] = map[string]any{"code": -32000, "message": e.Error()}
-		} else {
-			resp["result"] = result
-		}
-		_ = enc.Encode(resp)
+	server := mcpserver.NewMCPServer("trec", appVersion, mcpserver.WithToolCapabilities(false), mcpserver.WithRecovery())
+	add := func(name, description string, tool mcp.Tool) {
+		server.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			args, _ := json.Marshal(req.GetArguments())
+			value, err := s.tool(name, args)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			out, _ := json.Marshal(value)
+			return mcp.NewToolResultText(string(out)), nil
+		})
+	}
+	add("run", "Run any local command once, including any trec subcommand.", mcp.NewTool("run", mcp.WithDescription("Run any local command once."), mcp.WithArray("command", mcp.Required()), mcp.WithString("stdin"), mcp.WithNumber("timeout_seconds"), mcp.WithString("working_directory")))
+	add("terminal_start", "Start a persistent terminal process.", mcp.NewTool("terminal_start", mcp.WithDescription("Start a persistent terminal process."), mcp.WithArray("command", mcp.Required()), mcp.WithString("working_directory")))
+	add("terminal_write", "Write to a persistent terminal process.", mcp.NewTool("terminal_write", mcp.WithDescription("Write to a persistent terminal process."), mcp.WithString("session_id", mcp.Required()), mcp.WithString("data", mcp.Required())))
+	add("terminal_read", "Read a persistent terminal process.", mcp.NewTool("terminal_read", mcp.WithDescription("Read a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
+	add("terminal_close", "Close a persistent terminal process.", mcp.NewTool("terminal_close", mcp.WithDescription("Close a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
+	add("session_list", "List persistent terminal sessions.", mcp.NewTool("session_list", mcp.WithDescription("List persistent terminal sessions.")))
+	if err := mcpserver.ServeStdio(server); err != nil {
+		fmt.Fprintln(os.Stderr, "trec mcp:", err)
 	}
 }
 
 func (s *mcpServer) handle(method string, raw json.RawMessage) (any, error) {
 	switch method {
 	case "initialize":
-		return map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]string{"name": "trec", "version": "1"}}, nil
+		version := "2024-11-05"
+		var p struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		}
+		_ = json.Unmarshal(raw, &p)
+		for _, supported := range []string{"2025-06-18", "2025-03-26", "2024-11-05"} {
+			if p.ProtocolVersion == supported {
+				version = supported
+				break
+			}
+		}
+		return map[string]any{"protocolVersion": version, "capabilities": map[string]any{"tools": map[string]any{"listChanged": false}, "resources": map[string]any{"listChanged": false}, "prompts": map[string]any{}}, "serverInfo": map[string]string{"name": "trec", "version": appVersion}}, nil
+	case "ping":
+		return map[string]any{}, nil
 	case "notifications/initialized":
 		return nil, nil
+	case "resources/list":
+		return map[string]any{"resources": []any{}}, nil
+	case "resources/templates/list":
+		return map[string]any{"resourceTemplates": []any{}}, nil
+	case "prompts/list":
+		return map[string]any{"prompts": []any{}}, nil
 	case "tools/list":
 		return map[string]any{"tools": []map[string]any{
 			{"name": "run", "description": "Run any local command once; use trec -o <cast-path> to choose a recording name. working_directory resolves relative paths.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]string{"type": "array"}, "stdin": map[string]string{"type": "string"}, "timeout_seconds": map[string]string{"type": "integer"}, "working_directory": map[string]string{"type": "string"}}, "required": []string{"command"}}},
-			{"name": "terminal_start", "description": "Start any local command and retain its stdin/stdout/stderr. Use trec -o <cast-path> to choose a recording name.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]string{"type": "array"}, "working_directory": map[string]string{"type": "string"}}, "required": []string{"command"}}},
+			{"name": "terminal_start", "description": "Start any local command under a PTY and retain its stdin/stdout. Use trec -o <cast-path> to choose a recording name.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]string{"type": "array"}, "working_directory": map[string]string{"type": "string"}}, "required": []string{"command"}}},
 			{"name": "terminal_write", "description": "Write bytes to a retained terminal session.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"session_id": map[string]string{"type": "string"}, "data": map[string]string{"type": "string"}}, "required": []string{"session_id", "data"}}},
 			{"name": "terminal_read", "description": "Read accumulated stdout/stderr and process state.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"session_id": map[string]string{"type": "string"}}, "required": []string{"session_id"}}},
 			{"name": "terminal_close", "description": "Terminate a retained session.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"session_id": map[string]string{"type": "string"}}, "required": []string{"session_id"}}},
@@ -88,7 +106,7 @@ func (s *mcpServer) handle(method string, raw json.RawMessage) (any, error) {
 		}
 		v, e := s.tool(p.Name, p.Arguments)
 		if e != nil {
-			return nil, e
+			return map[string]any{"content": []map[string]string{{"type": "text", "text": e.Error()}}, "isError": true}, nil
 		}
 		b, _ := json.Marshal(v)
 		return map[string]any{"content": []map[string]string{{"type": "text", "text": string(b)}}}, nil
@@ -152,16 +170,25 @@ func (s *mcpServer) tool(name string, raw json.RawMessage) (any, error) {
 		}
 		c := exec.Command(a[0], a[1:]...)
 		c.Dir = dir
-		in, e := c.StdinPipe()
+		ptmx, e := pty.Start(c)
 		if e != nil {
 			return nil, e
 		}
-		ss := &mcpSession{in: in, cmd: c}
-		c.Stdout = &ss.out
-		c.Stderr = &ss.err
-		if e = c.Start(); e != nil {
-			return nil, e
-		}
+		ss := &mcpSession{in: ptmx, cmd: c}
+		go func() {
+			buf := make([]byte, 4096)
+			for {
+				n, err := ptmx.Read(buf)
+				if n > 0 {
+					ss.mu.Lock()
+					ss.out.Write(buf[:n])
+					ss.mu.Unlock()
+				}
+				if err != nil {
+					break
+				}
+			}
+		}()
 		s.mu.Lock()
 		s.next++
 		id := "session-" + strconv.Itoa(s.next)
