@@ -1,8 +1,7 @@
 package main
 
-// A deliberately small stdio MCP transport.  It has no dependency on an MCP
-// SDK so `trec mcp` remains a single binary.  Never write diagnostics to
-// stdout here: stdout is JSON-RPC only.
+// Never write diagnostics to stdout here: MCP stdio reserves stdout for
+// JSON-RPC frames.
 
 import (
 	"bytes"
@@ -38,10 +37,15 @@ func newMCPCommand() *cobra.Command {
 	return &cobra.Command{Use: "mcp", Short: "Run trec as a stdio MCP server", Args: cobra.NoArgs, Run: func(*cobra.Command, []string) { runMCP() }}
 }
 
-func runMCP() {
-	s := &mcpServer{sessions: map[string]*mcpSession{}}
+const (
+	defaultMCPCols  = 120
+	defaultMCPRows  = 40
+	maxMCPDimension = 1000
+)
+
+func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
 	server := mcpserver.NewMCPServer("trec", appVersion, mcpserver.WithToolCapabilities(false), mcpserver.WithRecovery())
-	add := func(name, description string, tool mcp.Tool) {
+	add := func(name string, tool mcp.Tool) {
 		server.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			args, _ := json.Marshal(req.GetArguments())
 			value, err := s.tool(name, args)
@@ -52,66 +56,26 @@ func runMCP() {
 			return mcp.NewToolResultText(string(out)), nil
 		})
 	}
-	add("run", "Run any local command once, including any trec subcommand.", mcp.NewTool("run", mcp.WithDescription("Run any local command once."), mcp.WithArray("command", mcp.Required()), mcp.WithString("stdin"), mcp.WithNumber("timeout_seconds"), mcp.WithString("working_directory")))
-	add("terminal_start", "Start a persistent terminal process.", mcp.NewTool("terminal_start", mcp.WithDescription("Start a persistent terminal process."), mcp.WithArray("command", mcp.Required()), mcp.WithString("working_directory")))
-	add("terminal_write", "Write to a persistent terminal process.", mcp.NewTool("terminal_write", mcp.WithDescription("Write to a persistent terminal process."), mcp.WithString("session_id", mcp.Required()), mcp.WithString("data", mcp.Required())))
-	add("terminal_read", "Read a persistent terminal process.", mcp.NewTool("terminal_read", mcp.WithDescription("Read a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
-	add("terminal_close", "Close a persistent terminal process.", mcp.NewTool("terminal_close", mcp.WithDescription("Close a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
-	add("session_list", "List persistent terminal sessions.", mcp.NewTool("session_list", mcp.WithDescription("List persistent terminal sessions.")))
-	if err := mcpserver.ServeStdio(server); err != nil {
-		fmt.Fprintln(os.Stderr, "trec mcp:", err)
-	}
+	add("run", mcp.NewTool("run", mcp.WithDescription("Run any local command once."), mcp.WithArray("command", mcp.Required()), mcp.WithString("stdin"), mcp.WithNumber("timeout_seconds"), mcp.WithString("working_directory")))
+	add("terminal_start", mcp.NewTool("terminal_start",
+		mcp.WithDescription("Start a persistent terminal process."),
+		mcp.WithArray("command", mcp.Required()),
+		mcp.WithString("working_directory"),
+		mcp.WithInteger("cols", mcp.Description("PTY columns."), mcp.DefaultNumber(defaultMCPCols), mcp.Min(1), mcp.Max(maxMCPDimension)),
+		mcp.WithInteger("rows", mcp.Description("PTY rows."), mcp.DefaultNumber(defaultMCPRows), mcp.Min(1), mcp.Max(maxMCPDimension)),
+	))
+	add("terminal_write", mcp.NewTool("terminal_write", mcp.WithDescription("Write to a persistent terminal process."), mcp.WithString("session_id", mcp.Required()), mcp.WithString("data", mcp.Required())))
+	add("terminal_read", mcp.NewTool("terminal_read", mcp.WithDescription("Read a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
+	add("terminal_close", mcp.NewTool("terminal_close", mcp.WithDescription("Close a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
+	add("session_list", mcp.NewTool("session_list", mcp.WithDescription("List persistent terminal sessions.")))
+	return server
 }
 
-func (s *mcpServer) handle(method string, raw json.RawMessage) (any, error) {
-	switch method {
-	case "initialize":
-		version := "2024-11-05"
-		var p struct {
-			ProtocolVersion string `json:"protocolVersion"`
-		}
-		_ = json.Unmarshal(raw, &p)
-		for _, supported := range []string{"2025-06-18", "2025-03-26", "2024-11-05"} {
-			if p.ProtocolVersion == supported {
-				version = supported
-				break
-			}
-		}
-		return map[string]any{"protocolVersion": version, "capabilities": map[string]any{"tools": map[string]any{"listChanged": false}, "resources": map[string]any{"listChanged": false}, "prompts": map[string]any{}}, "serverInfo": map[string]string{"name": "trec", "version": appVersion}}, nil
-	case "ping":
-		return map[string]any{}, nil
-	case "notifications/initialized":
-		return nil, nil
-	case "resources/list":
-		return map[string]any{"resources": []any{}}, nil
-	case "resources/templates/list":
-		return map[string]any{"resourceTemplates": []any{}}, nil
-	case "prompts/list":
-		return map[string]any{"prompts": []any{}}, nil
-	case "tools/list":
-		return map[string]any{"tools": []map[string]any{
-			{"name": "run", "description": "Run any local command once; use trec -o <cast-path> to choose a recording name. working_directory resolves relative paths.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]string{"type": "array"}, "stdin": map[string]string{"type": "string"}, "timeout_seconds": map[string]string{"type": "integer"}, "working_directory": map[string]string{"type": "string"}}, "required": []string{"command"}}},
-			{"name": "terminal_start", "description": "Start any local command under a PTY and retain its stdin/stdout. Use trec -o <cast-path> to choose a recording name.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"command": map[string]string{"type": "array"}, "working_directory": map[string]string{"type": "string"}}, "required": []string{"command"}}},
-			{"name": "terminal_write", "description": "Write bytes to a retained terminal session.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"session_id": map[string]string{"type": "string"}, "data": map[string]string{"type": "string"}}, "required": []string{"session_id", "data"}}},
-			{"name": "terminal_read", "description": "Read accumulated stdout/stderr and process state.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"session_id": map[string]string{"type": "string"}}, "required": []string{"session_id"}}},
-			{"name": "terminal_close", "description": "Terminate a retained session.", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"session_id": map[string]string{"type": "string"}}, "required": []string{"session_id"}}},
-			{"name": "session_list", "description": "List retained sessions.", "inputSchema": map[string]any{"type": "object"}}}}, nil
-	case "tools/call":
-		var p struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, err
-		}
-		v, e := s.tool(p.Name, p.Arguments)
-		if e != nil {
-			return map[string]any{"content": []map[string]string{{"type": "text", "text": e.Error()}}, "isError": true}, nil
-		}
-		b, _ := json.Marshal(v)
-		return map[string]any{"content": []map[string]string{{"type": "text", "text": string(b)}}}, nil
-	default:
-		return nil, fmt.Errorf("unsupported MCP method %q", method)
+func runMCP() {
+	s := &mcpServer{sessions: map[string]*mcpSession{}}
+	server := newMCPProtocolServer(s)
+	if err := mcpserver.ServeStdio(server); err != nil {
+		fmt.Fprintln(os.Stderr, "trec mcp:", err)
 	}
 }
 
@@ -135,6 +99,31 @@ func commandFrom(raw json.RawMessage) ([]string, string, int, string, error) {
 	}
 	return a.Command, a.Stdin, a.Timeout, a.Dir, nil
 }
+
+func mcpTerminalSize(raw json.RawMessage) (*pty.Winsize, error) {
+	var options struct {
+		Cols *int `json:"cols"`
+		Rows *int `json:"rows"`
+	}
+	if err := json.Unmarshal(raw, &options); err != nil {
+		return nil, fmt.Errorf("decode terminal size: %w", err)
+	}
+	cols, rows := defaultMCPCols, defaultMCPRows
+	if options.Cols != nil {
+		cols = *options.Cols
+	}
+	if options.Rows != nil {
+		rows = *options.Rows
+	}
+	if cols < 1 || cols > maxMCPDimension {
+		return nil, fmt.Errorf("cols must be between 1 and %d", maxMCPDimension)
+	}
+	if rows < 1 || rows > maxMCPDimension {
+		return nil, fmt.Errorf("rows must be between 1 and %d", maxMCPDimension)
+	}
+	return &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}, nil
+}
+
 func (s *mcpServer) tool(name string, raw json.RawMessage) (any, error) {
 	switch name {
 	case "run":
@@ -168,9 +157,13 @@ func (s *mcpServer) tool(name string, raw json.RawMessage) (any, error) {
 		if e != nil {
 			return nil, e
 		}
+		size, e := mcpTerminalSize(raw)
+		if e != nil {
+			return nil, e
+		}
 		c := exec.Command(a[0], a[1:]...)
 		c.Dir = dir
-		ptmx, e := pty.Start(c)
+		ptmx, e := pty.StartWithSize(c, size)
 		if e != nil {
 			return nil, e
 		}

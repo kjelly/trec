@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +36,24 @@ func TestRecordingWriterRedactsAllCastFieldsAndSplitOutput(t *testing.T) {
 	}
 	if got := strings.Count(cast, `\u003credacted:APP_PASSWORD\u003e`); got != 6 {
 		t.Fatalf("redacted occurrences = %d, want 6:\n%s", got, cast)
+	}
+}
+
+func TestRecordingWriterWritesOutputImmediatelyWithoutSecrets(t *testing.T) {
+	redactor := &secretRedactor{}
+	var output bytes.Buffer
+	bw := bufio.NewWriter(&output)
+	var mu sync.Mutex
+	recorder := newRecordingWriter(bw, &mu, redactor)
+
+	recorder.output(1.25, "visible now")
+	// Flush only the buffered writer, not the pending output tail. With no
+	// declared secrets, output must not be retained until flushOutput.
+	recorder.flush()
+
+	const want = "[1.25,\"o\",\"visible now\"]\n"
+	if got := output.String(); got != want {
+		t.Fatalf("cast output before flushOutput = %q, want %q", got, want)
 	}
 }
 
@@ -71,6 +90,45 @@ func TestParseDriveLifecycleSteps(t *testing.T) {
 		if _, err := parseDriveLine(line, 3); err == nil {
 			t.Errorf("%q unexpectedly parsed", line)
 		}
+	}
+}
+
+func TestDriveNavigationStepsSendExpectedEscapeSequences(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	var cast bytes.Buffer
+	var mu sync.Mutex
+	redactor := &secretRedactor{}
+	ds := &driveSession{
+		ptmx:     w,
+		start:    time.Now(),
+		redactor: redactor,
+		recorder: newRecordingWriter(bufio.NewWriter(&cast), &mu, redactor),
+	}
+	for lineNo, line := range []string{"LEFT 2", "RIGHT", "ESCAPE"} {
+		step, err := parseDriveLine(line, lineNo+1)
+		if err != nil {
+			t.Fatalf("parse %q: %v", line, err)
+		}
+		if err := ds.applyStep(step); err != nil {
+			t.Fatalf("apply %q: %v", line, err)
+		}
+	}
+	const want = "\x1b[D\x1b[D\x1b[C\x1b"
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("navigation bytes = %q, want %q", got, want)
 	}
 }
 

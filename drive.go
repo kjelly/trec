@@ -77,10 +77,16 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		st.kind, st.n = "down", atoiOr1(arg)
 	case "UP":
 		st.kind, st.n = "up", atoiOr1(arg)
+	case "LEFT":
+		st.kind, st.n = "left", atoiOr1(arg)
+	case "RIGHT":
+		st.kind, st.n = "right", atoiOr1(arg)
 	case "SPACE":
 		st.kind = "space"
 	case "TAB":
 		st.kind = "tab"
+	case "ESCAPE":
+		st.kind = "escape"
 	case "CTRLC":
 		st.kind = "ctrlc"
 	case "BACKSPACE":
@@ -401,10 +407,14 @@ func (ds *driveSession) applyStep(st *driveStep) error {
 		// navigation (repeated arrow presses) doesn't need this; only
 		// the transition does.
 		time.Sleep(ds.settleDelay)
-	case "down", "up":
+	case "down", "up", "left", "right":
 		seq := "\x1b[B"
 		if st.kind == "up" {
 			seq = "\x1b[A"
+		} else if st.kind == "left" {
+			seq = "\x1b[D"
+		} else if st.kind == "right" {
+			seq = "\x1b[C"
 		}
 		for range max1(st.n) {
 			if err := ds.sendBytes([]byte(seq)); err != nil {
@@ -419,6 +429,11 @@ func (ds *driveSession) applyStep(st *driveStep) error {
 		time.Sleep(ds.keyDelay)
 	case "tab":
 		if err := ds.sendBytes([]byte("\t")); err != nil {
+			return err
+		}
+		time.Sleep(ds.keyDelay)
+	case "escape":
+		if err := ds.sendBytes([]byte("\x1b")); err != nil {
 			return err
 		}
 		time.Sleep(ds.keyDelay)
@@ -512,8 +527,8 @@ Use one of these modes:
 
 When both are supplied, trec runs the script first, then accepts interactive
 operations from stdin. Interactive operations include TEXT, TEXT_ENV, TEXT_FILE,
-ENTER, DOWN, UP, SPACE, TAB, CTRLC, BACKSPACE, WAIT, EXPECT, EXPECT_QUIET,
-ASSERT, SELECT, SNAPSHOT, and QUIT. Use TEXT_ENV/--secret-env or
+ENTER, DOWN, UP, LEFT, RIGHT, SPACE, TAB, ESCAPE, CTRLC, BACKSPACE, WAIT, EXPECT,
+EXPECT_QUIET, ASSERT, SELECT, SNAPSHOT, and QUIT. Use TEXT_ENV/--secret-env or
 TEXT_FILE/--secret-file for credentials. Run "trec drive --help" for flags.`,
 		Args: cobra.ArbitraryArgs,
 		Run:  runDrive,
