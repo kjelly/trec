@@ -2,3 +2,4 @@ trec
 terminal-record
 *.cast
 .playwright-mcp/
+dist/

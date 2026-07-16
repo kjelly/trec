@@ -1,0 +1,44 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: trec
+    main: .
+    binary: trec
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X github.com/kjelly/trec.appVersion={{.Version}}
+
+archives:
+  - id: trec
+    ids:
+      - trec
+    formats: [tar.gz]
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+dockers_v2:
+  - id: trec-image
+    ids:
+      - trec
+    dockerfile: Dockerfile
+    images:
+      - ghcr.io/kjelly/trec
+    tags:
+      - "v{{ .Version }}"
+      - "latest"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    sbom: true

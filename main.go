@@ -59,6 +59,7 @@ func newRootCommand() *cobra.Command {
 		Use:           "trec [record-options] [-- command [args...]]",
 		Short:         "Record, play, and inspect terminal sessions",
 		Long:          "trec records terminal sessions in asciicast v2 format, then plays, annotates, exports, and serves them.",
+		Version:       appVersion,
 		Args:          cobra.ArbitraryArgs,
 		Run:           runRecord,
 		SilenceErrors: true,
@@ -71,7 +72,7 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringArray("secret-file", nil, "NAME=path whose file content is redacted from the recording (repeatable)")
 	cmd.PersistentFlags().Bool("record-command", false, "store the command in the cast header (redacted by --secret-env/--secret-file)")
 	cmd.PersistentFlags().String("command-label", "", "safe label stored in the cast header instead of the full command")
-	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand(), newMCPCommand())
+	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand(), newMCPCommand(), newVersionCommand())
 	return cmd
 }
 
