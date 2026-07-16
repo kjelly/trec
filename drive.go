@@ -512,7 +512,8 @@ Use one of these modes:
 
 When both are supplied, trec runs the script first, then accepts interactive
 operations from stdin. Interactive operations include TEXT, TEXT_ENV, TEXT_FILE,
-ENTER, EXPECT, SNAPSHOT, and QUIT. Use TEXT_ENV/--secret-env or
+ENTER, DOWN, UP, SPACE, TAB, CTRLC, BACKSPACE, WAIT, EXPECT, EXPECT_QUIET,
+ASSERT, SELECT, SNAPSHOT, and QUIT. Use TEXT_ENV/--secret-env or
 TEXT_FILE/--secret-file for credentials. Run "trec drive --help" for flags.`,
 		Args: cobra.ArbitraryArgs,
 		Run:  runDrive,
@@ -755,6 +756,9 @@ func runDrive(cmd *cobra.Command, rest []string) {
 	// finish while its controller is still waiting to issue another operation.
 	interactiveQuitRequested := false
 	if *interactive {
+		// Output the initial screen state so AI agents don't have to blind-guess or wait for the first response
+		ds.respond(nil)
+
 		inputCh := make(chan string)
 		go func() {
 			defer close(inputCh)
