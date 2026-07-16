@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trec MCP"
+  short_description: "Operate trec through persistent MCP sessions"
+  default_prompt: "Use trec mcp to operate trec, especially stateful terminal sessions."

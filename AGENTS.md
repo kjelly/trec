@@ -15,12 +15,6 @@ Use **Go modules** (`go 1.24`):
 | Format file | `gofmt -w file.go` |
 | Run subcommand | `go run . play file.cast` |
 
-## Commit Attribution
-AI commits MUST include:
-```
-Co-Authored-By: (the agent's name and attribution byline)
-```
-
 ## Project Structure
 - Single `package main` binary; no subpackages.
 - `main.go` — top-level dispatch, default `record` behavior, PTY setup.
