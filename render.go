@@ -1,8 +1,8 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/hinshun/vt10x"
 	"github.com/spf13/cobra"
@@ -18,6 +18,7 @@ func newRenderCommand() *cobra.Command {
 	}
 	cmd.Flags().Bool("markers", false, "Print the screen state at every marker event")
 	cmd.Flags().Float64("at", -1, "Stop rendering and print the screen at this timestamp (seconds)")
+	cmd.Flags().String("output-format", "", "Output format (e.g. jsonl)")
 	return cmd
 }
 
@@ -39,6 +40,11 @@ func validateRenderSize(width, height int) error {
 func runRender(cmd *cobra.Command, args []string) error {
 	markersOnly, _ := cmd.Flags().GetBool("markers")
 	atTime, _ := cmd.Flags().GetFloat64("at")
+	apiFormat, _ := cmd.Flags().GetString("output-format")
+	if apiFormat != "" && apiFormat != "jsonl" {
+		return fmt.Errorf("invalid --output-format %q; must be \"\" or \"jsonl\"", apiFormat)
+	}
+	jsonFormat := apiFormat == "jsonl"
 
 	hdr, events, err := loadCastFile(args[0])
 	if err != nil {
@@ -58,26 +64,70 @@ func runRender(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("trec render: apply output at %.2fs: %w", e.sec, err)
 			}
 		} else if e.typ == "m" && markersOnly {
-			fmt.Printf("--- MARKER: %s [%.2fs] ---\n", e.data, e.sec)
-			printScreen(vt)
-			fmt.Println()
+			if jsonFormat {
+				printScreenJSON(vt, e.sec, e.data)
+			} else {
+				fmt.Printf("--- MARKER: %s [%.2fs] ---\n", e.data, e.sec)
+				printScreen(vt)
+				fmt.Println()
+			}
 		}
 	}
 
 	if !markersOnly {
-		printScreen(vt)
+		if jsonFormat {
+			// Find the last event time for timestamp
+			t := 0.0
+			if len(events) > 0 {
+				t = events[len(events)-1].sec
+				if atTime >= 0 && t > atTime {
+					t = atTime
+				}
+			}
+			printScreenJSON(vt, t, "")
+		} else {
+			printScreen(vt)
+		}
 	}
 	return nil
 }
 
 func printScreen(vt vt10x.Terminal) {
-	lines := strings.Split(vt.String(), "\n")
-	// Trim trailing blank lines
-	last := len(lines) - 1
-	for last >= 0 && strings.TrimSpace(lines[last]) == "" {
-		last--
+	lines := normalizeScreen(vt.String())
+	for _, l := range lines {
+		fmt.Println(l)
 	}
-	for i := 0; i <= last; i++ {
-		fmt.Println(strings.TrimRight(lines[i], " "))
+}
+
+func printScreenJSON(vt vt10x.Terminal, timestamp float64, marker string) {
+	lines := normalizeScreen(vt.String())
+	cursor := vt.Cursor()
+	cols, rows := vt.Size()
+	res := struct {
+		Timestamp float64 `json:"timestamp"`
+		Marker    string  `json:"marker,omitempty"`
+		Cursor    struct {
+			Row int `json:"row"`
+			Col int `json:"col"`
+		} `json:"cursor"`
+		Size struct {
+			Rows int `json:"rows"`
+			Cols int `json:"cols"`
+		} `json:"size"`
+		Screen []string `json:"screen"`
+	}{
+		Timestamp: timestamp,
+		Marker:    marker,
+		Cursor: struct {
+			Row int `json:"row"`
+			Col int `json:"col"`
+		}{Row: cursor.Y, Col: cursor.X},
+		Size: struct {
+			Rows int `json:"rows"`
+			Cols int `json:"cols"`
+		}{Rows: rows, Cols: cols},
+		Screen: lines,
 	}
+	out, _ := json.Marshal(res)
+	fmt.Println(string(out))
 }

@@ -149,7 +149,14 @@ func runRecord(cmd *cobra.Command, args []string) {
 		hdr.Command = strings.Join(args, " ")
 	}
 	hdr.CommandLabel = commandLabel
-	recorder.writeHeader(hdr)
+	if err := recorder.writeHeader(hdr); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write header: %v\n", err)
+		os.Exit(1)
+	}
+	if err := recorder.flush(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write header: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Start the command under a PTY.
 	processCmd := exec.Command(args[0], args[1:]...)
@@ -233,15 +240,31 @@ func runRecord(cmd *cobra.Command, args []string) {
 	ptmx.Close()
 	wg.Wait()
 
-	recorder.flushOutput()
-	recorder.flush()
+	var recErr error
+	if err := recorder.flushOutput(); err != nil {
+		recErr = err
+	}
+	if err := recorder.flush(); err != nil && recErr == nil {
+		recErr = err
+	}
+	if err := recorder.getError(); err != nil && recErr == nil {
+		recErr = err
+	}
 	signal.Stop(sigWinch)
 	close(sigWinch)
 
 	if isInteractive {
 		term.Restore(int(os.Stdin.Fd()), oldState)
+		if recErr != nil {
+			fmt.Fprintf(os.Stderr, "\r\nError saving recording: %v\r\n", recErr)
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "\r\nDone. Recording saved to %s\r\n", outputFile)
 	} else {
+		if recErr != nil {
+			fmt.Fprintf(os.Stderr, "Error saving recording: %v\n", recErr)
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "Done. Recording saved to %s\n", outputFile)
 	}
 }

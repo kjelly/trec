@@ -202,13 +202,26 @@ type recordingWriter struct {
 	redactor  *secretRedactor
 	pending   string
 	pendingAt float64
+	writeErr  error
 }
 
 func newRecordingWriter(bw *bufio.Writer, mu *sync.Mutex, redactor *secretRedactor) *recordingWriter {
 	return &recordingWriter{bw: bw, mu: mu, redactor: redactor}
 }
 
-func (rw *recordingWriter) writeHeader(hdr castHeader) {
+func (rw *recordingWriter) setErrorLocked(err error) {
+	if err != nil && rw.writeErr == nil {
+		rw.writeErr = err
+	}
+}
+
+func (rw *recordingWriter) getError() error {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	return rw.writeErr
+}
+
+func (rw *recordingWriter) writeHeader(hdr castHeader) error {
 	hdr.Command = rw.redactor.RedactString(hdr.Command)
 	hdr.CommandLabel = rw.redactor.RedactString(hdr.CommandLabel)
 	hdr.Title = rw.redactor.RedactString(hdr.Title)
@@ -218,17 +231,26 @@ func (rw *recordingWriter) writeHeader(hdr castHeader) {
 	b, _ := json.Marshal(hdr)
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
-	_, _ = rw.bw.Write(b)
-	_ = rw.bw.WriteByte('\n')
+	if rw.writeErr != nil {
+		return rw.writeErr
+	}
+	_, err := rw.bw.Write(b)
+	rw.setErrorLocked(err)
+	if err == nil {
+		_, err = rw.bw.Write([]byte{'\n'})
+		rw.setErrorLocked(err)
+	}
+	return rw.writeErr
 }
 
-func (rw *recordingWriter) event(elapsed float64, eventType, data string) {
+func (rw *recordingWriter) event(elapsed float64, eventType, data string) error {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	rw.writeEventLocked(elapsed, eventType, rw.redactor.RedactString(data))
+	return rw.writeErr
 }
 
-func (rw *recordingWriter) output(elapsed float64, data string) {
+func (rw *recordingWriter) output(elapsed float64, data string) error {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	if rw.pending == "" {
@@ -240,7 +262,7 @@ func (rw *recordingWriter) output(elapsed float64, data string) {
 		keep = 0
 	}
 	if len(rw.pending) <= keep {
-		return
+		return rw.writeErr
 	}
 	cut := len(rw.pending) - keep
 	cut = rw.redactor.safeOutputCut(rw.pending, cut)
@@ -250,27 +272,41 @@ func (rw *recordingWriter) output(elapsed float64, data string) {
 	rw.writeEventLocked(rw.pendingAt, "o", rw.redactor.RedactString(rw.pending[:cut]))
 	rw.pending = rw.pending[cut:]
 	rw.pendingAt = elapsed
+	return rw.writeErr
 }
 
-func (rw *recordingWriter) flushOutput() {
+func (rw *recordingWriter) flushOutput() error {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
 	if rw.pending != "" {
 		rw.writeEventLocked(rw.pendingAt, "o", rw.redactor.RedactString(rw.pending))
 		rw.pending = ""
 	}
+	return rw.writeErr
 }
 
-func (rw *recordingWriter) flush() {
+func (rw *recordingWriter) flush() error {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
-	_ = rw.bw.Flush()
+	if rw.writeErr != nil {
+		return rw.writeErr
+	}
+	err := rw.bw.Flush()
+	rw.setErrorLocked(err)
+	return rw.writeErr
 }
 
 func (rw *recordingWriter) writeEventLocked(elapsed float64, eventType, data string) {
+	if rw.writeErr != nil {
+		return
+	}
 	b, _ := json.Marshal([]any{elapsed, eventType, data})
-	_, _ = rw.bw.Write(b)
-	_ = rw.bw.WriteByte('\n')
+	_, err := rw.bw.Write(b)
+	rw.setErrorLocked(err)
+	if err == nil {
+		_, err = rw.bw.Write([]byte{'\n'})
+		rw.setErrorLocked(err)
+	}
 }
 
 func (rw *recordingWriter) dumpScreen(w io.Writer, cols, rows int, lines []string) {

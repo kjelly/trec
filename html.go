@@ -12,8 +12,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const htmlPlayerVersion = "3.17.0"
-
 // The official standalone player bundle includes its WASM runtime. Embedding
 // it keeps generated pages and trec serve usable without a CDN connection.
 //

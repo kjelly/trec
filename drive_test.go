@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"os/exec"
@@ -78,17 +79,68 @@ func TestParseDriveLifecycleSteps(t *testing.T) {
 	if err != nil || assert.kind != "assert_exit" || assert.n != 7 {
 		t.Fatalf("ASSERT_EXIT = %#v, %v", assert, err)
 	}
-	interactive := &driveSession{interactive: true}
-	if err := interactive.applyStep(wait); err == nil {
+	interactive := &driveSession{interactive: true, ts: &terminalSession{}}
+	if err := interactive.applyStep(context.Background(), wait); err == nil {
 		t.Fatal("interactive WAIT_CHILD_EXIT unexpectedly succeeded")
 	}
-	if err := interactive.applyStep(assert); err == nil {
+	if err := interactive.applyStep(context.Background(), assert); err == nil {
 		t.Fatal("interactive ASSERT_EXIT unexpectedly succeeded")
 	}
 
 	for _, line := range []string{"WAIT_CHILD_EXIT extra", "ASSERT_EXIT", "ASSERT_EXIT -1"} {
 		if _, err := parseDriveLine(line, 3); err == nil {
 			t.Errorf("%q unexpectedly parsed", line)
+		}
+	}
+}
+
+func TestParseJSONDriveSteps(t *testing.T) {
+	// 1. Valid JSON steps
+	step1, err := parseDriveLine(`{"kind": "text", "text": "hello"}`, 1)
+	if err != nil || step1.kind != "text" || step1.text != "hello" {
+		t.Fatalf("failed to parse valid JSON step: %#v, %v", step1, err)
+	}
+
+	step2, err := parseDriveLine(`{"op": "DOWN", "n": 3}`, 2)
+	if err != nil || step2.kind != "down" || step2.n != 3 {
+		t.Fatalf("failed to parse valid JSON step with op: %#v, %v", step2, err)
+	}
+
+	step3, err := parseDriveLine(`{"kind": "expect", "text": "target"}`, 3)
+	if err != nil || step3.kind != "expect" || step3.text != "target" {
+		t.Fatalf("failed to parse valid JSON expect step: %#v, %v", step3, err)
+	}
+
+	step4, err := parseDriveLine(`{"kind": "assert_exit", "n": 0}`, 4)
+	if err != nil || step4.kind != "assert_exit" || step4.n != 0 || !step4.hasN {
+		t.Fatalf("failed to parse valid JSON assert_exit 0 step: %#v, %v", step4, err)
+	}
+
+	// 2. Invalid/Unknown JSON steps - should be rejected with errors
+	invalidLines := []struct {
+		input string
+		msg   string
+	}{
+		{`{"kind": "typo"}`, "unknown op"},
+		{`{"kind": "expect"}`, "EXPECT needs text"},
+		{`{"kind": "expect", "text": ""}`, "EXPECT needs text"},
+		{`{"kind": "text_env", "text": "bad env"}`, "TEXT_ENV needs an environment variable name"},
+		{`{"kind": "text_file", "text": ""}`, "TEXT_FILE needs a path"},
+		{`{"kind": "select", "text": ""}`, "SELECT needs a label"},
+		{`{"kind": "wait_child_exit", "text": "extra"}`, "WAIT_CHILD_EXIT takes no arguments"},
+		{`{"kind": "assert_exit", "n": -1}`, "ASSERT_EXIT needs a non-negative exit code"},
+		{`{"kind": "assert_exit"}`, "ASSERT_EXIT needs an exit code"},
+		{`{"kind": "expect", "text": "ready", "n": 0}`, "EXPECT needs a positive timeout duration"},
+		{`{"kind": "expect", "text": "ready", "n": -1}`, "EXPECT needs a positive timeout duration"},
+		{`{"kind": "text"`, "invalid JSON request"}, // Malformed JSON syntax
+	}
+
+	for _, tc := range invalidLines {
+		_, err := parseDriveLine(tc.input, 5)
+		if err == nil {
+			t.Errorf("expected JSON line %q to be rejected, but it succeeded", tc.input)
+		} else if !strings.Contains(err.Error(), tc.msg) {
+			t.Errorf("expected error message to contain %q, got: %v", tc.msg, err)
 		}
 	}
 }
@@ -104,18 +156,20 @@ func TestDriveNavigationStepsSendExpectedEscapeSequences(t *testing.T) {
 	var cast bytes.Buffer
 	var mu sync.Mutex
 	redactor := &secretRedactor{}
+	pr, pw, _ := os.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	ts := newTerminalSession(w, pr, nil, 80, 24, newRecordingWriter(bufio.NewWriter(&cast), &mu, redactor), false, nil)
 	ds := &driveSession{
-		ptmx:     w,
-		start:    time.Now(),
+		ts:       ts,
 		redactor: redactor,
-		recorder: newRecordingWriter(bufio.NewWriter(&cast), &mu, redactor),
 	}
 	for lineNo, line := range []string{"LEFT 2", "RIGHT", "ESCAPE"} {
 		step, err := parseDriveLine(line, lineNo+1)
 		if err != nil {
 			t.Fatalf("parse %q: %v", line, err)
 		}
-		if err := ds.applyStep(step); err != nil {
+		if err := ds.applyStep(context.Background(), step); err != nil {
 			t.Fatalf("apply %q: %v", line, err)
 		}
 	}
@@ -299,4 +353,92 @@ func TestDriveWaitChildExitAndAssertExit(t *testing.T) {
 			t.Fatalf("successful assertion recorded failure:\n%s", cast)
 		}
 	})
+}
+
+func TestDriveAndRenderOutputFormat(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "trec")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build trec: %v\n%s", err, output)
+	}
+
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "steps.txt")
+	castPath := filepath.Join(dir, "run.cast")
+	if err := os.WriteFile(scriptPath, []byte("WAIT_CHILD_EXIT\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Test validation error with invalid --output-format on drive
+	cmdDrive := exec.Command(binary, "drive", "--output-format", "json", "--script", scriptPath, "-o", castPath, "--", "echo", "1")
+	outDrive, errDrive := cmdDrive.CombinedOutput()
+	if errDrive == nil || !strings.Contains(string(outDrive), "invalid --output-format") {
+		t.Fatalf("expected drive validation error, got: %v\n%s", errDrive, outDrive)
+	}
+
+	// 2. Test successful JSONL output format on drive (interactive)
+	cmdDriveJSONL := exec.Command(binary, "drive", "--output-format", "jsonl", "--interactive", "-o", castPath, "--", "echo", "hello-jsonl")
+	stdin, err := cmdDriveJSONL.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var outBuf bytes.Buffer
+	cmdDriveJSONL.Stdout = &outBuf
+	if err := cmdDriveJSONL.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	stdin.Write([]byte("WAIT_CHILD_EXIT\n"))
+	stdin.Close()
+
+	if err := cmdDriveJSONL.Wait(); err != nil {
+		t.Fatalf("drive interactive failed: %v", err)
+	}
+
+	outDriveJSONL := outBuf.String()
+	foundJSONL := false
+	for _, line := range strings.Split(outDriveJSONL, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err == nil {
+			if _, exists := m["screen"]; exists {
+				foundJSONL = true
+			}
+		}
+	}
+	if !foundJSONL {
+		t.Fatalf("expected JSONL structured output from drive, got:\n%s", outDriveJSONL)
+	}
+
+	// 3. Test validation error with invalid --output-format on render
+	cmdRender := exec.Command(binary, "render", "--output-format", "json", castPath)
+	outRender, errRender := cmdRender.CombinedOutput()
+	if errRender == nil || !strings.Contains(string(outRender), "invalid --output-format") {
+		t.Fatalf("expected render validation error, got: %v\n%s", errRender, outRender)
+	}
+
+	// 4. Test JSONL output format on render
+	cmdRenderJSONL := exec.Command(binary, "render", "--output-format", "jsonl", castPath)
+	outRenderJSONL, errRenderJSONL := cmdRenderJSONL.CombinedOutput()
+	if errRenderJSONL != nil {
+		t.Fatalf("failed to run render with jsonl format: %v\n%s", errRenderJSONL, outRenderJSONL)
+	}
+	foundRenderJSONL := false
+	for _, line := range strings.Split(string(outRenderJSONL), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err == nil {
+			if _, exists := m["screen"]; exists {
+				foundRenderJSONL = true
+			}
+		}
+	}
+	if !foundRenderJSONL {
+		t.Fatalf("expected JSONL structured output from render, got:\n%s", outRenderJSONL)
+	}
 }

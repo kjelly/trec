@@ -410,14 +410,6 @@ func visualizeKeys(data string) string {
 	return b.String()
 }
 
-func fmtDur(sec float64) string {
-	t := int(sec)
-	if h := t / 3600; h > 0 {
-		return fmt.Sprintf("%d:%02d:%02d", h, (t%3600)/60, t%60)
-	}
-	return fmt.Sprintf("%d:%02d", t/60, t%60)
-}
-
 func newPlayCommand() *cobra.Command {
 	cmd := &cobra.Command{Use: "play <file.cast>", Short: "Play back a recording", Args: cobra.ExactArgs(1), Run: runPlay}
 	cmd.Flags().Float64P("speed", "s", 1.0, "initial playback speed multiplier (e.g. 2.0 = double speed)")
