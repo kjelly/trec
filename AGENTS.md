@@ -21,6 +21,7 @@ Use **Go modules** (`go 1.24`):
 - `play.go` — interactive playback with status bar and key controls.
 - `drive.go` — scripted TUI driving via keystroke scripts.
 - `transcript.go` — ANSI-stripped transcript for agents.
+- `render.go` — VT100-emulated screen renderer for agents to read final/marker states of full-screen TUIs.
 - `annotate.go` — merges marker events from JSON.
 - `cast.go` — asciicast v2 load/save helpers.
 - `skills/trec-terminal-audit/` — project skill for terminal audit recordings. See `SKILL.md` there.
