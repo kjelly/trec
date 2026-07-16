@@ -236,7 +236,10 @@ func (rw *recordingWriter) output(elapsed float64, data string) {
 	}
 	rw.pending += data
 	keep := rw.redactor.maxSecretBytes() - 1
-	if keep <= 0 || len(rw.pending) <= keep {
+	if keep < 0 {
+		keep = 0
+	}
+	if len(rw.pending) <= keep {
 		return
 	}
 	cut := len(rw.pending) - keep
