@@ -40,6 +40,39 @@ func TestMCPTerminalSize(t *testing.T) {
 	}
 }
 
+// TestMCPServerAdvertisesArrayItemSchema guards against a real
+// regression: mcp.WithArray("command", mcp.Required()) alone produces
+// a bare {"type":"array"} schema with no "items" — valid JSON Schema,
+// but MCP clients that validate/convert tool schemas before exposing
+// them (observed with Claude Code) silently dropped both "run" and
+// "terminal_start" entirely rather than surfacing an error, since
+// neither ever appeared in the client's own tool listing despite the
+// server responding correctly to a raw tools/list probe. Every array
+// property in this server's tool schemas must declare its item type.
+func TestMCPServerAdvertisesArrayItemSchema(t *testing.T) {
+	server := newMCPProtocolServer(&mcpServer{sessions: map[string]*mcpSession{}})
+	for _, toolName := range []string{"run", "terminal_start"} {
+		tool := server.GetTool(toolName)
+		if tool == nil {
+			t.Fatalf("%s tool is missing", toolName)
+		}
+		property, ok := tool.Tool.InputSchema.Properties["command"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s property %q is missing", toolName, "command")
+		}
+		if property["type"] != "array" {
+			t.Fatalf("%s command type = %v, want array", toolName, property["type"])
+		}
+		items, ok := property["items"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s command schema has no \"items\" (this is exactly the bug that made Claude Code silently drop the tool): %#v", toolName, property)
+		}
+		if items["type"] != "string" {
+			t.Fatalf("%s command items type = %v, want string", toolName, items["type"])
+		}
+	}
+}
+
 func TestMCPServerAdvertisesTerminalSize(t *testing.T) {
 	server := newMCPProtocolServer(&mcpServer{sessions: map[string]*mcpSession{}})
 	tool := server.GetTool("terminal_start")

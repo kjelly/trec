@@ -56,10 +56,10 @@ func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
 			return mcp.NewToolResultText(string(out)), nil
 		})
 	}
-	add("run", mcp.NewTool("run", mcp.WithDescription("Run any local command once."), mcp.WithArray("command", mcp.Required()), mcp.WithString("stdin"), mcp.WithNumber("timeout_seconds"), mcp.WithString("working_directory")))
+	add("run", mcp.NewTool("run", mcp.WithDescription("Run any local command once."), mcp.WithArray("command", mcp.Required(), mcp.WithStringItems(), mcp.Description("Argv: command name followed by its arguments, e.g. [\"echo\", \"hi\"].")), mcp.WithString("stdin"), mcp.WithNumber("timeout_seconds"), mcp.WithString("working_directory")))
 	add("terminal_start", mcp.NewTool("terminal_start",
 		mcp.WithDescription("Start a persistent terminal process."),
-		mcp.WithArray("command", mcp.Required()),
+		mcp.WithArray("command", mcp.Required(), mcp.WithStringItems(), mcp.Description("Argv: command name followed by its arguments, e.g. [\"bash\"].")),
 		mcp.WithString("working_directory"),
 		mcp.WithInteger("cols", mcp.Description("PTY columns."), mcp.DefaultNumber(defaultMCPCols), mcp.Min(1), mcp.Max(maxMCPDimension)),
 		mcp.WithInteger("rows", mcp.Description("PTY rows."), mcp.DefaultNumber(defaultMCPRows), mcp.Min(1), mcp.Max(maxMCPDimension)),
