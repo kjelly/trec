@@ -79,8 +79,14 @@ inside the recorded shell before typing `exit`:
 2. Confirm its first line is an asciicast v2 header with the intended title.
 3. Inspect a clean transcript with `trec transcript <cast>` when that subcommand is
    available; otherwise inspect the cast header and events directly.
-4. Record final repository status and all relevant test results.
-5. Confirm that no second conversation cast was created.
+4. Read the cast's adjacent `.result.json`; its `status` must be `success` and its
+   `exit_code` must be zero before describing the audited command as successful.
+   A non-success result is audit evidence of failure, not a successful recording.
+5. Run trec's secret scan against the cast. A finding blocks sharing, HTML export,
+   and HTTP serving; re-record with declared exact-value redaction rather than
+   editing the cast by hand.
+6. Record final repository status and all relevant test results.
+7. Confirm that no second conversation cast was created.
 
 Then type `exit`, wait for `trec` to report that it saved the recording, and retain
 the same cast path in the final response.

@@ -46,7 +46,10 @@ QUIT                 提前結束
 5. **EXPECT/ASSERT 是逐列比對**：跨列折行的長字串不會命中。選短而唯一的關鍵字；
    寬度不夠導致折行時加大 `-W`。
 6. **固定終端尺寸**（預設 220×50），重跑才可重現；別依賴外層終端大小。
-7. **秘密不落地**：密碼、token 絕不 `TEXT` 進錄影。wizard 要求輸入秘密時，用
+7. **先讀結果摘要，再決定是否重播。** 每個錄影完成後，trec 會在 cast 旁寫入 `.result.json`；先以其中的 `status`、`exit_code`、`error` 與 `final_screen` 判定結果。`status != success` 時不得把該錄影當作驗證證據；失敗錄影也會在 cast 中留下 `FAILED_SCREEN` marker。
+8. **腳本定稿時啟用嚴格選單防呆。** `--strict-agent` 會拒絕 `UP`／`DOWN` 腳本步驟，避免依選項位置盲打；選單要以 `SELECT <label>` 表達。只有已證實為非選單游標操作時，才不要使用此旗標並在腳本旁說明原因。
+9. **分享前掃描。** 對每個準備提供給人或其他 agent 的 cast 執行 trec 的 secret scan；有 finding 時先宣告正確的 `--secret-env`／`--secret-file` 後重新錄製，不能以手動刪改 cast 取代。
+10. **秘密不落地**：密碼、token 絕不 `TEXT` 進錄影。wizard 要求輸入秘密時，用
    `TEXT_ENV <ENV>` 或 `TEXT_FILE <path>`。以 `--secret-env <ENV>` 或
    `--secret-file NAME=path` 宣告任何可能出現在 command、子程序 output、marker 或診斷的
    秘密（可重複）。兩種 TEXT 指令都會真正送值到 PTY，但 cast 只留下 `<redacted:...>`；
@@ -59,11 +62,11 @@ QUIT                 提前結束
    `TEXT` 或 `trec record` 的鍵盤輸入：後者可能把一個值拆成多個 input event，無法取得
    output redaction 的跨 chunk 保證。HTML / `serve` 的 keystroke overlay 只會顯示 cast
    已存的 input event，分享前仍須確認裡面沒有未宣告的秘密。
-8. **長跑 apply 不得以 `EXPECT_QUIET` 判定完成。** `EXPECT_QUIET` 只適合短暫、可預期
+11. **長跑 apply 不得以 `EXPECT_QUIET` 判定完成。** `EXPECT_QUIET` 只適合短暫、可預期
    會停止的畫面轉場；Ansible 等持續輸出的工作會讓它一直等到輸出停止。最後一次送出
    apply 後，腳本必須以 `WAIT_CHILD_EXIT` 再以 `ASSERT_EXIT 0` 判定完成；不要用 per-step
    `EXPECT@` 或 quiet timeout 當整個 deploy 的存活／完成判斷。
-9. **同一個有狀態的多步驟流程，探勘必須使用同一個錄影與 stdin session。** 前一頁的
+12. **同一個有狀態的多步驟流程，探勘必須使用同一個錄影與 stdin session。** 前一頁的
    輸入會影響下一頁、可返回、或最後才提交的流程，禁止為每個畫面另開探勘錄影；逐頁
    重啟會遺失狀態，也無法驗證真正的轉場。以同一個 `--interactive` session 逐步讀取
    `SCREEN`，直到流程完成或找到可重現的分岔。每次啟動都能直接進入同一畫面且沒有
@@ -107,7 +110,7 @@ trec drive --script steps.txt -o run.cast -- ./wizard
 ## 失敗了怎麼辦
 
 fail-fast 已內建：任一步失敗會立刻停止（後續按鍵不會打出去）、stderr 印出
-**失敗行號 + 指令 + 原因 + 當下畫面傾印**、cast 裡留下 `FAILED` marker、exit 1。
+**失敗行號 + 指令 + 原因 + 當下畫面傾印**、cast 裡留下 `FAILED` 與 `FAILED_SCREEN` marker、同名 `.result.json` 寫入失敗摘要，並以 exit 1 結束。
 
 1. 先讀 stderr 的畫面傾印——多數情況直接看出實際畫面與預期差在哪。
 2. `trec play run.cast`：`n`/`N` 跳 step marker（每行腳本一個 ⚑），`←/→` 逐格、

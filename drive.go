@@ -307,6 +307,17 @@ func (ds *driveSession) marker(label string) {
 	}
 }
 
+// failureMarker records both the failing operation and the rendered screen so
+// an agent can diagnose a failed cast without a separate render invocation.
+func (ds *driveSession) failureMarker(st *driveStep, err error) {
+	ds.marker(fmt.Sprintf("FAILED line %d: %s (%v)", st.line, st.raw, err))
+	lines := ds.screenLines()
+	for i := range lines {
+		lines[i] = ds.redactor.RedactString(lines[i])
+	}
+	ds.marker(fmt.Sprintf("FAILED_SCREEN line %d:\n%s", st.line, strings.Join(lines, "\n")))
+}
+
 func (ds *driveSession) dumpScreen(w io.Writer) {
 	lines := ds.screenLines()
 	last := len(lines) - 1
@@ -502,6 +513,7 @@ TEXT_FILE/--secret-file for credentials. Run "trec drive --help" for flags.`,
 	cmd.Flags().Int("expect-timeout", 10000, "default milliseconds EXPECT waits before failing")
 	cmd.Flags().String("pointer", `^\s*(?:❯|▸|›|→|»|>)\s`, "regexp matching a menu selection-pointer row, used by SELECT")
 	cmd.Flags().Bool("step-markers", true, "record a marker event per script step")
+	cmd.Flags().Bool("strict-agent", false, "reject UP/DOWN script steps; use SELECT for menu choices")
 	return cmd
 }
 
@@ -526,6 +538,7 @@ func runDrive(cmd *cobra.Command, rest []string) {
 	expectTimeoutMsValue, _ := cmd.Flags().GetInt("expect-timeout")
 	pointerValue, _ := cmd.Flags().GetString("pointer")
 	stepMarkersValue, _ := cmd.Flags().GetBool("step-markers")
+	strictAgentValue, _ := cmd.Flags().GetBool("strict-agent")
 	secretEnv, _ := cmd.Flags().GetStringArray("secret-env")
 	secretFiles, _ := cmd.Flags().GetStringArray("secret-file")
 	recordCommand, _ := cmd.Flags().GetBool("record-command")
@@ -551,6 +564,14 @@ func runDrive(cmd *cobra.Command, rest []string) {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "trec drive: load script: %v\n", err)
 			os.Exit(2)
+		}
+	}
+	if strictAgentValue {
+		for _, st := range steps {
+			if st.kind == "down" || st.kind == "up" {
+				fmt.Fprintf(os.Stderr, "trec drive: line %d: --strict-agent rejects %s; use SELECT <label> for menu choices\n", st.line, strings.ToUpper(st.kind))
+				os.Exit(2)
+			}
 		}
 	}
 	redactor, err := newSecretRedactor(secretEnv)
@@ -659,8 +680,9 @@ func runDrive(cmd *cobra.Command, rest []string) {
 		if err := ds.applyStep(ctx, st); err != nil {
 			fmt.Fprintf(os.Stderr, "trec drive: FAILED at line %d (%s): %v\n", st.line, st.raw, err)
 			ds.dumpScreen(os.Stderr)
-			if ds.stepMarkers {
-				ds.marker(fmt.Sprintf("FAILED line %d: %s (%v)", st.line, st.raw, err))
+			ds.failureMarker(st, err)
+			if resultErr := writeSessionResult(*outputFile, ds.result("failed", -1, fmt.Sprintf("line %d: %v", st.line, err))); resultErr != nil {
+				fmt.Fprintf(os.Stderr, "trec drive: write summary: %v\n", resultErr)
 			}
 			if errClose := ts.close(); errClose != nil {
 				fmt.Fprintf(os.Stderr, "trec drive: finalize error: %v\n", errClose)
@@ -795,8 +817,37 @@ interactiveDone:
 	}
 
 	fmt.Fprintf(os.Stderr, "trec drive: recorded to %s — replay with: trec play %s\n", *outputFile, *outputFile)
+	status := "success"
+	message := ""
+	if failed || finalizeErr != nil {
+		status = "failed"
+		if finalizeErr != nil {
+			message = finalizeErr.Error()
+		} else if processExitErr != nil {
+			message = processExitErr.Error()
+		}
+	}
+	_, exitCode, _ := ts.getExitState()
+	if err := writeSessionResult(*outputFile, ds.result(status, exitCode, message)); err != nil {
+		fmt.Fprintf(os.Stderr, "trec drive: write summary: %v\n", err)
+		failed = true
+	}
 
 	if failed {
 		os.Exit(1)
+	}
+}
+
+func (ds *driveSession) result(status string, exitCode int, message string) sessionResult {
+	lines := ds.screenLines()
+	for i := range lines {
+		lines[i] = ds.redactor.RedactString(lines[i])
+	}
+	return sessionResult{
+		Status:          status,
+		ExitCode:        exitCode,
+		Error:           message,
+		DurationSeconds: time.Since(ds.ts.start).Seconds(),
+		FinalScreen:     lines,
 	}
 }

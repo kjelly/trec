@@ -62,7 +62,7 @@ func TestMCPTerminalSize(t *testing.T) {
 // server responding correctly to a raw tools/list probe. Every array
 // property in this server's tool schemas must declare its item type.
 func TestMCPServerAdvertisesArrayItemSchema(t *testing.T) {
-	server := newMCPProtocolServer(&mcpServer{sessions: map[string]*mcpSession{}})
+	server := newMCPProtocolServer(&mcpServer{sessions: map[string]*terminalSession{}})
 	for _, toolName := range []string{"run", "terminal_start"} {
 		tool := server.GetTool(toolName)
 		if tool == nil {

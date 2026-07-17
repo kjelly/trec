@@ -73,7 +73,7 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringArray("secret-file", nil, "NAME=path whose file content is redacted from the recording (repeatable)")
 	cmd.PersistentFlags().Bool("record-command", false, "store the command in the cast header (redacted by --secret-env/--secret-file)")
 	cmd.PersistentFlags().String("command-label", "", "safe label stored in the cast header instead of the full command")
-	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand(), newMCPCommand(), newVersionCommand(), newRenderCommand())
+	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand(), newMCPCommand(), newVersionCommand(), newRenderCommand(), newScanCommand())
 	return cmd
 }
 
@@ -236,7 +236,7 @@ func runRecord(cmd *cobra.Command, args []string) {
 	}()
 
 	// Block until the recorded program exits.
-	processCmd.Wait()
+	processErr := processCmd.Wait()
 	ptmx.Close()
 	wg.Wait()
 
@@ -252,6 +252,26 @@ func runRecord(cmd *cobra.Command, args []string) {
 	}
 	signal.Stop(sigWinch)
 	close(sigWinch)
+	exitCode := 0
+	if processCmd.ProcessState != nil {
+		exitCode = processCmd.ProcessState.ExitCode()
+	}
+	status := "success"
+	message := ""
+	if processErr != nil {
+		status = "failed"
+		message = processErr.Error()
+	}
+	if recErr != nil {
+		status = "recording_error"
+		message = recErr.Error()
+	}
+	if err := writeSessionResult(outputFile, sessionResult{Status: status, ExitCode: exitCode, Error: message, DurationSeconds: time.Since(startTime).Seconds()}); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing recording summary: %v\n", err)
+		if recErr == nil {
+			recErr = err
+		}
+	}
 
 	if isInteractive {
 		term.Restore(int(os.Stdin.Fd()), oldState)
@@ -266,5 +286,8 @@ func runRecord(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr, "Done. Recording saved to %s\n", outputFile)
+	}
+	if processErr != nil {
+		os.Exit(exitCode)
 	}
 }
