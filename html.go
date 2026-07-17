@@ -42,6 +42,7 @@ var htmlPageTemplate = template.Must(template.New("player").Parse(`<!doctype htm
       autoPlay: false,
       preload: true,
       fit: "width",
+      keystrokeOverlay: true,
       markers: JSON.parse(atob("{{.MarkersBase64}}"))
     });
   </script>

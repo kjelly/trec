@@ -54,9 +54,21 @@ non-terminal tool, state that limitation before using it and include a recorded
 before/after inspection whenever possible. Never claim that the cast contains the
 internal activity of a non-terminal tool.
 
-Never enter secrets, tokens, passwords, private keys, or unredacted sensitive data
-into the recorded terminal. Stop and request a safe input method if a command would
-expose them.
+Never type a literal secret, token, password, private key, or other sensitive value
+into the recorded shell or command argv. Use trec's declared-value redaction when a
+known value can appear in the cast: `--secret-env NAME` or `--secret-file NAME=path`
+replace that exact value in headers, output, markers, and input events before they are
+written. This is opt-in redaction, not password detection; values that were not
+declared are recorded verbatim.
+
+For a program that prompts for a credential, use `trec drive` with `TEXT_ENV NAME` or
+`TEXT_FILE path`. Those operations send the actual value to the PTY while recording a
+`<redacted:NAME>` placeholder for the input event. Do not manually type a credential
+through `trec record`: stdin reads can split one value across input events, so exact
+value redaction cannot provide the same cross-event guarantee. Before sharing an HTML
+export or `serve` page, remember that the keystroke overlay displays the input events
+already stored in the cast; it captures no new browser input, but makes any unredacted
+recorded input more visible.
 
 ## Verify before closing
 

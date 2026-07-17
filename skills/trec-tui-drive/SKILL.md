@@ -55,7 +55,10 @@ QUIT                 提前結束
    的文字。不要仰賴 `password=` 或
    `sshpass -p` 的猜測式警告：未宣告的明文秘密不保證能遮住。
    完整 command 預設不寫入 header；需要辨識時用 `--command-label`。只有確實需要時才
-   開啟 `--record-command`，且仍必須搭配 `--secret-env`。
+   開啟 `--record-command`，且仍必須搭配 `--secret-env`。不要把需遮蔽的值改成手動
+   `TEXT` 或 `trec record` 的鍵盤輸入：後者可能把一個值拆成多個 input event，無法取得
+   output redaction 的跨 chunk 保證。HTML / `serve` 的 keystroke overlay 只會顯示 cast
+   已存的 input event，分享前仍須確認裡面沒有未宣告的秘密。
 8. **長跑 apply 不得以 `EXPECT_QUIET` 判定完成。** `EXPECT_QUIET` 只適合短暫、可預期
    會停止的畫面轉場；Ansible 等持續輸出的工作會讓它一直等到輸出停止。最後一次送出
    apply 後，腳本必須以 `WAIT_CHILD_EXIT` 再以 `ASSERT_EXIT 0` 判定完成；不要用 per-step

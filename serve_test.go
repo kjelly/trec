@@ -29,14 +29,14 @@ func TestCastServerListsAndPlaysCastFiles(t *testing.T) {
 	index := httptest.NewRecorder()
 	h.ServeHTTP(index, httptest.NewRequest(http.MethodGet, "/", nil))
 	indexPage := index.Body.String()
-	if index.Code != http.StatusOK || !strings.Contains(indexPage, "href=\"/play/demo.cast\"") || !strings.Contains(indexPage, "href=\"/play/second.cast\"") || !strings.Contains(indexPage, "id=\"player-0\"") || !strings.Contains(indexPage, "id=\"player-1\"") || strings.Count(indexPage, "AsciinemaPlayer.create") != 2 || !strings.Contains(indexPage, "broken.cast") || !strings.Contains(indexPage, "Unable to load this recording") || strings.Contains(indexPage, "notes.txt") {
+	if index.Code != http.StatusOK || !strings.Contains(indexPage, "href=\"/play/demo.cast\"") || !strings.Contains(indexPage, "href=\"/play/second.cast\"") || !strings.Contains(indexPage, "id=\"player-0\"") || !strings.Contains(indexPage, "id=\"player-1\"") || strings.Count(indexPage, "AsciinemaPlayer.create") != 2 || strings.Count(indexPage, "keystrokeOverlay:true") != 2 || !strings.Contains(indexPage, "broken.cast") || !strings.Contains(indexPage, "Unable to load this recording") || strings.Contains(indexPage, "notes.txt") {
 		t.Fatalf("unexpected index response: status=%d body=%q", index.Code, index.Body.String())
 	}
 
 	player := httptest.NewRecorder()
 	h.ServeHTTP(player, httptest.NewRequest(http.MethodGet, "/play/demo.cast", nil))
 	page := player.Body.String()
-	if player.Code != http.StatusOK || !strings.Contains(page, "Uint8Array.from(") || !strings.Contains(page, "AsciinemaPlayer") || strings.Contains(page, "cdn.jsdelivr.net") {
+	if player.Code != http.StatusOK || !strings.Contains(page, "Uint8Array.from(") || !strings.Contains(page, "AsciinemaPlayer") || !strings.Contains(page, "keystrokeOverlay: true") || strings.Contains(page, "cdn.jsdelivr.net") {
 		t.Fatalf("unexpected player response: status=%d body=%q", player.Code, player.Body.String())
 	}
 }
