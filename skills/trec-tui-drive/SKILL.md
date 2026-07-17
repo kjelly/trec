@@ -14,12 +14,13 @@ TEXT <text>          逐字打字（不含 Enter）
 TEXT_ENV <ENV>       送出 ENV 的值，但 cast 的輸入事件只記 <redacted:ENV>
 TEXT_FILE <path>     送出檔案的原始文字內容，並自動在 cast 遮罩該值
 ENTER / SPACE / TAB / CTRLC
-DOWN [n] / UP [n]    ⚠ 僅限非選單場景；選單一律用 SELECT（會捲動視窗的多選清單例外，見規則 1a）
+DOWN [n] / UP [n]    ⚠ 僅限非選單場景；選單一律用 SELECT（會捲動視窗的多選清單例外，見規則 1a）；n 必須為正整數
 BACKSPACE [n]        送 DEL，清除 prompt 預填值
 WAIT <ms>            ⚠ 最後手段；先考慮 EXPECT / EXPECT_QUIET
 EXPECT <text>        等到畫面出現文字（預設 timeout 10s）
 EXPECT@<ms> <text>   單步覆寫 timeout（慢步驟：建置、網路）
-EXPECT_QUIET [ms]    等輸出安靜 N ms（預設 300）
+EXPECT_QUIET [ms]    等輸出安靜 N ms（預設 300；總等待使用 --expect-timeout）
+EXPECT_QUIET@<timeout-ms> <quiet-ms> 以單步 timeout 等待輸出安靜
 ASSERT <text>        當下畫面必須有該文字，否則立刻失敗
 WAIT_CHILD_EXIT      僅 script：純等待被錄製的子程序自然退出，不看畫面或安靜時間
 ASSERT_EXIT <code>   僅 script：子程序已退出時斷言 exit code；不符即寫 FAILED marker 並失敗
@@ -39,6 +40,7 @@ QUIT                 提前結束
 6. **固定終端尺寸**（預設 220×50），重跑才可重現；別依賴外層終端大小。
 7. **秘密不落地**：密碼、token 絕不 `TEXT` 進錄影。wizard 要求輸入秘密時，用 `TEXT_ENV <ENV>` 或 `TEXT_FILE <path>`；以 `--secret-env <ENV>` 或 `--secret-file NAME=path` 宣告可能出現在 command、子程序 output、marker 或診斷的秘密。完整 command 預設不寫入 header；需要辨識時用 `--command-label`。只有確實需要時才開啟 `--record-command`，且仍必須搭配 `--secret-env`。
 8. **長跑 apply 不得以 `EXPECT_QUIET` 判定完成。** 最後一次送出 apply 後，腳本必須以 `WAIT_CHILD_EXIT` 再以 `ASSERT_EXIT 0` 判定完成。
+9. **opcode 與參數間的額外空白會被忽略。** 若 `TEXT` 必須傳送前導空白，使用 JSON step（例如 `{"kind":"text","text":" hello"}`）。
 9. **同一個有狀態的多步驟流程，探勘必須使用同一個錄影與 stdin session。** 前一頁輸入會影響下一頁、可返回、或最後才提交的流程，禁止為每個畫面另開探勘錄影。
 
 ## 腳本範本

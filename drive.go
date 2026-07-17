@@ -27,9 +27,13 @@ type driveStep struct {
 	text string
 	n    int
 	hasN bool
-	re   *regexp.Regexp // for EXPECT_REGEX and EXPECT_SCREEN_REGEX
-	raw  string         // original script line, for markers and error reports
-	line int            // script line number (or interactive command sequence)
+	// timeout is an optional per-step timeout, currently used by
+	// EXPECT_QUIET@<ms>. A zero value means to use the session default.
+	timeout    int
+	hasTimeout bool
+	re         *regexp.Regexp // for EXPECT_REGEX and EXPECT_SCREEN_REGEX
+	raw        string         // original script line, for markers and error reports
+	line       int            // script line number (or interactive command sequence)
 }
 
 type jsonDriveStep struct {
@@ -62,7 +66,10 @@ func validateStep(st *driveStep) error {
 			return fmt.Errorf("line %d: EXPECT_CHANGE needs a positive timeout duration", st.line)
 		}
 	case "down", "up", "left", "right", "backspace", "wait":
-		if st.n <= 0 {
+		if st.hasN && st.n <= 0 {
+			return fmt.Errorf("line %d: %s needs a positive count", st.line, strings.ToUpper(st.kind))
+		}
+		if !st.hasN {
 			st.n = 1
 		}
 	case "expect", "expect_eventually":
@@ -87,8 +94,14 @@ func validateStep(st *driveStep) error {
 			return fmt.Errorf("line %d: %s needs a positive timeout duration", st.line, strings.ToUpper(st.kind))
 		}
 	case "expect_quiet":
-		if st.n <= 0 {
+		if st.hasN && st.n <= 0 {
+			return fmt.Errorf("line %d: EXPECT_QUIET needs a positive quiet duration", st.line)
+		}
+		if !st.hasN {
 			st.n = 300
+		}
+		if st.hasTimeout && st.timeout <= 0 {
+			return fmt.Errorf("line %d: EXPECT_QUIET needs a positive timeout duration", st.line)
 		}
 	case "assert":
 		if st.text == "" {
@@ -159,7 +172,9 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	op := strings.ToUpper(fields[0])
 	arg := ""
 	if len(fields) > 1 {
-		arg = fields[1]
+		// Script syntax uses whitespace as the opcode/argument separator.
+		// Preserve intentional leading whitespace with JSON steps instead.
+		arg = strings.TrimSpace(fields[1])
 	}
 	st := &driveStep{raw: trimmed, line: lineNo}
 
@@ -196,6 +211,24 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		return st, nil
 	}
 
+	// EXPECT_QUIET@<ms> <quiet-ms> overrides the global timeout while keeping
+	// the existing EXPECT_QUIET <quiet-ms> form backward compatible.
+	if ms, ok := strings.CutPrefix(op, "EXPECT_QUIET@"); ok {
+		timeout, err := strconv.Atoi(ms)
+		if err != nil || timeout <= 0 {
+			return nil, fmt.Errorf("line %d: bad timeout in %q", lineNo, fields[0])
+		}
+		quiet, err := parsePositiveCount(arg, 300)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: EXPECT_QUIET needs a positive quiet duration", lineNo)
+		}
+		st.kind, st.n, st.hasN, st.timeout, st.hasTimeout = "expect_quiet", quiet, true, timeout, true
+		if err := validateStep(st); err != nil {
+			return nil, err
+		}
+		return st, nil
+	}
+
 	switch op {
 	case "TEXT":
 		st.kind, st.text = "text", arg
@@ -213,13 +246,29 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	case "ENTER":
 		st.kind = "enter"
 	case "DOWN":
-		st.kind, st.n = "down", atoiOr1(arg)
+		n, err := parsePositiveCount(arg, 1)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: DOWN needs a positive count", lineNo)
+		}
+		st.kind, st.n, st.hasN = "down", n, arg != ""
 	case "UP":
-		st.kind, st.n = "up", atoiOr1(arg)
+		n, err := parsePositiveCount(arg, 1)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: UP needs a positive count", lineNo)
+		}
+		st.kind, st.n, st.hasN = "up", n, arg != ""
 	case "LEFT":
-		st.kind, st.n = "left", atoiOr1(arg)
+		n, err := parsePositiveCount(arg, 1)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: LEFT needs a positive count", lineNo)
+		}
+		st.kind, st.n, st.hasN = "left", n, arg != ""
 	case "RIGHT":
-		st.kind, st.n = "right", atoiOr1(arg)
+		n, err := parsePositiveCount(arg, 1)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: RIGHT needs a positive count", lineNo)
+		}
+		st.kind, st.n, st.hasN = "right", n, arg != ""
 	case "SPACE":
 		st.kind = "space"
 	case "TAB":
@@ -233,9 +282,17 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	case "CTRLW":
 		st.kind = "ctrlw"
 	case "BACKSPACE":
-		st.kind, st.n = "backspace", atoiOr1(arg)
+		n, err := parsePositiveCount(arg, 1)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: BACKSPACE needs a positive count", lineNo)
+		}
+		st.kind, st.n, st.hasN = "backspace", n, arg != ""
 	case "WAIT":
-		st.kind, st.n = "wait", atoiOr1(arg)
+		n, err := parsePositiveCount(arg, 1)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: WAIT needs a positive count", lineNo)
+		}
+		st.kind, st.n, st.hasN = "wait", n, arg != ""
 	case "EXPECT":
 		if arg == "" {
 			return nil, fmt.Errorf("line %d: EXPECT needs text", lineNo)
@@ -256,7 +313,11 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	case "EXPECT_SCREEN_REGEX":
 		st.kind, st.text = "expect_screen_regex", arg
 	case "EXPECT_QUIET":
-		st.kind, st.n = "expect_quiet", atoiOrDef(arg, 300)
+		n, err := parsePositiveCount(arg, 300)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: EXPECT_QUIET needs a positive quiet duration", lineNo)
+		}
+		st.kind, st.n, st.hasN = "expect_quiet", n, arg != ""
 	case "ASSERT":
 		if arg == "" {
 			return nil, fmt.Errorf("line %d: ASSERT needs text", lineNo)
@@ -327,20 +388,15 @@ func loadDriveScript(path string, redactor *secretRedactor) ([]*driveStep, error
 	return steps, nil
 }
 
-func atoiOr1(s string) int {
-	return atoiOrDef(s, 1)
-}
-
-func atoiOrDef(s string, def int) int {
-	s = strings.TrimSpace(s)
+func parsePositiveCount(s string, def int) (int, error) {
 	if s == "" {
-		return def
+		return def, nil
 	}
 	n, err := strconv.Atoi(s)
 	if err != nil || n <= 0 {
-		return def
+		return 0, fmt.Errorf("not a positive integer")
 	}
-	return n
+	return n, nil
 }
 
 func max1(n int) int {
@@ -520,7 +576,11 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 		}
 		err = ds.ts.waitForRegex(ctx, "EXPECT_SCREEN_REGEX", st.re, timeout, true)
 	case "expect_quiet":
-		err = ds.ts.waitQuiet(ctx, time.Duration(st.n)*time.Millisecond, ds.expectTimeout)
+		limit := ds.expectTimeout
+		if st.hasTimeout {
+			limit = time.Duration(st.timeout) * time.Millisecond
+		}
+		err = ds.ts.waitQuiet(ctx, time.Duration(st.n)*time.Millisecond, limit)
 	case "assert":
 		if !screenContains(ds.screenLines(), st.text) {
 			err = fmt.Errorf("ASSERT %q: not on screen", st.text)
@@ -615,7 +675,7 @@ When both are supplied, trec runs the script first, then accepts interactive
 operations from stdin. Interactive operations include TEXT, TEXT_ENV, TEXT_FILE,
 ENTER, DOWN, UP, LEFT, RIGHT, SPACE, TAB, ESCAPE, CTRLC, CTRLU, CLEAR_LINE, CTRLW, BACKSPACE, WAIT,
 EXPECT, EXPECT_EVENTUALLY, EXPECT_CHANGE, EXPECT_REGEX, EXPECT_SCREEN_REGEX,
-EXPECT_QUIET, ASSERT, SELECT, SNAPSHOT, and QUIT. Use TEXT_ENV/--secret-env or
+EXPECT_QUIET, EXPECT_QUIET@<timeout-ms> <quiet-ms>, ASSERT, SELECT, SNAPSHOT, and QUIT. Use TEXT_ENV/--secret-env or
 TEXT_FILE/--secret-file for credentials. Run "trec drive --help" for flags.`,
 		Args: cobra.ArbitraryArgs,
 		Run:  runDrive,

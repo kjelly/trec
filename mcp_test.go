@@ -954,6 +954,17 @@ func TestMCPTerminalSelectBehavior(t *testing.T) {
 	if !strings.Contains(err.Error(), "bad pointer regexp") {
 		t.Errorf("expected bad pointer regexp error, got: %v", err)
 	}
+
+	// 5. Multiple visible pointer rows are ambiguous. Selecting the first one
+	// can send navigation in the wrong direction when a TUI leaves old rows on
+	// the visible screen.
+	ts.vtMu.Lock()
+	ts.vt.Write([]byte("\x1b[H\x1b[2J❯ Old option\r\n❯ Option 1\r\n  Option 2"))
+	ts.vtMu.Unlock()
+	_, err = ts.selectLabel(context.Background(), "Option 2", pointerRe, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous pointer rows") {
+		t.Fatalf("expected ambiguous pointer error, got: %v", err)
+	}
 }
 
 func TestMCPTerminalSelectConcurrency(t *testing.T) {

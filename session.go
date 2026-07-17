@@ -476,12 +476,17 @@ func (ts *terminalSession) selectLabel(ctx context.Context, label string, pointe
 			return written, err
 		}
 		lines, _, _, _, _ := ts.rawScreenSnapshot()
-		pIdx := -1
+		pointerRows := make([]int, 0, 1)
 		for idx, l := range lines {
 			if pointerRe.MatchString(l) {
-				pIdx = idx
-				break
+				pointerRows = append(pointerRows, idx)
 			}
+		}
+		pIdx := -1
+		if len(pointerRows) == 1 {
+			pIdx = pointerRows[0]
+		} else if len(pointerRows) > 1 {
+			return written, fmt.Errorf("SELECT %q: ambiguous pointer rows %v", label, pointerRows)
 		}
 		if pIdx >= 0 && strings.Contains(lines[pIdx], label) {
 			return written, nil

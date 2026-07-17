@@ -149,6 +149,56 @@ func TestParseJSONDriveSteps(t *testing.T) {
 	}
 }
 
+func TestParseDriveLineNormalizesArgumentWhitespaceAndRejectsZeroCounts(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		text string
+	}{
+		{"TEXT  hello", "hello"},
+		{"EXPECT  ready", "ready"},
+		{"ASSERT  saved", "saved"},
+		{"SELECT  option", "option"},
+	} {
+		st, err := parseDriveLine(tc.line, 1)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.line, err)
+		}
+		if st.text != tc.text {
+			t.Errorf("%q text = %q, want %q", tc.line, st.text, tc.text)
+		}
+	}
+
+	for _, line := range []string{
+		"DOWN 0", "UP -1", "LEFT nope", "RIGHT 0", "BACKSPACE 0", "WAIT 0", "EXPECT_QUIET 0",
+	} {
+		if _, err := parseDriveLine(line, 1); err == nil {
+			t.Errorf("%q unexpectedly parsed", line)
+		}
+	}
+	for _, line := range []string{
+		`{"kind":"down","n":0}`, `{"kind":"backspace","n":-1}`, `{"kind":"expect_quiet","n":0}`,
+	} {
+		if _, err := parseDriveLine(line, 1); err == nil {
+			t.Errorf("%q unexpectedly parsed", line)
+		}
+	}
+}
+
+func TestParseExpectQuietWithStepTimeout(t *testing.T) {
+	st, err := parseDriveLine("EXPECT_QUIET@12000 5000", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.kind != "expect_quiet" || st.n != 5000 || !st.hasTimeout || st.timeout != 12000 {
+		t.Fatalf("unexpected step: %#v", st)
+	}
+	for _, line := range []string{"EXPECT_QUIET@0 500", "EXPECT_QUIET@1000 0", "EXPECT_QUIET@1000 nope"} {
+		if _, err := parseDriveLine(line, 1); err == nil {
+			t.Errorf("%q unexpectedly parsed", line)
+		}
+	}
+}
+
 func TestDriveNavigationStepsSendExpectedEscapeSequences(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {
