@@ -70,26 +70,36 @@ export or `serve` page, remember that the keystroke overlay displays the input e
 already stored in the cast; it captures no new browser input, but makes any unredacted
 recorded input more visible.
 
-## Verify before closing
+## Verify capture before closing
 
-Because no command can be added after the recorder exits, perform verification from
-inside the recorded shell before typing `exit`:
+Before typing `exit`, verify only the live capture properties that do not claim to
+describe the final bytes:
 
 1. Confirm the selected cast exists and is non-empty.
 2. Confirm its first line is an asciicast v2 header with the intended title.
 3. Inspect a clean transcript with `trec transcript <cast>` when that subcommand is
    available; otherwise inspect the cast header and events directly.
-4. Read the cast's adjacent `.result.json`; its `status` must be `success` and its
-   `exit_code` must be zero before describing the audited command as successful.
-   A non-success result is audit evidence of failure, not a successful recording.
-5. Run trec's secret scan against the cast. A finding blocks sharing, HTML export,
-   and HTTP serving; re-record with declared exact-value redaction rather than
-   editing the cast by hand.
-6. Record final repository status and all relevant test results.
-7. Confirm that no second conversation cast was created.
+4. Record final repository status and all relevant test results.
+5. Confirm that no second conversation cast was created.
 
-Then type `exit`, wait for `trec` to report that it saved the recording, and retain
-the same cast path in the final response.
+Do not run the final secret scan or calculate a SHA-256 from inside the live recorded
+shell: their output becomes new cast events, so they cannot validate the final file.
+
+## Finalize and verify
+
+Then type `exit` and wait for `trec` to report that it saved the recording. After it
+has closed, perform one explicitly reported, read-only verification outside that cast:
+
+1. Read its adjacent `.result.json`. `status` must be `success`, `exit_code` must be
+   zero, and `cast.complete` must be true.
+2. Recompute the closed cast's SHA-256 and compare it to `cast.sha256`; also require
+   the observed size to match `cast.byte_size`.
+3. Run `trec scan <cast>`. A finding blocks sharing, HTML export, and HTTP serving;
+   re-record with declared exact-value redaction rather than editing the cast by hand.
+
+This final read-only verification cannot itself be contained in the cast being
+verified. State that distinction in the final audit report; do not claim that the cast
+contains the verification command. Retain the same cast path in the final response.
 
 If the recorder fails, its PTY is lost, or any external command bypasses it, stop
 issuing commands. Report the exact gap and do not describe the conversation as fully
