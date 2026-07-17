@@ -3,3 +3,5 @@ terminal-record
 *.cast
 .playwright-mcp/
 dist/
+pilot-verify-minimal-poc/
+./tmp
