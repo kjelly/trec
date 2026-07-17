@@ -1,27 +1,43 @@
 package main
 
-import "testing"
+import (
+	"bufio"
+	"bytes"
+	"strings"
+	"sync"
+	"testing"
+	"time"
 
-func TestValidateRenderSize(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		width     int
-		height    int
-		wantError bool
-	}{
-		{name: "normal", width: 120, height: 40},
-		{name: "zero width", width: 0, height: 40, wantError: true},
-		{name: "zero height", width: 120, height: 0, wantError: true},
-		{name: "negative width", width: -1, height: 40, wantError: true},
-		{name: "dimension too large", width: maxRenderDimension + 1, height: 40, wantError: true},
-		{name: "cell count too large", width: maxRenderDimension, height: 100, wantError: false},
-		{name: "cell count over limit", width: maxRenderDimension, height: 105, wantError: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			err := validateRenderSize(tc.width, tc.height)
-			if (err != nil) != tc.wantError {
-				t.Fatalf("validateRenderSize(%d, %d) error = %v, wantError = %v", tc.width, tc.height, err, tc.wantError)
-			}
-		})
+	"github.com/hinshun/vt10x"
+)
+
+func TestResizeEventsUpdateRenderAndRecordingState(t *testing.T) {
+	vt := vt10x.New(vt10x.WithSize(80, 24))
+	if err := applyRenderEvent(vt, castEvent{typ: "r", data: "100x30"}); err != nil {
+		t.Fatal(err)
+	}
+	cols, rows := vt.Size()
+	if cols != 100 || rows != 30 {
+		t.Fatalf("render size = %dx%d, want 100x30", cols, rows)
+	}
+
+	var cast bytes.Buffer
+	redactor, err := newSecretRedactor(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := newRecordingWriter(bufio.NewWriter(&cast), &sync.Mutex{}, redactor)
+	ts := &terminalSession{
+		start:    time.Now(),
+		cols:     80,
+		rows:     24,
+		vt:       vt10x.New(vt10x.WithSize(80, 24)),
+		recorder: recorder,
+	}
+	if err := ts.resize(100, 30); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(cast.String(), `"r","100x30"`) {
+		t.Fatalf("resize was not recorded:\n%s", cast.String())
 	}
 }

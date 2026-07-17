@@ -329,7 +329,7 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		}
 		st.kind, st.text = "select", arg
 	case "SNAPSHOT":
-		st.kind = "snapshot"
+		st.kind, st.text = "snapshot", arg
 	case "WAIT_CHILD_EXIT":
 		if arg != "" {
 			return nil, fmt.Errorf("line %d: WAIT_CHILD_EXIT takes no arguments", lineNo)
@@ -424,6 +424,7 @@ type driveSession struct {
 	baselineSnapshot *screenSnapshot
 	baselineValid    bool
 	redactor         *secretRedactor
+	snapshots        []sessionSnapshot
 }
 
 func (ds *driveSession) screenLines() []string {
@@ -441,13 +442,37 @@ func (ds *driveSession) marker(label string) {
 	}
 }
 
+func (ds *driveSession) stepMarker(phase string, st *driveStep, elapsed time.Duration) {
+	label := fmt.Sprintf("STEP_%s line %d: %s", phase, st.line, st.raw)
+	if phase != "START" {
+		label += fmt.Sprintf(" (%.3fs)", elapsed.Seconds())
+	}
+	ds.marker(label)
+}
+
 // failureMarker records both the failing operation and the rendered screen so
 // an agent can diagnose a failed cast without a separate render invocation.
-func (ds *driveSession) failureMarker(st *driveStep, err error) {
-	msg := fmt.Sprintf("FAILED line %d: %s (%v)", st.line, st.raw, err)
+func (ds *driveSession) failureMarker(st *driveStep, elapsed time.Duration, err error) {
+	msg := fmt.Sprintf("STEP_FAILED line %d: %s (%.3fs; %v)", st.line, st.raw, elapsed.Seconds(), err)
 	ds.marker(ds.redactor.RedactString(msg))
 	lines, _, _, _, _ := ds.ts.redactedScreenSnapshot()
 	ds.marker(fmt.Sprintf("FAILED_SCREEN line %d:\n%s", st.line, strings.Join(lines, "\n")))
+}
+
+func (ds *driveSession) snapshot(st *driveStep) {
+	lines, _, _, _, _ := ds.ts.redactedScreenSnapshot()
+	label := st.text
+	if label == "" {
+		label = fmt.Sprintf("line %d: SNAPSHOT", st.line)
+	}
+	ds.snapshots = append(ds.snapshots, sessionSnapshot{
+		Time:   time.Since(ds.ts.start).Seconds(),
+		Label:  ds.redactor.RedactString(label),
+		Screen: append([]string(nil), lines...),
+	})
+	if !ds.interactive {
+		ds.dumpScreen(os.Stderr)
+	}
 }
 
 func (ds *driveSession) dumpScreen(w io.Writer) {
@@ -590,9 +615,7 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 		bytesWritten += n
 		err = e
 	case "snapshot":
-		if !ds.interactive {
-			ds.dumpScreen(os.Stderr)
-		}
+		ds.snapshot(st)
 	case "wait_child_exit":
 		if ds.interactive {
 			return fmt.Errorf("WAIT_CHILD_EXIT is only available in --script mode")
@@ -847,14 +870,15 @@ func runDrive(cmd *cobra.Command, rest []string) {
 		if st.kind == "quit" {
 			break
 		}
-		if ds.stepMarkers && st.kind != "snapshot" {
-			ds.marker(fmt.Sprintf("line %d: %s", st.line, st.raw))
+		stepStarted := time.Now()
+		if ds.stepMarkers {
+			ds.stepMarker("START", st, 0)
 		}
 		if err := ds.applyStep(ctx, st); err != nil {
 			msg := fmt.Sprintf("trec drive: FAILED at line %d (%s): %v\n", st.line, st.raw, err)
 			fmt.Fprint(os.Stderr, ds.redactor.RedactString(msg))
 			ds.dumpScreen(os.Stderr)
-			ds.failureMarker(st, err)
+			ds.failureMarker(st, time.Since(stepStarted), err)
 			if resultErr := writeSessionResult(*outputFile, ds.result("failed", -1, fmt.Sprintf("line %d: %v", st.line, err))); resultErr != nil {
 				fmt.Fprintf(os.Stderr, "trec drive: write summary: %v\n", resultErr)
 			}
@@ -863,6 +887,9 @@ func runDrive(cmd *cobra.Command, rest []string) {
 			}
 			fmt.Fprintf(os.Stderr, "trec drive: recorded to %s — replay with: trec play %s\n", *outputFile, *outputFile)
 			os.Exit(1)
+		}
+		if ds.stepMarkers {
+			ds.stepMarker("OK", st, time.Since(stepStarted))
 		}
 	}
 
@@ -913,10 +940,17 @@ func runDrive(cmd *cobra.Command, rest []string) {
 					interactiveQuitRequested = true
 					continue
 				}
-				if ds.stepMarkers && st.kind != "snapshot" {
-					ds.marker(fmt.Sprintf("cmd %d: %s", seq, st.raw))
+				stepStarted := time.Now()
+				if ds.stepMarkers {
+					ds.stepMarker("START", st, 0)
 				}
-				ds.respond(ds.applyStep(ctx, st))
+				err = ds.applyStep(ctx, st)
+				if err != nil {
+					ds.failureMarker(st, time.Since(stepStarted), err)
+				} else if ds.stepMarkers {
+					ds.stepMarker("OK", st, time.Since(stepStarted))
+				}
+				ds.respond(err)
 			}
 		}
 	}
@@ -1020,5 +1054,6 @@ func (ds *driveSession) result(status string, exitCode int, message string) sess
 		Error:           ds.redactor.RedactString(message),
 		DurationSeconds: time.Since(ds.ts.start).Seconds(),
 		FinalScreen:     lines,
+		Snapshots:       append([]sessionSnapshot(nil), ds.snapshots...),
 	}
 }

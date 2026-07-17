@@ -1,35 +1,37 @@
 package main
 
 import (
-	"bytes"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestHTMLOutputPath(t *testing.T) {
-	tests := map[string]string{
-		"demo.cast":        "demo.html",
-		"recording":        "recording.html",
-		"dir/demo.cast.gz": "dir/demo.cast.html",
-	}
-	for input, want := range tests {
-		if got := htmlOutputPath(input); got != want {
-			t.Errorf("htmlOutputPath(%q) = %q, want %q", input, got, want)
-		}
-	}
-}
-
-func TestHTMLPlayerShowsRecordedKeystrokes(t *testing.T) {
-	var page bytes.Buffer
-	data := htmlPageData{
-		Title:         "demo",
-		CastBase64:    "Y2FzdA==",
-		MarkersBase64: "W10=",
-	}
-	if err := htmlPageTemplate.Execute(&page, data); err != nil {
+func TestSharingBlocksScanFindingsUnlessExplicitlyAllowed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "unsafe.cast")
+	if err := writeCastFile(path, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{
+		{sec: 1, typ: "o", data: "password=definitely-not-safe"},
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(page.String(), "keystrokeOverlay: true") {
-		t.Fatalf("HTML player does not enable recorded keystroke overlay: %q", page.String())
+
+	if _, err := shareableHTMLPageData(path, "", true, false); err == nil || !strings.Contains(err.Error(), "refusing to share") {
+		t.Fatalf("unreviewed cast error = %v, want scan gate", err)
+	}
+	data, err := shareableHTMLPageData(path, "", false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.KeystrokeOverlay {
+		t.Fatal("keystroke overlay override was ignored")
+	}
+
+	server := newCastServerWithOptions(filepath.Dir(path), false, true)
+	req := httptest.NewRequest(http.MethodGet, "/play/unsafe.cast", nil)
+	res := httptest.NewRecorder()
+	server.ServeHTTP(res, req)
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("serve status = %d, want %d", res.Code, http.StatusForbidden)
 	}
 }

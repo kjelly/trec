@@ -59,11 +59,10 @@ func runRender(cmd *cobra.Command, args []string) error {
 		if atTime >= 0 && e.sec > atTime {
 			break
 		}
-		if e.typ == "o" {
-			if _, err := vt.Write([]byte(e.data)); err != nil {
-				return fmt.Errorf("trec render: apply output at %.2fs: %w", e.sec, err)
-			}
-		} else if e.typ == "m" && markersOnly {
+		if err := applyRenderEvent(vt, e); err != nil {
+			return fmt.Errorf("trec render: apply event at %.2fs: %w", e.sec, err)
+		}
+		if e.typ == "m" && markersOnly {
 			if jsonFormat {
 				printScreenJSON(vt, e.sec, e.data)
 			} else {
@@ -88,6 +87,25 @@ func runRender(cmd *cobra.Command, args []string) error {
 		} else {
 			printScreen(vt)
 		}
+	}
+	return nil
+}
+
+func applyRenderEvent(vt vt10x.Terminal, e castEvent) error {
+	switch e.typ {
+	case "o":
+		if _, err := vt.Write([]byte(e.data)); err != nil {
+			return fmt.Errorf("write output: %w", err)
+		}
+	case "r":
+		cols, rows, err := parseResizeData(e.data)
+		if err != nil {
+			return fmt.Errorf("resize: %w", err)
+		}
+		if err := validateRenderSize(cols, rows); err != nil {
+			return err
+		}
+		vt.Resize(cols, rows)
 	}
 	return nil
 }

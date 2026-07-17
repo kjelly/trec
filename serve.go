@@ -18,7 +18,7 @@ import (
 var castIndexTemplate = template.Must(template.New("cast-index").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>trec recordings</title><style>{{.PlayerCSS}}</style><style>body{max-width:70rem;margin:3rem auto;padding:0 1rem;font-family:system-ui;background:#111;color:#eee}a{color:#8ab4f8}.recording{margin:2.5rem 0}.recording h2{font-size:1.1rem;font-weight:600}.player{max-width:100%;margin:auto}</style>
-</head><body><h1>trec recordings</h1>{{if .HasFiles}}{{if .Casts}}<script>{{.PlayerJS}}</script>{{range .Casts}}<article class="recording"><h2><a href="/play/{{.URL}}">{{.Name}}</a></h2><div class="player" id="player-{{.ID}}"></div><script>(()=>{const cast=new TextDecoder().decode(Uint8Array.from(atob("{{.CastBase64}}"),byte=>byte.charCodeAt(0)));AsciinemaPlayer.create({data:cast},document.getElementById("player-{{.ID}}"),{autoPlay:false,preload:true,fit:"width",keystrokeOverlay:true,markers:JSON.parse(atob("{{.MarkersBase64}}"))});})();</script></article>{{end}}{{end}}{{range .Invalid}}<article class="recording"><h2>{{.Name}}</h2><p>Unable to load this recording: {{.Error}}</p></article>{{end}}{{else}}<p>No .cast files in this directory.</p>{{end}}</body></html>`))
+</head><body><h1>trec recordings</h1>{{if .HasFiles}}{{if .Casts}}<script>{{.PlayerJS}}</script>{{range .Casts}}<article class="recording"><h2><a href="/play/{{.URL}}">{{.Name}}</a></h2><div class="player" id="player-{{.ID}}"></div><script>(()=>{const cast=new TextDecoder().decode(Uint8Array.from(atob("{{.CastBase64}}"),byte=>byte.charCodeAt(0)));AsciinemaPlayer.create({data:cast},document.getElementById("player-{{.ID}}"),{autoPlay:false,preload:true,fit:"width",{{if .KeystrokeOverlay}}keystrokeOverlay:true{{else}}keystrokeOverlay:false{{end}},markers:JSON.parse(atob("{{.MarkersBase64}}"))});})();</script></article>{{end}}{{end}}{{range .Invalid}}<article class="recording"><h2>{{.Name}}</h2><p>Unable to load this recording: {{.Error}}</p></article>{{end}}{{else}}<p>No .cast files in this directory.</p>{{end}}</body></html>`))
 
 type castLink struct {
 	Name string
@@ -68,6 +68,10 @@ func castPath(dir, escapedName string) (string, error) {
 }
 
 func overviewDataFromCasts(dir string) (castOverviewData, error) {
+	return overviewDataFromCastsWithOptions(dir, false, true)
+}
+
+func overviewDataFromCastsWithOptions(dir string, allowScanFindings, keystrokeOverlay bool) (castOverviewData, error) {
 	links, err := listCastFiles(dir)
 	if err != nil {
 		return castOverviewData{}, err
@@ -80,7 +84,7 @@ func overviewDataFromCasts(dir string) (castOverviewData, error) {
 		PlayerCSS: template.CSS(asciinemaPlayerCSS),
 	}
 	for _, link := range links {
-		data, err := htmlPageDataFromCast(filepath.Join(dir, link.Name), "")
+		data, err := shareableHTMLPageData(filepath.Join(dir, link.Name), "", keystrokeOverlay, allowScanFindings)
 		if err != nil {
 			overview.Invalid = append(overview.Invalid, invalidCast{Name: link.Name, Error: err.Error()})
 			continue
@@ -95,13 +99,17 @@ func overviewDataFromCasts(dir string) (castOverviewData, error) {
 }
 
 func newCastServer(dir string) http.Handler {
+	return newCastServerWithOptions(dir, false, true)
+}
+
+func newCastServerWithOptions(dir string, allowScanFindings, keystrokeOverlay bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
 		}
-		overview, err := overviewDataFromCasts(dir)
+		overview, err := overviewDataFromCastsWithOptions(dir, allowScanFindings, keystrokeOverlay)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -117,9 +125,9 @@ func newCastServer(dir string) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		data, err := htmlPageDataFromCast(path, "")
+		data, err := shareableHTMLPageData(path, "", keystrokeOverlay, allowScanFindings)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
+			http.Error(w, err.Error(), http.StatusForbidden)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -134,12 +142,16 @@ func newServeCommand() *cobra.Command {
 	cmd := &cobra.Command{Use: "serve [directory]", Short: "Serve recordings in a web player", Args: cobra.MaximumNArgs(1), Run: runServe}
 	cmd.Flags().String("host", "127.0.0.1", "host address to listen on (use 0.0.0.0 for all interfaces)")
 	cmd.Flags().IntP("port", "p", 8080, "TCP port to listen on")
+	cmd.Flags().Bool("allow-scan-findings", false, "serve recordings even when the secret scan reports findings")
+	cmd.Flags().Bool("keystroke-overlay", true, "show recorded input in the player")
 	return cmd
 }
 
 func runServe(cmd *cobra.Command, dirs []string) {
 	host, _ := cmd.Flags().GetString("host")
 	port, _ := cmd.Flags().GetInt("port")
+	allowScanFindings, _ := cmd.Flags().GetBool("allow-scan-findings")
+	keystrokeOverlay, _ := cmd.Flags().GetBool("keystroke-overlay")
 	if len(dirs) > 1 || port < 1 || port > 65535 {
 		cmd.Usage()
 		os.Exit(1)
@@ -160,7 +172,7 @@ func runServe(cmd *cobra.Command, dirs []string) {
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	fmt.Fprintf(os.Stderr, "Serving %s at http://%s\n", dir, addr)
-	if err := http.ListenAndServe(addr, newCastServer(dir)); err != nil {
+	if err := http.ListenAndServe(addr, newCastServerWithOptions(dir, allowScanFindings, keystrokeOverlay)); err != nil {
 		fmt.Fprintf(os.Stderr, "trec serve: %v\n", err)
 		os.Exit(1)
 	}

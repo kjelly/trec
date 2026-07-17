@@ -25,7 +25,7 @@ ASSERT <text>        當下畫面必須有該文字，否則立刻失敗
 WAIT_CHILD_EXIT      僅 script：純等待被錄製的子程序自然退出，不看畫面或安靜時間
 ASSERT_EXIT <code>   僅 script：子程序已退出時斷言 exit code；不符即寫 FAILED marker 並失敗
 SELECT <label>       自動按 ↑/↓ 直到選單指標行含有 label
-SNAPSHOT             傾印渲染畫面到 stderr（除錯用）
+SNAPSHOT [label]     將渲染畫面保存到 result 的 snapshots，並傾印到 stderr（除錯用）
 QUIT                 提前結束
 ```
 
@@ -81,7 +81,7 @@ trec drive --script steps.txt -o run.cast -- ./wizard
 
 ## 失敗了怎麼辦
 
-fail-fast 已內建：任一步失敗會立刻停止（後續按鍵不會打出去）、stderr 印出**失敗行號 + 指令 + 原因 + 當下畫面傾印**、cast 裡留下 `FAILED` marker、exit 1。
+fail-fast 已內建：任一步失敗會立刻停止（後續按鍵不會打出去）、stderr 印出**失敗行號 + 指令 + 原因 + 當下畫面傾印**、cast 裡留下 `STEP_FAILED` marker、exit 1。每個成功步驟也會留下 `STEP_START` 與 `STEP_OK`，後者附帶耗時。
 
 1. 先讀 stderr 的畫面傾印，多數情況可直接看出實際畫面與預期差異。
 2. `trec play run.cast`：`n`/`N` 跳 step marker（每行腳本一個 ⚑），`←`/`→` 逐格、`space` 暫停、`↑`/`↓` 變速。

@@ -647,6 +647,14 @@ func (ts *terminalSession) resize(cols, rows int) error {
 	ts.cols = cols
 	ts.rows = rows
 	ts.vtMu.Unlock()
+	if ts.recorder != nil {
+		if err := ts.recorder.event(time.Since(ts.start).Seconds(), "r", fmt.Sprintf("%dx%d", cols, rows)); err != nil {
+			return fmt.Errorf("record resize: %w", err)
+		}
+		if err := ts.recorder.flush(); err != nil {
+			return fmt.Errorf("flush resize: %w", err)
+		}
+	}
 	return nil
 }
 

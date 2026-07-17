@@ -98,3 +98,38 @@ func TestTranscriptFormatsAndANSI(t *testing.T) {
 		t.Errorf("expected error for unsupported format, got nil")
 	}
 }
+
+func TestTranscriptStreamsSplitANSIAndOutputChunks(t *testing.T) {
+	hdr := castHeader{}
+	events := []castEvent{
+		{sec: 1, typ: "o", data: "pass\x1b[3"},
+		{sec: 2, typ: "o", data: "1mword\x1b[0"},
+		{sec: 3, typ: "o", data: "m\r"},
+		{sec: 4, typ: "o", data: "\nnext\x1b]0;title\x1b"},
+		{sec: 5, typ: "o", data: "\\done"},
+	}
+
+	output, err := generateTranscript(hdr, events, "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Events []struct {
+			Time      float64 `json:"time"`
+			EndTime   float64 `json:"end_time"`
+			CleanData string  `json:"clean_data"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal([]byte(output), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Events) != 1 {
+		t.Fatalf("events = %#v, want one merged output event", decoded.Events)
+	}
+	if got, want := decoded.Events[0].CleanData, "password\nnextdone"; got != want {
+		t.Fatalf("clean data = %q, want %q", got, want)
+	}
+	if decoded.Events[0].Time != 1 || decoded.Events[0].EndTime != 5 {
+		t.Fatalf("time range = %.1f-%.1f, want 1.0-5.0", decoded.Events[0].Time, decoded.Events[0].EndTime)
+	}
+}

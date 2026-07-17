@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/hinshun/vt10x"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -169,13 +170,37 @@ func runRecord(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	startTime := time.Now()
+	finalVT := vt10x.New(vt10x.WithSize(width, height))
+	var finalVTMu sync.Mutex
+
 	// Forward SIGWINCH to the PTY so the child sees resize events.
 	sigWinch := make(chan os.Signal, 1)
 	signal.Notify(sigWinch, syscall.SIGWINCH)
+	winchDone := make(chan struct{})
 	go func() {
+		defer close(winchDone)
 		for range sigWinch {
 			if !fixedSize {
-				pty.InheritSize(os.Stdin, ptmx)
+				if err := pty.InheritSize(os.Stdin, ptmx); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to resize PTY: %v\n", err)
+					continue
+				}
+				rows, cols, err := pty.Getsize(ptmx)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "failed to read PTY size: %v\n", err)
+					continue
+				}
+				if err := recorder.event(time.Since(startTime).Seconds(), "r", fmt.Sprintf("%dx%d", cols, rows)); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to record resize: %v\n", err)
+					continue
+				}
+				finalVTMu.Lock()
+				finalVT.Resize(cols, rows)
+				finalVTMu.Unlock()
+				if err := recorder.flush(); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to flush resize: %v\n", err)
+				}
 			}
 		}
 	}()
@@ -197,7 +222,6 @@ func runRecord(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "Recording to %s (non-interactive mode) — exit the program to stop.\n", outputFile)
 	}
 
-	startTime := time.Now()
 	// Forward PTY output to our stdout and write timed events to the cast file.
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -209,6 +233,9 @@ func runRecord(cmd *cobra.Command, args []string) {
 			if n > 0 {
 				elapsed := time.Since(startTime).Seconds()
 				os.Stdout.Write(buf[:n])
+				finalVTMu.Lock()
+				_, _ = finalVT.Write(buf[:n])
+				finalVTMu.Unlock()
 				recorder.output(elapsed, string(buf[:n]))
 				recorder.flush()
 			}
@@ -239,6 +266,9 @@ func runRecord(cmd *cobra.Command, args []string) {
 	processErr := processCmd.Wait()
 	ptmx.Close()
 	wg.Wait()
+	signal.Stop(sigWinch)
+	close(sigWinch)
+	<-winchDone
 
 	var recErr error
 	if err := recorder.flushOutput(); err != nil {
@@ -250,8 +280,6 @@ func runRecord(cmd *cobra.Command, args []string) {
 	if err := recorder.getError(); err != nil && recErr == nil {
 		recErr = err
 	}
-	signal.Stop(sigWinch)
-	close(sigWinch)
 	exitCode := 0
 	if processCmd.ProcessState != nil {
 		exitCode = processCmd.ProcessState.ExitCode()
@@ -266,7 +294,10 @@ func runRecord(cmd *cobra.Command, args []string) {
 		status = "recording_error"
 		message = recErr.Error()
 	}
-	if err := writeSessionResult(outputFile, sessionResult{Status: status, ExitCode: exitCode, Error: message, DurationSeconds: time.Since(startTime).Seconds()}); err != nil {
+	finalVTMu.Lock()
+	finalScreen := redactor.redactScreen(normalizeScreen(finalVT.String()))
+	finalVTMu.Unlock()
+	if err := writeSessionResult(outputFile, sessionResult{Status: status, ExitCode: exitCode, Error: message, DurationSeconds: time.Since(startTime).Seconds(), FinalScreen: finalScreen}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing recording summary: %v\n", err)
 		if recErr == nil {
 			recErr = err

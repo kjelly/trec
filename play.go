@@ -13,20 +13,15 @@ import (
 )
 
 type castEvent struct {
-	sec  float64
-	typ  string
-	data string
+	sec     float64
+	typ     string
+	data    string
+	rawData json.RawMessage // Preserves extension-event payloads verbatim.
 }
 
 func parseCastLine(line []byte) (sec float64, typ, data string, err error) {
-	var raw []json.RawMessage
-	if e := json.Unmarshal(line, &raw); e != nil || len(raw) < 3 {
-		return 0, "", "", fmt.Errorf("bad event line")
-	}
-	json.Unmarshal(raw[0], &sec)
-	json.Unmarshal(raw[1], &typ)
-	json.Unmarshal(raw[2], &data)
-	return
+	e, err := parseCastEvent(line)
+	return e.sec, e.typ, e.data, err
 }
 
 const (
@@ -522,8 +517,21 @@ func findMarkerIndex(events []castEvent, cur, dir int) int {
 // jumping backward or to a marker.
 func fastForwardTo(events []castEvent, from, to int) {
 	for k := from; k < to; k++ {
-		if events[k].typ == "o" {
-			os.Stdout.WriteString(events[k].data)
+		applyPlaybackEvent(events[k])
+	}
+}
+
+func applyPlaybackEvent(e castEvent) {
+	switch e.typ {
+	case "o":
+		os.Stdout.WriteString(e.data)
+	case "r":
+		cols, rows, err := parseResizeData(e.data)
+		if err == nil {
+			// CSI 8 requests a terminal-window resize. Terminals that do not
+			// support it safely ignore the sequence, matching asciinema's
+			// best-effort playback behavior.
+			fmt.Fprintf(os.Stdout, "\x1b[8;%d;%dt", rows, cols)
 		}
 	}
 }
@@ -532,9 +540,7 @@ func fastForwardTo(events []castEvent, from, to int) {
 // navigation metadata, but must not write to the terminal grid: a cast owns
 // every cell in that grid while it is being replayed.
 func (p *player) apply(e castEvent) {
-	if e.typ == "o" {
-		os.Stdout.WriteString(e.data)
-	}
+	applyPlaybackEvent(e)
 }
 
 // handleCmd executes one control command against the event list. i is the
@@ -626,7 +632,7 @@ func playFile(p *player, path string) error {
 
 	var events []castEvent
 	for _, e := range allEvents {
-		if e.typ == "o" || e.typ == "i" || e.typ == "m" {
+		if e.typ == "o" || e.typ == "i" || e.typ == "m" || e.typ == "r" {
 			events = append(events, e)
 		}
 	}

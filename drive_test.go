@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hinshun/vt10x"
 )
 
 func TestRecordingWriterRedactsAllCastFieldsAndSplitOutput(t *testing.T) {
@@ -510,8 +512,15 @@ func TestDriveWaitChildExitAndAssertExit(t *testing.T) {
 		if !strings.Contains(output, "process exited 0") {
 			t.Fatalf("missing successful exit report:\n%s", output)
 		}
-		if !strings.Contains(cast, "line 1: WAIT_CHILD_EXIT") || !strings.Contains(cast, "line 2: ASSERT_EXIT 0") {
-			t.Fatalf("cast is missing lifecycle markers:\n%s", cast)
+		for _, want := range []string{
+			"STEP_START line 1: WAIT_CHILD_EXIT",
+			"STEP_OK line 1: WAIT_CHILD_EXIT",
+			"STEP_START line 2: ASSERT_EXIT 0",
+			"STEP_OK line 2: ASSERT_EXIT 0",
+		} {
+			if !strings.Contains(cast, want) {
+				t.Fatalf("cast is missing lifecycle marker %q:\n%s", want, cast)
+			}
 		}
 	})
 
@@ -536,6 +545,37 @@ func TestDriveWaitChildExitAndAssertExit(t *testing.T) {
 			t.Fatalf("successful assertion recorded failure:\n%s", cast)
 		}
 	})
+}
+
+func TestDriveSnapshotPersistsRedactedScreenAndLabel(t *testing.T) {
+	redactor, err := newSecretRedactor(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := &terminalSession{
+		start:    time.Now(),
+		cols:     80,
+		rows:     24,
+		vt:       vt10x.New(vt10x.WithSize(80, 24)),
+		redactor: redactor,
+	}
+	ts.feedOutput([]byte("saved successfully"))
+	ds := &driveSession{ts: ts, redactor: redactor}
+	step, err := parseDriveLine("SNAPSHOT hosts saved", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ds.applyStep(context.Background(), step); err != nil {
+		t.Fatal(err)
+	}
+	result := ds.result("success", 0, "")
+	if len(result.Snapshots) != 1 {
+		t.Fatalf("snapshots = %#v, want one", result.Snapshots)
+	}
+	snapshot := result.Snapshots[0]
+	if snapshot.Label != "hosts saved" || len(snapshot.Screen) != 1 || snapshot.Screen[0] != "saved successfully" {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
 }
 
 func TestDriveAndRenderOutputFormat(t *testing.T) {

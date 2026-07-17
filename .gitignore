@@ -5,3 +5,4 @@ terminal-record
 dist/
 pilot-verify-minimal-poc/
 ./tmp
+workspace

@@ -14,7 +14,7 @@ func TestRecordPropagatesExitCodeAndWritesResult(t *testing.T) {
 		t.Fatalf("build trec: %v\n%s", err, out)
 	}
 	cast := filepath.Join(t.TempDir(), "failed.cast")
-	cmd := exec.Command(binary, "-o", cast, "--", "sh", "-c", "exit 7")
+	cmd := exec.Command(binary, "-o", cast, "--", "sh", "-c", "printf final-screen; exit 7")
 	output, err := cmd.CombinedOutput()
 	code := 0
 	if err != nil {
@@ -33,6 +33,9 @@ func TestRecordPropagatesExitCodeAndWritesResult(t *testing.T) {
 	}
 	if !strings.Contains(string(result), `"status": "failed"`) || !strings.Contains(string(result), `"exit_code": 7`) {
 		t.Fatalf("unexpected result:\n%s", result)
+	}
+	if !strings.Contains(string(result), "final-screen") {
+		t.Fatalf("record result is missing final screen:\n%s", result)
 	}
 }
 
