@@ -1008,6 +1008,160 @@ func TestMCPTerminalSelectConcurrency(t *testing.T) {
 	}
 }
 
+// menuWriteCloser simulates a TUI list: arrow keys move a bounded selection
+// pointer and every keypress re-renders a static header line plus the list,
+// mirroring a program that leaves stale/diagnostic text on the screen.
+type menuWriteCloser struct {
+	ts     *terminalSession
+	header string
+	opts   []string
+	sel    int
+}
+
+func (mw *menuWriteCloser) render() {
+	var b strings.Builder
+	b.WriteString("\x1b[H\x1b[2J")
+	b.WriteString(mw.header + "\r\n")
+	for i, o := range mw.opts {
+		if i == mw.sel {
+			b.WriteString("❯ " + o)
+		} else {
+			b.WriteString("  " + o)
+		}
+		if i < len(mw.opts)-1 {
+			b.WriteString("\r\n")
+		}
+	}
+	mw.ts.vtMu.Lock()
+	mw.ts.vt.Write([]byte(b.String()))
+	mw.ts.vtMu.Unlock()
+}
+
+func (mw *menuWriteCloser) Write(p []byte) (int, error) {
+	switch string(p) {
+	case "\x1b[A":
+		if mw.sel > 0 {
+			mw.sel--
+		}
+	case "\x1b[B":
+		if mw.sel < len(mw.opts)-1 {
+			mw.sel++
+		}
+	}
+	mw.render()
+	return len(p), nil
+}
+
+func (mw *menuWriteCloser) Close() error { return nil }
+
+// Regression test for github.com/kjelly/trec/issues/1: a stale/diagnostic
+// line above the list repeats the target label, sending the direction
+// heuristic UP from row 0 forever. selectLabel must notice the no-op press
+// and sweep the other way instead.
+func TestMCPTerminalSelectRecoversFromMisleadingStaleText(t *testing.T) {
+	br, bw, _ := os.Pipe()
+	defer br.Close()
+	defer bw.Close()
+
+	mw := &menuWriteCloser{header: "DEBUG: highlighted=Option 3", opts: []string{"Option 1", "Option 2", "Option 3"}}
+	ts := newTerminalSession(mw, br, nil, 80, 24, nil, nil, false, nil)
+	mw.ts = ts
+	mw.render()
+
+	pointerRe := regexp.MustCompile(`^\s*(?:❯|▸|›|→|»|>)\s`)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := ts.selectLabel(ctx, "Option 3", pointerRe, time.Millisecond); err != nil {
+		t.Fatalf("selectLabel failed despite the label being selectable: %v", err)
+	}
+	if mw.sel != 2 {
+		t.Fatalf("pointer ended on option index %d, want 2", mw.sel)
+	}
+}
+
+// Regression test for github.com/kjelly/trec/issues/1: when the label only
+// exists in stale text and no selectable row ever matches, selectLabel must
+// fail fast with a clear error after sweeping both directions instead of
+// pressing toward a boundary until the press budget runs out.
+func TestMCPTerminalSelectStaleOnlyLabelFailsFast(t *testing.T) {
+	br, bw, _ := os.Pipe()
+	defer br.Close()
+	defer bw.Close()
+
+	mw := &menuWriteCloser{header: "leftover from previous screen: Ghost", opts: []string{"Option 1", "Option 2", "Option 3"}}
+	ts := newTerminalSession(mw, br, nil, 80, 24, nil, nil, false, nil)
+	mw.ts = ts
+	mw.render()
+
+	pointerRe := regexp.MustCompile(`^\s*(?:❯|▸|›|→|»|>)\s`)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := ts.selectLabel(ctx, "Ghost", pointerRe, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "sweeping both directions") {
+		t.Fatalf("expected a both-directions sweep error, got: %v", err)
+	}
+}
+
+// Regression test for github.com/kjelly/trec/issues/2: terminal_write must
+// deliver a real carriage-return byte to a directly-launched raw-mode child
+// (no intermediate `trec drive` process translating DSL steps).
+func TestMCPTerminalWriteEnterRawModeChild(t *testing.T) {
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+
+	startSession := func(t *testing.T, script string) string {
+		t.Helper()
+		req, _ := json.Marshal(map[string]any{"command": []string{"sh", "-c", script}})
+		res, err := s.tool(context.Background(), "terminal_start", req)
+		if err != nil {
+			t.Fatalf("terminal_start failed: %v", err)
+		}
+		id := res.(map[string]string)["session_id"]
+		t.Cleanup(func() {
+			if ss, _ := s.session(id); ss != nil {
+				ss.close()
+			}
+		})
+		return id
+	}
+
+	expect := func(t *testing.T, id, text string) {
+		t.Helper()
+		if _, err := s.tool(context.Background(), "terminal_expect", []byte(`{"session_id":"`+id+`","text":"`+text+`","timeout_seconds":5}`)); err != nil {
+			t.Fatalf("terminal_expect %q failed: %v", text, err)
+		}
+	}
+
+	t.Run("plain enter", func(t *testing.T) {
+		id := startSession(t, "stty raw -echo; printf ready.; head -c 1 | od -An -tx1")
+		expect(t, id, "ready.")
+		if _, err := s.tool(context.Background(), "terminal_write", []byte(`{"session_id":"`+id+`","data":"\r"}`)); err != nil {
+			t.Fatalf("terminal_write failed: %v", err)
+		}
+		// In raw mode the child must see the CR byte itself (0d), not a
+		// line-discipline-translated LF (0a).
+		expect(t, id, "0d")
+	})
+
+	t.Run("paced text ending in enter", func(t *testing.T) {
+		id := startSession(t, "stty raw -echo; printf ready.; head -c 2 | od -An -tx1")
+		expect(t, id, "ready.")
+		if _, err := s.tool(context.Background(), "terminal_write", []byte(`{"session_id":"`+id+`","data":"a\r","delay_ms":10}`)); err != nil {
+			t.Fatalf("terminal_write with delay_ms failed: %v", err)
+		}
+		expect(t, id, "61 0d")
+	})
+
+	t.Run("negative delay rejected", func(t *testing.T) {
+		id := startSession(t, "sleep 5")
+		_, err := s.tool(context.Background(), "terminal_write", []byte(`{"session_id":"`+id+`","data":"x","delay_ms":-1}`))
+		if err == nil || !strings.Contains(err.Error(), "delay_ms must not be negative") {
+			t.Fatalf("expected negative delay_ms error, got: %v", err)
+		}
+	})
+}
+
 func TestMCPHarmlessScreenRedaction(t *testing.T) {
 	s := &mcpServer{sessions: map[string]*terminalSession{}}
 	t.Setenv("MYSECRET", "super-secret-value")

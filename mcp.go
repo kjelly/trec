@@ -59,7 +59,12 @@ func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
 		mcp.WithArray("secret_env", mcp.Description("Environment variables to redact from the recording.")),
 		mcp.WithArray("secret_file", mcp.Description("Files to redact (NAME=path).")),
 	))
-	add("terminal_write", mcp.NewTool("terminal_write", mcp.WithDescription("Write to a persistent terminal process."), mcp.WithString("session_id", mcp.Required()), mcp.WithString("data", mcp.Required())))
+	add("terminal_write", mcp.NewTool("terminal_write",
+		mcp.WithDescription("Write raw bytes to a persistent terminal process. Send \"\\r\" (carriage return) for Enter; \"\\n\" is Ctrl+J and most TUIs do not treat it as Enter."),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("data", mcp.Required()),
+		mcp.WithNumber("delay_ms", mcp.Description("Per-character delay in milliseconds, for TUIs that drop unpaced keystrokes. Leave unset for escape sequences, which must arrive as one unpaced burst.")),
+	))
 	add("terminal_read", mcp.NewTool("terminal_read", mcp.WithDescription("Read a persistent terminal process incremental raw output."), mcp.WithString("session_id", mcp.Required())))
 	add("terminal_read_screen", mcp.NewTool("terminal_read_screen", mcp.WithDescription("Read the emulated screen from a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
 	add("terminal_resize", mcp.NewTool("terminal_resize", mcp.WithDescription("Resize the terminal to a new width and height."), mcp.WithString("session_id", mcp.Required()), mcp.WithNumber("cols", mcp.Required()), mcp.WithNumber("rows", mcp.Required())))
@@ -289,17 +294,26 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 		return map[string]string{"session_id": id}, nil
 	case "terminal_write":
 		var a struct {
-			SessionID string `json:"session_id"`
-			Data      string `json:"data"`
+			SessionID string   `json:"session_id"`
+			Data      string   `json:"data"`
+			DelayMS   *float64 `json:"delay_ms"`
 		}
 		if e := json.Unmarshal(raw, &a); e != nil {
 			return nil, e
+		}
+		if a.DelayMS != nil && *a.DelayMS < 0 {
+			return nil, fmt.Errorf("delay_ms must not be negative")
 		}
 		ss, e := s.session(a.SessionID)
 		if e != nil {
 			return nil, e
 		}
-		n, e := ss.sendBytes([]byte(a.Data), "")
+		var n int
+		if a.DelayMS != nil && *a.DelayMS > 0 {
+			n, e = ss.sendText(a.Data, "", time.Duration(*a.DelayMS*float64(time.Millisecond)))
+		} else {
+			n, e = ss.sendBytes([]byte(a.Data), "")
+		}
 		return map[string]any{"written": n}, e
 	case "terminal_read":
 		// Note: terminal_read returns unredacted raw output by design, so clients can process raw bytes.

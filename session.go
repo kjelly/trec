@@ -469,13 +469,21 @@ func (ts *terminalSession) selectLabel(ctx context.Context, label string, pointe
 	ts.writeMu.Lock()
 	defer ts.writeMu.Unlock()
 
+	const (
+		keyDown = "\x1b[B"
+		keyUp   = "\x1b[A"
+	)
 	maxPress := 3 * ts.rows
 	written := 0
+	var prevSnap *screenSnapshot
+	lastKey := ""
+	reversals := 0
 	for press := 0; ; press++ {
 		if err := ctx.Err(); err != nil {
 			return written, err
 		}
-		lines, _, _, _, _ := ts.rawScreenSnapshot()
+		snap := ts.getSnapshot()
+		lines := snap.lines
 		pointerRows := make([]int, 0, 1)
 		for idx, l := range lines {
 			if pointerRe.MatchString(l) {
@@ -497,14 +505,34 @@ func (ts *terminalSession) selectLabel(ctx context.Context, label string, pointe
 			}
 			return written, fmt.Errorf("SELECT %q: not reached after %d presses (no pointer row found)", label, press)
 		}
-		key := "\x1b[B" // down
-		if pIdx >= 0 {
-			for idx, l := range lines {
-				if idx != pIdx && strings.Contains(l, label) {
-					if idx < pIdx {
-						key = "\x1b[A" // label is above the pointer
+		var key string
+		switch {
+		case prevSnap != nil && snap.equal(prevSnap):
+			// The previous press changed nothing on screen: the pointer is at a
+			// list boundary. The label scan below can be misled by stale
+			// content from a previous screen or interleaved diagnostic output,
+			// so sweep the opposite direction instead of trusting it again.
+			reversals++
+			if reversals >= 2 {
+				return written, fmt.Errorf("SELECT %q: not reached after sweeping both directions (%d presses); the label may only match stale or non-selectable screen text", label, press)
+			}
+			if lastKey == keyUp {
+				key = keyDown
+			} else {
+				key = keyUp
+			}
+		case reversals > 0:
+			key = lastKey
+		default:
+			key = keyDown
+			if pIdx >= 0 {
+				for idx, l := range lines {
+					if idx != pIdx && strings.Contains(l, label) {
+						if idx < pIdx {
+							key = keyUp // label is above the pointer
+						}
+						break
 					}
-					break
 				}
 			}
 		}
@@ -513,6 +541,8 @@ func (ts *terminalSession) selectLabel(ctx context.Context, label string, pointe
 		if err != nil {
 			return written, err
 		}
+		lastKey = key
+		prevSnap = snap
 		time.Sleep(keyDelay)
 		if err := ts.waitQuiet(ctx, 120*time.Millisecond, 2*time.Second); err != nil {
 			return written, err
