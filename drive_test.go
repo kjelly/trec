@@ -132,6 +132,10 @@ func TestParseJSONDriveSteps(t *testing.T) {
 		{`{"kind": "assert_exit"}`, "ASSERT_EXIT needs an exit code"},
 		{`{"kind": "expect", "text": "ready", "n": 0}`, "EXPECT needs a positive timeout duration"},
 		{`{"kind": "expect", "text": "ready", "n": -1}`, "EXPECT needs a positive timeout duration"},
+		{`{"kind": "expect_change", "n": 0}`, "EXPECT_CHANGE needs a positive timeout duration"},
+		{`{"kind": "expect_change", "n": -1}`, "EXPECT_CHANGE needs a positive timeout duration"},
+		{`{"kind": "expect_regex", "text": ""}`, "EXPECT_REGEX needs text pattern"},
+		{`{"kind": "expect_screen_regex", "text": ""}`, "EXPECT_SCREEN_REGEX needs text pattern"},
 		{`{"kind": "text"`, "invalid JSON request"}, // Malformed JSON syntax
 	}
 
@@ -159,12 +163,12 @@ func TestDriveNavigationStepsSendExpectedEscapeSequences(t *testing.T) {
 	pr, pw, _ := os.Pipe()
 	defer pr.Close()
 	defer pw.Close()
-	ts := newTerminalSession(w, pr, nil, 80, 24, newRecordingWriter(bufio.NewWriter(&cast), &mu, redactor), false, nil)
+	ts := newTerminalSession(w, pr, nil, 80, 24, newRecordingWriter(bufio.NewWriter(&cast), &mu, redactor), redactor, false, nil)
 	ds := &driveSession{
 		ts:       ts,
 		redactor: redactor,
 	}
-	for lineNo, line := range []string{"LEFT 2", "RIGHT", "ESCAPE"} {
+	for lineNo, line := range []string{"LEFT 2", "RIGHT", "ESCAPE", "CTRLU", "CTRLW", "CLEAR_LINE"} {
 		step, err := parseDriveLine(line, lineNo+1)
 		if err != nil {
 			t.Fatalf("parse %q: %v", line, err)
@@ -173,7 +177,7 @@ func TestDriveNavigationStepsSendExpectedEscapeSequences(t *testing.T) {
 			t.Fatalf("apply %q: %v", line, err)
 		}
 	}
-	const want = "\x1b[D\x1b[D\x1b[C\x1b"
+	const want = "\x1b[D\x1b[D\x1b[C\x1b\x15\x17\x15"
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -223,6 +227,135 @@ func TestDriveTextFileAndSecretFileDoNotLeakToCast(t *testing.T) {
 	}
 	if !strings.Contains(string(cast), `\u003credacted:LEGACY_PASSWORD\u003e`) {
 		t.Fatalf("named secret-file redaction missing:\n%s", cast)
+	}
+}
+
+func TestExpectAndBaselineSemantics(t *testing.T) {
+	var cast bytes.Buffer
+	var mu sync.Mutex
+	redactor := &secretRedactor{}
+	pr, pw, _ := os.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	ts := newTerminalSession(pw, pr, nil, 80, 24, newRecordingWriter(bufio.NewWriter(&cast), &mu, redactor), redactor, false, nil)
+	ds := &driveSession{ts: ts, expectTimeout: 50 * time.Millisecond, redactor: redactor}
+
+	// 1. Regex vs Screen Regex
+	ts.feedOutput([]byte("line1\nline2"))
+	time.Sleep(50 * time.Millisecond)
+
+	stReg, _ := parseDriveLine("EXPECT_REGEX line1.*line2", 1)
+	if err := ds.applyStep(context.Background(), stReg); err == nil {
+		t.Fatal("EXPECT_REGEX unexpectedly matched across lines")
+	}
+	// We need `(?s)` for dot to match newline
+	stScr, _ := parseDriveLine("EXPECT_SCREEN_REGEX (?s)line1.*line2", 2)
+	if err := ds.applyStep(context.Background(), stScr); err != nil {
+		t.Fatalf("EXPECT_SCREEN_REGEX failed to match across lines: %v", err)
+	}
+
+	// 2. EXPECT_CHANGE baseline failure without prior mutation (even with empty TEXT)
+	stTextEmpty, _ := parseDriveLine("TEXT ", 4)
+	_ = ds.applyStep(context.Background(), stTextEmpty)
+
+	stChgFail, _ := parseDriveLine("EXPECT_CHANGE", 5)
+	if err := ds.applyStep(context.Background(), stChgFail); err == nil || !strings.Contains(err.Error(), "no previous mutating action") {
+		t.Fatalf("EXPECT_CHANGE unexpectedly succeeded or gave wrong error without prior mutation: %v", err)
+	}
+
+	// 3. EXPECT_CHANGE baseline success
+	stSpace, _ := parseDriveLine("SPACE", 6)
+	ds.applyStep(context.Background(), stSpace)
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		ts.feedOutput([]byte(" change"))
+	}()
+	stChg, _ := parseDriveLine("EXPECT_CHANGE", 7)
+	if err := ds.applyStep(context.Background(), stChg); err != nil {
+		t.Fatalf("EXPECT_CHANGE failed: %v", err)
+	}
+
+	// 4. Cursor-only EXPECT_CHANGE
+	stLeft, _ := parseDriveLine("LEFT 1", 8)
+	ds.applyStep(context.Background(), stLeft) // Moves cursor to left
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		ts.feedOutput([]byte("\x1b[D")) // Cursor left ANSI
+	}()
+	stChg2, _ := parseDriveLine("EXPECT_CHANGE", 9)
+	if err := ds.applyStep(context.Background(), stChg2); err != nil {
+		t.Fatalf("EXPECT_CHANGE failed on cursor movement: %v", err)
+	}
+
+	// 5. Zero-byte mutation after successful mutation clears baseline
+	stZero, _ := parseDriveLine("TEXT ", 10)
+	ds.applyStep(context.Background(), stZero) // 0 bytes written, baselineValid = false
+	stChgFail2, _ := parseDriveLine("EXPECT_CHANGE", 11)
+	if err := ds.applyStep(context.Background(), stChgFail2); err == nil || !strings.Contains(err.Error(), "no previous mutating action") {
+		t.Fatalf("EXPECT_CHANGE unexpectedly succeeded after 0-byte mutation cleared baseline: %v", err)
+	}
+}
+
+func TestDriveTimeoutErrorDoesNotLeakSecret(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "trec")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build trec: %v\n%s", err, output)
+	}
+
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "steps.txt")
+	castPath := filepath.Join(dir, "run.cast")
+	resultPath := castPath + ".result.json"
+
+	const secret = "my-super-secret-value"
+	script := "EXPECT_EVENTUALLY missing-string"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// Use width=5 so secret wraps across lines
+	cmd := exec.CommandContext(ctx, binary, "drive", "--width", "5", "--expect-timeout", "10", "--secret-env", "MYSECRET", "--script", scriptPath, "-o", castPath, "--", "sh", "-c", "echo $MYSECRET && sleep 2")
+	cmd.Env = append(os.Environ(), "MYSECRET="+secret)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	// We intentionally do not check stdout because the raw PTY echo is unredacted.
+	err := cmd.Run()
+
+	if err == nil {
+		t.Fatalf("drive succeeded unexpectedly:\n%s", errBuf.String())
+	}
+
+	if strings.Contains(errBuf.String(), secret) {
+		t.Fatalf("secret leaked in stderr output:\n%s", errBuf.String())
+	}
+
+	resultJSON, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(resultJSON), secret) {
+		t.Fatalf("secret leaked in result JSON:\n%s", resultJSON)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(resultJSON, &result); err != nil {
+		t.Fatalf("failed to parse result JSON: %v", err)
+	}
+	screens, ok := result["final_screen"].([]any)
+	if !ok || len(screens) == 0 || screens[0] != "<screen redacted>" {
+		t.Fatalf("result JSON final_screen does not contain <screen redacted>: %v", result["final_screen"])
+	}
+
+	castData, err := os.ReadFile(castPath)
+	if err == nil {
+		if strings.Contains(string(castData), secret) {
+			t.Fatalf("secret leaked in cast file:\n%s", castData)
+		}
+		if !strings.Contains(string(castData), `<screen redacted>`) && !strings.Contains(string(castData), `\u003cscreen redacted\u003e`) {
+			t.Fatalf("cast marker does not contain <screen redacted> placeholder:\n%s", castData)
+		}
 	}
 }
 
@@ -440,5 +573,52 @@ func TestDriveAndRenderOutputFormat(t *testing.T) {
 	}
 	if !foundRenderJSONL {
 		t.Fatalf("expected JSONL structured output from render, got:\n%s", outRenderJSONL)
+	}
+}
+
+func TestParseJSONClearLine(t *testing.T) {
+	st, err := parseDriveLine(`{"op":"CLEAR_LINE"}`, 1)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if st.kind != "ctrlu" {
+		t.Fatalf("expected ctrlu, got %q", st.kind)
+	}
+}
+
+func TestDriveRespondResultRespectsTaint(t *testing.T) {
+	os.Setenv("TEST_DRIVE_TAINT", "mysecret")
+	defer os.Unsetenv("TEST_DRIVE_TAINT")
+
+	redactor, _ := newSecretRedactor([]string{"TEST_DRIVE_TAINT"})
+	dummyIn, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	defer dummyIn.Close()
+	ts := newTerminalSession(dummyIn, strings.NewReader(""), nil, 80, 24, nil, redactor, false, nil)
+	ts.tainted = true
+	ds := &driveSession{
+		ts:       ts,
+		redactor: redactor,
+	}
+
+	// Just check the result JSON
+	res := ds.result("success", 0, "ok")
+	if len(res.FinalScreen) != 1 || res.FinalScreen[0] != "<screen redacted>" {
+		t.Fatalf("expected result.FinalScreen to be redacted, got %v", res.FinalScreen)
+	}
+
+	// For respond, we'd need to capture stdout.
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	ds.respond(nil)
+	w.Close()
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+	out := buf.String()
+	if !strings.Contains(out, "<screen redacted>") {
+		t.Fatalf("expected respond output to be redacted, got %s", out)
 	}
 }

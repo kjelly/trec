@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,13 +44,7 @@ func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
 	server := mcpserver.NewMCPServer("trec", appVersion, mcpserver.WithToolCapabilities(false), mcpserver.WithRecovery())
 	add := func(name string, tool mcp.Tool) {
 		server.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			args, _ := json.Marshal(req.GetArguments())
-			value, err := s.tool(ctx, name, args)
-			if err != nil {
-				return mcp.NewToolResultError(err.Error()), nil
-			}
-			out, _ := json.Marshal(value)
-			return mcp.NewToolResultText(string(out)), nil
+			return s.handleCallTool(ctx, name, req)
 		})
 	}
 	add("run", mcp.NewTool("run", mcp.WithDescription("Run any local command once."), mcp.WithArray("command", mcp.Required(), mcp.WithStringItems(), mcp.Description("Argv: command name followed by its arguments, e.g. [\"echo\", \"hi\"].")), mcp.WithString("stdin"), mcp.WithNumber("timeout_seconds"), mcp.WithString("working_directory")))
@@ -67,6 +62,7 @@ func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
 	add("terminal_write", mcp.NewTool("terminal_write", mcp.WithDescription("Write to a persistent terminal process."), mcp.WithString("session_id", mcp.Required()), mcp.WithString("data", mcp.Required())))
 	add("terminal_read", mcp.NewTool("terminal_read", mcp.WithDescription("Read a persistent terminal process incremental raw output."), mcp.WithString("session_id", mcp.Required())))
 	add("terminal_read_screen", mcp.NewTool("terminal_read_screen", mcp.WithDescription("Read the emulated screen from a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
+	add("terminal_resize", mcp.NewTool("terminal_resize", mcp.WithDescription("Resize the terminal to a new width and height."), mcp.WithString("session_id", mcp.Required()), mcp.WithNumber("cols", mcp.Required()), mcp.WithNumber("rows", mcp.Required())))
 	add("terminal_expect", mcp.NewTool("terminal_expect", mcp.WithDescription("Wait until text appears on the terminal screen."), mcp.WithString("session_id", mcp.Required()), mcp.WithString("text", mcp.Required()), mcp.WithNumber("timeout_seconds", mcp.Required())))
 	add("terminal_wait_quiet", mcp.NewTool("terminal_wait_quiet", mcp.WithDescription("Wait until terminal output is quiet."), mcp.WithString("session_id", mcp.Required()), mcp.WithNumber("quiet_duration_seconds", mcp.Required()), mcp.WithNumber("timeout_seconds", mcp.Required())))
 	add("terminal_close", mcp.NewTool("terminal_close", mcp.WithDescription("Close a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
@@ -79,6 +75,27 @@ func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
 	))
 	add("session_list", mcp.NewTool("session_list", mcp.WithDescription("List persistent terminal sessions.")))
 	return server
+}
+func (s *mcpServer) handleCallTool(ctx context.Context, name string, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, _ := json.Marshal(req.GetArguments())
+	value, err := s.tool(ctx, name, args)
+	var res *mcp.CallToolResult
+	if value != nil {
+		out, _ := json.Marshal(value)
+		res = mcp.NewToolResultText(string(out))
+		if err != nil {
+			res.IsError = true
+			res.Content = append(res.Content, mcp.TextContent{
+				Type: "text",
+				Text: err.Error(),
+			})
+		}
+	} else if err != nil {
+		res = mcp.NewToolResultError(err.Error())
+	} else {
+		res = mcp.NewToolResultText("null")
+	}
+	return res, nil
 }
 
 func runMCP() {
@@ -134,7 +151,24 @@ func mcpTerminalSize(raw json.RawMessage) (*pty.Winsize, error) {
 	return &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}, nil
 }
 
-func (s *mcpServer) tool(ctx context.Context, name string, raw json.RawMessage) (any, error) {
+type mcpScreenError struct {
+	err error
+	msg string
+}
+
+func (e *mcpScreenError) Error() string { return e.msg }
+func (e *mcpScreenError) Unwrap() error { return e.err }
+
+func mcpErrorWithScreen(e error, ss *terminalSession) error {
+	lines, _, _, _, _ := ss.redactedScreenSnapshot()
+	msg := fmt.Sprintf("%v\nScreen:\n%s", e, strings.Join(lines, "\n"))
+	if ss.redactor != nil {
+		msg = ss.redactor.RedactString(msg)
+	}
+	return &mcpScreenError{err: e, msg: msg}
+}
+
+func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, error) {
 	switch name {
 	case "run":
 		a, in, to, dir, e := commandFrom(raw)
@@ -181,19 +215,19 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw json.RawMessage) 
 			return nil, err
 		}
 
+		redactor, err := newSecretRedactor(mcpOpts.SecretEnv)
+		if err != nil {
+			return nil, err
+		}
+		if err := addSecretFileSpecs(redactor, mcpOpts.SecretFile); err != nil {
+			return nil, err
+		}
+
 		var recorder *recordingWriter
 		var extraClosers []io.Closer
 		if mcpOpts.RecordFile != "" {
 			if _, err := os.Stat(mcpOpts.RecordFile); err == nil {
 				return nil, fmt.Errorf("record_file %q already exists", mcpOpts.RecordFile)
-			}
-
-			redactor, err := newSecretRedactor(mcpOpts.SecretEnv)
-			if err != nil {
-				return nil, err
-			}
-			if err := addSecretFileSpecs(redactor, mcpOpts.SecretFile); err != nil {
-				return nil, err
 			}
 
 			f, err := os.OpenFile(mcpOpts.RecordFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
@@ -246,7 +280,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw json.RawMessage) 
 			return nil, e
 		}
 
-		ts := newTerminalSession(ptmx, ptmx, c, int(size.Cols), int(size.Rows), recorder, true, extraClosers)
+		ts := newTerminalSession(ptmx, ptmx, c, int(size.Cols), int(size.Rows), recorder, redactor, true, extraClosers)
 		s.mu.Lock()
 		s.next++
 		id := "session-" + strconv.Itoa(s.next)
@@ -265,9 +299,11 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw json.RawMessage) 
 		if e != nil {
 			return nil, e
 		}
-		e = ss.sendBytes([]byte(a.Data))
-		return map[string]any{"written": len(a.Data)}, e
+		n, e := ss.sendBytes([]byte(a.Data), "")
+		return map[string]any{"written": n}, e
 	case "terminal_read":
+		// Note: terminal_read returns unredacted raw output by design, so clients can process raw bytes.
+		// Use terminal_read_screen for redacted rendered output.
 		var a struct {
 			SessionID string `json:"session_id"`
 		}
@@ -282,6 +318,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw json.RawMessage) 
 		exited, code, _ := ss.getExitState()
 		return map[string]any{"stdout": o, "stderr": "", "running": !exited, "exit_code": code, "truncated": truncated}, nil
 	case "terminal_read_screen":
+		// Note: terminal_read_screen handles redaction internally now
 		var a struct {
 			SessionID string `json:"session_id"`
 		}
@@ -292,7 +329,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw json.RawMessage) 
 		if e != nil {
 			return nil, e
 		}
-		lines, r, c, rows, cols := ss.screenSnapshot()
+		lines, r, c, rows, cols := ss.redactedScreenSnapshot()
 		exited, code, _ := ss.getExitState()
 		return map[string]any{
 			"screen":    lines,
@@ -301,6 +338,25 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw json.RawMessage) 
 			"running":   !exited,
 			"exit_code": code,
 		}, nil
+	case "terminal_resize":
+		var a struct {
+			SessionID string `json:"session_id"`
+		}
+		if e := json.Unmarshal(raw, &a); e != nil {
+			return nil, e
+		}
+		ss, e := s.session(a.SessionID)
+		if e != nil {
+			return nil, e
+		}
+		size, e := mcpTerminalSize(raw)
+		if e != nil {
+			return nil, e
+		}
+		if e := ss.resize(int(size.Cols), int(size.Rows)); e != nil {
+			return nil, e
+		}
+		return map[string]any{"cols": int(size.Cols), "rows": int(size.Rows)}, nil
 	case "terminal_expect":
 		var a struct {
 			SessionID string  `json:"session_id"`
@@ -317,9 +373,9 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw json.RawMessage) 
 		if e != nil {
 			return nil, e
 		}
-		e = ss.waitForText(ctx, a.Text, time.Duration(a.Timeout*float64(time.Second)))
+		e = ss.waitForText(ctx, "EXPECT", a.Text, time.Duration(a.Timeout*float64(time.Second)))
 		if e != nil {
-			return nil, e
+			return nil, mcpErrorWithScreen(e, ss)
 		}
 		return map[string]bool{"found": true}, nil
 	case "terminal_wait_quiet":
@@ -343,7 +399,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw json.RawMessage) 
 		}
 		e = ss.waitQuiet(ctx, time.Duration(a.Quiet*float64(time.Second)), time.Duration(a.Timeout*float64(time.Second)))
 		if e != nil {
-			return nil, e
+			return nil, mcpErrorWithScreen(e, ss)
 		}
 		return map[string]bool{"quiet": true}, nil
 	case "terminal_select":
@@ -382,9 +438,9 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw json.RawMessage) 
 		ctxSelect, cancel := context.WithTimeout(ctx, time.Duration(timeoutVal*float64(time.Second)))
 		defer cancel()
 
-		e = ss.selectLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+		_, e = ss.selectLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
 		if e != nil {
-			return nil, e
+			return nil, mcpErrorWithScreen(e, ss)
 		}
 		return map[string]bool{"selected": true}, nil
 	case "terminal_close":

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/hinshun/vt10x"
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 func TestMCPTerminalSize(t *testing.T) {
@@ -129,7 +133,7 @@ func TestMCPTerminalIntegration(t *testing.T) {
 	// Test read_screen
 	// wait for 'hello' to appear
 	ss, _ := s.session(sessionID)
-	ss.waitForText(context.Background(), "hello", 2*time.Second)
+	ss.waitForText(context.Background(), "EXPECT", "hello", 2*time.Second)
 
 	res2, err := s.tool(context.Background(), "terminal_read_screen", []byte(`{"session_id":"`+sessionID+`"}`))
 	if err != nil {
@@ -173,6 +177,65 @@ func TestMCPTerminalIntegration(t *testing.T) {
 	_, err = s.tool(context.Background(), "terminal_wait_quiet", []byte(`{"session_id":"`+sessionID+`","quiet_duration_seconds":0.1,"timeout_seconds":0}`))
 	if err == nil || !strings.Contains(err.Error(), "must be greater than zero") {
 		t.Fatalf("wait_quiet with timeout_seconds=0 should fail validation, got: %v", err)
+	}
+}
+
+func TestMCPTimeoutSecretRedaction(t *testing.T) {
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+
+	tmpCast := filepath.Join(t.TempDir(), "test_mcp_secret.cast")
+	defer os.Remove(tmpCast)
+
+	t.Setenv("MYSECRET", "super-secret-value")
+
+	req := map[string]any{
+		"command":     []string{"sh", "-c", "echo $MYSECRET; sleep 2"},
+		"secret_env":  []string{"MYSECRET"},
+		"record_file": tmpCast,
+		"cols":        5, // Narrow enough to force "super-secret-value" across lines
+	}
+	reqBytes, _ := json.Marshal(req)
+
+	res, err := s.tool(context.Background(), "terminal_start", reqBytes)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	m, _ := res.(map[string]string)
+	sessionID := m["session_id"]
+	defer func() {
+		ss, _ := s.session(sessionID)
+		if ss != nil {
+			ss.close()
+		}
+	}()
+
+	_, err = s.tool(context.Background(), "terminal_expect", []byte(`{"session_id":"`+sessionID+`","text":"impossible-string","timeout_seconds":0.5}`))
+	if err == nil {
+		t.Fatalf("expect should have timed out")
+	}
+
+	errMsg := err.Error()
+	if strings.Contains(errMsg, "super-secret-value") {
+		t.Fatalf("MCP terminal_expect error leaked secret: %s", errMsg)
+	}
+	if !strings.Contains(errMsg, "<screen redacted>") {
+		t.Fatalf("MCP terminal_expect error did not contain redacted placeholder: %s", errMsg)
+	}
+
+	resScreen, err := s.tool(context.Background(), "terminal_read_screen", []byte(`{"session_id":"`+sessionID+`"}`))
+	if err != nil {
+		t.Fatalf("terminal_read_screen failed: %v", err)
+	}
+	if !strings.Contains(fmt.Sprint(resScreen), "<screen redacted>") {
+		t.Fatalf("terminal_read_screen did not redact: %v", resScreen)
+	}
+
+	// Test errors.Is context.Canceled unwrapping
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, errCtx := s.tool(ctx, "terminal_expect", []byte(`{"session_id":"`+sessionID+`","text":"impossible-string","timeout_seconds":0.5}`))
+	if !errors.Is(errCtx, context.Canceled) {
+		t.Fatalf("Expected context.Canceled, got %v", errCtx)
 	}
 }
 
@@ -274,11 +337,8 @@ func TestMCPWriteAfterClose(t *testing.T) {
 	}
 
 	// Direct sendBytes should fail with "session is closed"
-	err = ss.sendBytes([]byte("hello"))
-	if err == nil {
-		t.Fatalf("expected error directly writing to closed session, got nil")
-	}
-	if !strings.Contains(err.Error(), "session is closed") {
+	_, err = ss.sendBytes([]byte("hello"), "")
+	if err == nil || !strings.Contains(err.Error(), "session is closed") {
 		t.Fatalf("expected 'session is closed' error, got: %v", err)
 	}
 }
@@ -356,7 +416,7 @@ func TestMCPNaturalExitAndWriteConcurrency(t *testing.T) {
 	defer blockWriter.Close()
 
 	// 手動構造 ts。我們不需要真實進程
-	ts := newTerminalSession(sw, blockReader, nil, 80, 24, recorder, false, []io.Closer{f})
+	ts := newTerminalSession(sw, blockReader, nil, 80, 24, recorder, nil, false, []io.Closer{f})
 	sessionID := "session-race-1"
 	s.sessions[sessionID] = ts
 
@@ -408,7 +468,7 @@ func TestMCPNaturalExitAndWriteConcurrency(t *testing.T) {
 	blockReader2, blockWriter2, _ := os.Pipe()
 	defer blockReader2.Close()
 	defer blockWriter2.Close()
-	ts2 := newTerminalSession(sw2, blockReader2, nil, 80, 24, nil, false, nil)
+	ts2 := newTerminalSession(sw2, blockReader2, nil, 80, 24, nil, nil, false, nil)
 	sessionID2 := "session-race-2"
 	s2.sessions[sessionID2] = ts2
 
@@ -444,7 +504,7 @@ func TestMCPDoubleCloseTeardownWait(t *testing.T) {
 	defer dummyOut.Close()
 
 	bc := &blockCloser{block: make(chan struct{})}
-	ts := newTerminalSession(dummyIn, dummyOut, nil, 80, 24, nil, false, []io.Closer{bc})
+	ts := newTerminalSession(dummyIn, dummyOut, nil, 80, 24, nil, nil, false, []io.Closer{bc})
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -521,7 +581,7 @@ func TestMCPFinalizeErrorPropagation(t *testing.T) {
 	defer dummyOut.Close()
 
 	ec := errorCloser{}
-	ts := newTerminalSession(dummyIn, dummyOut, nil, 80, 24, nil, false, []io.Closer{ec})
+	ts := newTerminalSession(dummyIn, dummyOut, nil, 80, 24, nil, nil, false, []io.Closer{ec})
 
 	err := ts.close()
 	if err == nil {
@@ -537,7 +597,14 @@ type failingWriter struct {
 }
 
 func (fw *failingWriter) Write(p []byte) (int, error) {
-	return 0, fw.err
+	if len(p) > 2 {
+		return 2, fw.err
+	}
+	return len(p), fw.err
+}
+
+func (fw *failingWriter) Close() error {
+	return nil
 }
 
 func TestMCPRecorderFailurePropagation(t *testing.T) {
@@ -552,7 +619,7 @@ func TestMCPRecorderFailurePropagation(t *testing.T) {
 	defer dummyIn.Close()
 	defer dummyOut.Close()
 
-	ts := newTerminalSession(dummyIn, dummyOut, nil, 80, 24, recorder, false, nil)
+	ts := newTerminalSession(dummyIn, dummyOut, nil, 80, 24, recorder, nil, false, nil)
 
 	_ = recorder.writeHeader(castHeader{Version: 2})
 	_ = recorder.event(0.1, "o", "hello")
@@ -575,15 +642,18 @@ func TestMCPNaturalExitErrorPropagation(t *testing.T) {
 	recorder := newRecordingWriter(bw, &mu, redactor)
 
 	dummyIn, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	dummyOut, _ := os.Open(os.DevNull)
+	dummyOutR, dummyOutW := io.Pipe()
 	defer dummyIn.Close()
-	defer dummyOut.Close()
+	defer dummyOutR.Close()
 
-	ts := newTerminalSession(dummyIn, dummyOut, nil, 80, 24, recorder, false, nil)
+	ts := newTerminalSession(dummyIn, dummyOutR, nil, 80, 24, recorder, nil, false, nil)
 
 	_ = recorder.writeHeader(castHeader{Version: 2})
 	_ = recorder.event(0.1, "o", "hello")
 	_ = recorder.flush()
+
+	// Now let the session exit
+	dummyOutW.Close()
 
 	processExitErr, finalizeErr := ts.waitChildExit(context.Background())
 	if processExitErr != nil {
@@ -661,7 +731,7 @@ func TestMCPTerminalWriteEventFailure(t *testing.T) {
 	defer pr.Close()
 	defer pw.Close()
 
-	ts := newTerminalSession(dummyIn, pr, nil, 80, 24, recorder, false, nil)
+	ts := newTerminalSession(dummyIn, pr, nil, 80, 24, recorder, nil, false, nil)
 
 	s := &mcpServer{sessions: map[string]*terminalSession{}}
 	s.sessions["session-fail-write"] = ts
@@ -833,7 +903,7 @@ func TestMCPTerminalSelectBehavior(t *testing.T) {
 	defer br.Close()
 	defer bw.Close()
 
-	ts := newTerminalSession(sw, br, nil, 80, 24, nil, false, nil)
+	ts := newTerminalSession(sw, br, nil, 80, 24, nil, nil, false, nil)
 	sw.ts = ts
 
 	// Initial screen
@@ -847,7 +917,7 @@ func TestMCPTerminalSelectBehavior(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := ts.selectLabel(ctx, "Option 3", pointerRe, 1*time.Millisecond)
+	_, err := ts.selectLabel(ctx, "Option 3", pointerRe, 1*time.Millisecond)
 	if err != nil {
 		t.Fatalf("failed to select Option 3: %v", err)
 	}
@@ -860,14 +930,17 @@ func TestMCPTerminalSelectBehavior(t *testing.T) {
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel2()
 
-	err = ts.selectLabel(ctx2, "Nonexistent", pointerRe, 1*time.Millisecond)
+	_, err = ts.selectLabel(ctx2, "Nonexistent", pointerRe, 1*time.Millisecond)
 	if err == nil {
 		t.Fatalf("expected nonexistent select to fail, got nil")
 	}
+	if !strings.Contains(err.Error(), "not reached") && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected nonexistent select to fail with timeout or not reached, got: %v", err)
+	}
 
 	// 3. Empty label - immediate error
-	err = ts.selectLabel(context.Background(), "", pointerRe, 1*time.Millisecond)
-	if err == nil {
+	_, err = ts.selectLabel(context.Background(), "", pointerRe, 1*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "non-empty label") {
 		t.Fatalf("expected empty label select to fail, got nil")
 	}
 
@@ -889,7 +962,7 @@ func TestMCPTerminalSelectConcurrency(t *testing.T) {
 	defer br.Close()
 	defer bw.Close()
 
-	ts := newTerminalSession(sw, br, nil, 80, 24, nil, false, nil)
+	ts := newTerminalSession(sw, br, nil, 80, 24, nil, nil, false, nil)
 	sw.ts = ts
 
 	ts.vtMu.Lock()
@@ -909,7 +982,7 @@ func TestMCPTerminalSelectConcurrency(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			err := ts.selectLabel(ctx, "Option 3", pointerRe, 5*time.Millisecond)
+			_, err := ts.selectLabel(ctx, "Option 3", pointerRe, 5*time.Millisecond)
 			if err != nil {
 				errChan <- err
 			}
@@ -921,5 +994,264 @@ func TestMCPTerminalSelectConcurrency(t *testing.T) {
 
 	for err := range errChan {
 		t.Errorf("concurrent select failed: %v", err)
+	}
+}
+
+func TestMCPHarmlessScreenRedaction(t *testing.T) {
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+	t.Setenv("MYSECRET", "super-secret-value")
+
+	req := map[string]any{
+		"command":    []string{"sh", "-c", "echo hello; sleep 1"},
+		"secret_env": []string{"MYSECRET"},
+		"cols":       80,
+	}
+	reqBytes, _ := json.Marshal(req)
+
+	res, err := s.tool(context.Background(), "terminal_start", reqBytes)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	m, _ := res.(map[string]string)
+	sessionID := m["session_id"]
+	defer func() {
+		ss, _ := s.session(sessionID)
+		if ss != nil {
+			ss.close()
+		}
+	}()
+
+	_, _ = s.tool(context.Background(), "terminal_expect", []byte(`{"session_id":"`+sessionID+`","text":"hello","timeout_seconds":2}`))
+
+	resScreen, err := s.tool(context.Background(), "terminal_read_screen", []byte(`{"session_id":"`+sessionID+`"}`))
+	if err != nil {
+		t.Fatalf("read_screen failed: %v", err)
+	}
+	if strings.Contains(fmt.Sprint(resScreen), "<screen redacted>") {
+		t.Fatalf("harmless screen was redacted: %v", resScreen)
+	}
+	if !strings.Contains(fmt.Sprint(resScreen), "hello") {
+		t.Fatalf("harmless screen did not contain expected text: %v", resScreen)
+	}
+}
+
+func TestMCPScreenRedactionWithoutRecorder(t *testing.T) {
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+
+	os.Setenv("TEST_SECRET_NO_RECORDER", "my-secret-val")
+	defer os.Unsetenv("TEST_SECRET_NO_RECORDER")
+
+	res, err := s.tool(context.Background(), "terminal_start", []byte(`{"command":["sh","-c","echo my-secret-val; sleep 5"],"secret_env":["TEST_SECRET_NO_RECORDER"]}`))
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	m, _ := res.(map[string]string)
+	sessionID := m["session_id"]
+	defer func() {
+		ss, _ := s.session(sessionID)
+		if ss != nil {
+			ss.close()
+		}
+	}()
+
+	// wait for output
+	time.Sleep(100 * time.Millisecond)
+
+	resScreen, err := s.tool(context.Background(), "terminal_read_screen", []byte(`{"session_id":"`+sessionID+`"}`))
+	if err != nil {
+		t.Fatalf("read_screen failed: %v", err)
+	}
+	if !strings.Contains(fmt.Sprint(resScreen), "<screen redacted>") {
+		t.Fatalf("screen without recorder was not redacted: %v", resScreen)
+	}
+}
+
+func TestMCPPartialWriteErrorIncludesDetails(t *testing.T) {
+	srv := &mcpServer{sessions: map[string]*terminalSession{}}
+
+	// Create a dummy session
+	srv.mu.Lock()
+	fw := &failingWriter{err: io.ErrUnexpectedEOF}
+	dummyIn, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	dummyOutR, dummyOutW := io.Pipe()
+	defer dummyIn.Close()
+	defer dummyOutW.Close()
+	ts := newTerminalSession(fw, dummyOutR, nil, 80, 24, nil, nil, false, nil)
+	srv.sessions["test-session"] = ts
+	srv.mu.Unlock()
+
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "terminal_write"
+	req.Params.Arguments = map[string]any{"session_id": "test-session", "data": "hello"}
+
+	res, err := srv.handleCallTool(context.Background(), req.Params.Name, req)
+	if err != nil {
+		t.Fatalf("handleCallTool error: %v", err)
+	}
+
+	if !res.IsError {
+		t.Fatalf("response missing isError=true")
+	}
+	resStr := fmt.Sprint(res.Content)
+	if !strings.Contains(resStr, "unexpected EOF") {
+		t.Fatalf("response missing unexpected EOF: %s", resStr)
+	}
+	if !strings.Contains(fmt.Sprint(res.Content), `"written":2`) && !strings.Contains(fmt.Sprint(res.Content), `"written": 2`) {
+		t.Fatalf("response missing written count 2: %s", resStr)
+	}
+}
+
+func TestMCPHarmlessScreenAfterSecret(t *testing.T) {
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+
+	os.Setenv("TEST_MY_SECRET", "super-secret-value")
+	defer os.Unsetenv("TEST_MY_SECRET")
+
+	res, err := s.tool(context.Background(), "terminal_start", []byte(`{"command":["sh","-c","echo super-secret-value; sleep 0.1; clear; echo harmless-next-screen; sleep 5"],"secret_env":["TEST_MY_SECRET"]}`))
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	m, _ := res.(map[string]string)
+	sessionID := m["session_id"]
+	defer func() {
+		ss, _ := s.session(sessionID)
+		if ss != nil {
+			ss.close()
+		}
+	}()
+
+	// wait for output to settle
+	time.Sleep(500 * time.Millisecond)
+
+	_, err = s.tool(context.Background(), "terminal_expect", []byte(`{"session_id":"`+sessionID+`","text":"harmless-next-screen","timeout_seconds":2}`))
+	if err != nil {
+		t.Fatalf("terminal_expect failed on harmless screen after secret: %v", err)
+	}
+
+	resScreen, err := s.tool(context.Background(), "terminal_read_screen", []byte(`{"session_id":"`+sessionID+`"}`))
+	if err != nil {
+		t.Fatalf("read_screen failed: %v", err)
+	}
+	// The response should be redacted because the session is permanently tainted
+	if !strings.Contains(fmt.Sprint(resScreen), "<screen redacted>") {
+		t.Fatalf("screen should be redacted for protocol responses: %v", resScreen)
+	}
+}
+
+func TestANSISplitSecretCastRedaction(t *testing.T) {
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+	t.Setenv("ANSI_SECRET", "abcdefghijklmnopqrst")
+
+	tmpCast := filepath.Join(t.TempDir(), "ansi_secret.cast")
+
+	req := map[string]any{
+		"command":     []string{"sh", "-c", "printf 'abcdefghij\\033[31mklmnopqrst\\033[0m\\n'; sleep 1"},
+		"secret_env":  []string{"ANSI_SECRET"},
+		"record_file": tmpCast,
+		"cols":        80,
+	}
+	reqBytes, _ := json.Marshal(req)
+
+	res, err := s.tool(context.Background(), "terminal_start", reqBytes)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	m, _ := res.(map[string]string)
+	sessionID := m["session_id"]
+	defer func() {
+		ss, _ := s.session(sessionID)
+		if ss != nil {
+			ss.close()
+		}
+	}()
+
+	ss, _ := s.session(sessionID)
+	_, _ = ss.waitChildExit(context.Background())
+	time.Sleep(200 * time.Millisecond)
+
+	castBytes, err := os.ReadFile(tmpCast)
+	if err != nil {
+		t.Fatalf("failed to read cast: %v", err)
+	}
+	castStr := string(castBytes)
+
+	hdr, events, err := loadCastFile(tmpCast)
+	if err != nil {
+		t.Fatalf("failed to load cast: %v", err)
+	}
+
+	vt := vt10x.New(vt10x.WithSize(hdr.Width, hdr.Height))
+	for _, e := range events {
+		if e.typ == "o" {
+			vt.Write([]byte(e.data))
+		}
+	}
+	rendered := strings.Join(normalizeScreen(vt.String()), "\n")
+
+	if strings.Contains(rendered, "abcdefghijklmnopqrst") {
+		t.Fatalf("render reconstructed full ANSI-split secret: %s", rendered)
+	}
+
+	for _, e := range events {
+		if e.typ == "o" && strings.Contains(e.data, "abcdefghijklmnopqrst") {
+			t.Fatalf("cast output event contains contiguous secret: %q", e.data)
+		}
+	}
+
+	strippedCast := stripANSI(castStr)
+	if strings.Contains(strippedCast, "abcdefghijklmnopqrst") {
+		t.Fatalf("cast raw bytes contain ANSI-split secret after stripping: %s", castStr)
+	}
+}
+
+func TestMCPTerminalResize(t *testing.T) {
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+
+	res, err := s.tool(context.Background(), "terminal_start", []byte(`{"command":["sleep","10"],"cols":80,"rows":24}`))
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	m, _ := res.(map[string]string)
+	sessionID := m["session_id"]
+	defer func() {
+		s.tool(context.Background(), "terminal_close", []byte(`{"session_id":"`+sessionID+`"}`))
+	}()
+
+	resResize, err := s.tool(context.Background(), "terminal_resize", []byte(`{"session_id":"`+sessionID+`","cols":100,"rows":30}`))
+	if err != nil {
+		t.Fatalf("resize failed: %v", err)
+	}
+	rm, _ := resResize.(map[string]any)
+	cols, _ := rm["cols"].(int)
+	rows, _ := rm["rows"].(int)
+	if cols != 100 || rows != 30 {
+		t.Fatalf("resize returned wrong dimensions: cols=%d rows=%d", cols, rows)
+	}
+
+	resScreen, err := s.tool(context.Background(), "terminal_read_screen", []byte(`{"session_id":"`+sessionID+`"}`))
+	if err != nil {
+		t.Fatalf("read_screen failed: %v", err)
+	}
+	screenStr := fmt.Sprint(resScreen)
+	if !strings.Contains(screenStr, "cols:100") {
+		t.Fatalf("screen size not updated after resize (cols): %s", screenStr)
+	}
+	if !strings.Contains(screenStr, "rows:30") {
+		t.Fatalf("screen size not updated after resize (rows): %s", screenStr)
+	}
+
+	_, err = s.tool(context.Background(), "terminal_resize", []byte(`{"session_id":"nonexistent","cols":80,"rows":24}`))
+	if err == nil {
+		t.Fatalf("resize with invalid session should fail")
+	}
+
+	_, err = s.tool(context.Background(), "terminal_resize", []byte(`{"session_id":"`+sessionID+`","cols":0,"rows":24}`))
+	if err == nil {
+		t.Fatalf("resize with cols=0 should fail")
+	}
+
+	_, err = s.tool(context.Background(), "terminal_resize", []byte(`{"session_id":"`+sessionID+`","cols":1001,"rows":24}`))
+	if err == nil {
+		t.Fatalf("resize with cols=1001 should fail")
 	}
 }

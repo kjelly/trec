@@ -27,8 +27,9 @@ type driveStep struct {
 	text string
 	n    int
 	hasN bool
-	raw  string // original script line, for markers and error reports
-	line int    // script line number (or interactive command sequence)
+	re   *regexp.Regexp // for EXPECT_REGEX and EXPECT_SCREEN_REGEX
+	raw  string         // original script line, for markers and error reports
+	line int            // script line number (or interactive command sequence)
 }
 
 type jsonDriveStep struct {
@@ -51,18 +52,39 @@ func validateStep(st *driveStep) error {
 		if strings.TrimSpace(st.text) == "" {
 			return fmt.Errorf("line %d: TEXT_FILE needs a path", st.line)
 		}
-	case "enter", "space", "tab", "escape", "ctrlc", "snapshot", "quit":
+	case "enter", "space", "tab", "escape", "ctrlc", "ctrlu", "ctrlw", "snapshot", "quit":
 		// These commands do not use extra arguments.
+	case "expect_change":
+		if st.text != "" {
+			return fmt.Errorf("line %d: EXPECT_CHANGE takes no arguments", st.line)
+		}
+		if st.hasN && st.n <= 0 {
+			return fmt.Errorf("line %d: EXPECT_CHANGE needs a positive timeout duration", st.line)
+		}
 	case "down", "up", "left", "right", "backspace", "wait":
 		if st.n <= 0 {
 			st.n = 1
 		}
-	case "expect":
+	case "expect", "expect_eventually":
 		if st.text == "" {
-			return fmt.Errorf("line %d: EXPECT needs text", st.line)
+			return fmt.Errorf("line %d: %s needs text", st.line, strings.ToUpper(st.kind))
 		}
 		if st.hasN && st.n <= 0 {
-			return fmt.Errorf("line %d: EXPECT needs a positive timeout duration", st.line)
+			return fmt.Errorf("line %d: %s needs a positive timeout duration", st.line, strings.ToUpper(st.kind))
+		}
+	case "expect_regex", "expect_screen_regex":
+		if st.text == "" {
+			return fmt.Errorf("line %d: %s needs text pattern", st.line, strings.ToUpper(st.kind))
+		}
+		if st.re == nil {
+			re, err := regexp.Compile(st.text)
+			if err != nil {
+				return fmt.Errorf("line %d: invalid regex", st.line)
+			}
+			st.re = re
+		}
+		if st.hasN && st.n <= 0 {
+			return fmt.Errorf("line %d: %s needs a positive timeout duration", st.line, strings.ToUpper(st.kind))
 		}
 	case "expect_quiet":
 		if st.n <= 0 {
@@ -114,8 +136,12 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		if text == "" {
 			text = jS.Arg
 		}
+		kind = strings.ToLower(kind)
+		if kind == "clear_line" {
+			kind = "ctrlu"
+		}
 		st := &driveStep{
-			kind: strings.ToLower(kind),
+			kind: kind,
 			text: text,
 			raw:  trimmed,
 			line: lineNo,
@@ -138,15 +164,35 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	st := &driveStep{raw: trimmed, line: lineNo}
 
 	// EXPECT@<ms> overrides the default --expect-timeout for one step.
-	if ms, ok := strings.CutPrefix(op, "EXPECT@"); ok {
+	for _, prefix := range []string{"EXPECT", "EXPECT_EVENTUALLY", "EXPECT_REGEX", "EXPECT_SCREEN_REGEX"} {
+		if ms, ok := strings.CutPrefix(op, prefix+"@"); ok {
+			n, err := strconv.Atoi(ms)
+			if err != nil || n <= 0 {
+				return nil, fmt.Errorf("line %d: bad timeout in %q", lineNo, fields[0])
+			}
+			if arg == "" {
+				return nil, fmt.Errorf("line %d: %s needs text", lineNo, prefix)
+			}
+			st.kind, st.text, st.n, st.hasN = strings.ToLower(prefix), arg, n, true
+			if err := validateStep(st); err != nil {
+				return nil, err
+			}
+			return st, nil
+		}
+	}
+
+	if ms, ok := strings.CutPrefix(op, "EXPECT_CHANGE@"); ok {
 		n, err := strconv.Atoi(ms)
 		if err != nil || n <= 0 {
 			return nil, fmt.Errorf("line %d: bad timeout in %q", lineNo, fields[0])
 		}
-		if arg == "" {
-			return nil, fmt.Errorf("line %d: EXPECT needs text", lineNo)
+		if arg != "" {
+			return nil, fmt.Errorf("line %d: EXPECT_CHANGE takes no arguments", lineNo)
 		}
-		st.kind, st.text, st.n = "expect", arg, n
+		st.kind, st.n, st.hasN = "expect_change", n, true
+		if err := validateStep(st); err != nil {
+			return nil, err
+		}
 		return st, nil
 	}
 
@@ -182,6 +228,10 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		st.kind = "escape"
 	case "CTRLC":
 		st.kind = "ctrlc"
+	case "CTRLU", "CLEAR_LINE":
+		st.kind = "ctrlu"
+	case "CTRLW":
+		st.kind = "ctrlw"
 	case "BACKSPACE":
 		st.kind, st.n = "backspace", atoiOr1(arg)
 	case "WAIT":
@@ -191,6 +241,20 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 			return nil, fmt.Errorf("line %d: EXPECT needs text", lineNo)
 		}
 		st.kind, st.text = "expect", arg
+	case "EXPECT_EVENTUALLY":
+		if arg == "" {
+			return nil, fmt.Errorf("line %d: EXPECT_EVENTUALLY needs text", lineNo)
+		}
+		st.kind, st.text = "expect_eventually", arg
+	case "EXPECT_CHANGE":
+		if arg != "" {
+			return nil, fmt.Errorf("line %d: EXPECT_CHANGE takes no arguments", lineNo)
+		}
+		st.kind = "expect_change"
+	case "EXPECT_REGEX":
+		st.kind, st.text = "expect_regex", arg
+	case "EXPECT_SCREEN_REGEX":
+		st.kind, st.text = "expect_screen_regex", arg
 	case "EXPECT_QUIET":
 		st.kind, st.n = "expect_quiet", atoiOrDef(arg, 300)
 	case "ASSERT":
@@ -221,10 +285,13 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	default:
 		return nil, fmt.Errorf("line %d: unknown op %q", lineNo, op)
 	}
+	if err := validateStep(st); err != nil {
+		return nil, err
+	}
 	return st, nil
 }
 
-func loadDriveScript(path string) ([]*driveStep, error) {
+func loadDriveScript(path string, redactor *secretRedactor) ([]*driveStep, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -242,6 +309,15 @@ func loadDriveScript(path string) ([]*driveStep, error) {
 			return nil, err
 		}
 		if st != nil {
+			if st.kind == "text_env" && redactor != nil {
+				if err := redactor.addEnv(st.text); err != nil {
+					return nil, fmt.Errorf("line %d: %v", st.line, err)
+				}
+			} else if st.kind == "text_file" && redactor != nil {
+				if _, err := redactor.addFile(st.text); err != nil {
+					return nil, fmt.Errorf("line %d: %v", st.line, err)
+				}
+			}
 			steps = append(steps, st)
 		}
 	}
@@ -280,16 +356,18 @@ func max1(n int) int {
 // screen (rendered characters), not the raw byte stream, because escape
 // sequences fragment text and menu redraws leave stale bytes in the stream.
 type driveSession struct {
-	ts            *terminalSession
-	keyDelay      time.Duration
-	settleDelay   time.Duration
-	expectTimeout time.Duration
-	pointerRe     *regexp.Regexp
-	interactive   bool
-	stepMarkers   bool
-	exitAsserted  bool
-	outputFormat  string
-	redactor      *secretRedactor
+	ts               *terminalSession
+	keyDelay         time.Duration
+	settleDelay      time.Duration
+	expectTimeout    time.Duration
+	pointerRe        *regexp.Regexp
+	interactive      bool
+	stepMarkers      bool
+	exitAsserted     bool
+	outputFormat     string
+	baselineSnapshot *screenSnapshot
+	baselineValid    bool
+	redactor         *secretRedactor
 }
 
 func (ds *driveSession) screenLines() []string {
@@ -310,16 +388,14 @@ func (ds *driveSession) marker(label string) {
 // failureMarker records both the failing operation and the rendered screen so
 // an agent can diagnose a failed cast without a separate render invocation.
 func (ds *driveSession) failureMarker(st *driveStep, err error) {
-	ds.marker(fmt.Sprintf("FAILED line %d: %s (%v)", st.line, st.raw, err))
-	lines := ds.screenLines()
-	for i := range lines {
-		lines[i] = ds.redactor.RedactString(lines[i])
-	}
+	msg := fmt.Sprintf("FAILED line %d: %s (%v)", st.line, st.raw, err)
+	ds.marker(ds.redactor.RedactString(msg))
+	lines, _, _, _, _ := ds.ts.redactedScreenSnapshot()
 	ds.marker(fmt.Sprintf("FAILED_SCREEN line %d:\n%s", st.line, strings.Join(lines, "\n")))
 }
 
 func (ds *driveSession) dumpScreen(w io.Writer) {
-	lines := ds.screenLines()
+	lines, _, _, _, _ := ds.ts.redactedScreenSnapshot()
 	last := len(lines) - 1
 	for last >= 0 && lines[last] == "" {
 		last--
@@ -330,31 +406,37 @@ func (ds *driveSession) dumpScreen(w io.Writer) {
 }
 
 func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
+	isMutating := false
+	switch st.kind {
+	case "text", "text_env", "text_file", "enter", "down", "up", "left", "right", "space", "tab", "escape", "ctrlc", "ctrlu", "ctrlw", "backspace", "select":
+		isMutating = true
+	}
+	if isMutating {
+		ds.baselineSnapshot = ds.ts.getSnapshot()
+		ds.baselineValid = false
+	}
+
+	bytesWritten := 0
+	var err error
+
 	switch st.kind {
 	case "text":
-		if err := ds.ts.sendText(st.text, st.text, ds.keyDelay); err != nil {
-			return err
-		}
+		bytesWritten, err = ds.ts.sendText(st.text, "", ds.keyDelay)
 	case "text_env":
-		if err := ds.redactor.addEnv(st.text); err != nil {
+		if err = ds.redactor.addEnv(st.text); err != nil {
 			return err
 		}
 		value, _ := os.LookupEnv(st.text)
-		if err := ds.ts.sendText(value, "<redacted:"+st.text+">", ds.keyDelay); err != nil {
-			return err
-		}
+		bytesWritten, err = ds.ts.sendText(value, st.text, ds.keyDelay)
 	case "text_file":
-		value, err := ds.redactor.addFile(st.text)
+		var value string
+		value, err = ds.redactor.addFile(st.text)
 		if err != nil {
 			return err
 		}
-		if err := ds.ts.sendText(value, value, ds.keyDelay); err != nil {
-			return err
-		}
+		bytesWritten, err = ds.ts.sendText(value, "file", ds.keyDelay)
 	case "enter":
-		if err := ds.ts.sendBytes([]byte("\r")); err != nil {
-			return err
-		}
+		bytesWritten, err = ds.ts.sendBytes([]byte("\r"), "")
 		time.Sleep(ds.settleDelay)
 	case "down", "up", "left", "right":
 		seq := "\x1b[B"
@@ -366,35 +448,39 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 			seq = "\x1b[C"
 		}
 		for range max1(st.n) {
-			if err := ds.ts.sendBytes([]byte(seq)); err != nil {
-				return err
+			n, e := ds.ts.sendBytes([]byte(seq), "")
+			bytesWritten += n
+			if e != nil {
+				err = e
+				break
 			}
 			time.Sleep(ds.keyDelay)
 		}
 	case "space":
-		if err := ds.ts.sendBytes([]byte(" ")); err != nil {
-			return err
-		}
+		bytesWritten, err = ds.ts.sendBytes([]byte(" "), "")
 		time.Sleep(ds.keyDelay)
 	case "tab":
-		if err := ds.ts.sendBytes([]byte("\t")); err != nil {
-			return err
-		}
+		bytesWritten, err = ds.ts.sendBytes([]byte("\t"), "")
 		time.Sleep(ds.keyDelay)
 	case "escape":
-		if err := ds.ts.sendBytes([]byte("\x1b")); err != nil {
-			return err
-		}
+		bytesWritten, err = ds.ts.sendBytes([]byte("\x1b"), "")
 		time.Sleep(ds.keyDelay)
 	case "ctrlc":
-		if err := ds.ts.sendBytes([]byte{0x03}); err != nil {
-			return err
-		}
+		bytesWritten, err = ds.ts.sendBytes([]byte{0x03}, "")
+		time.Sleep(ds.keyDelay)
+	case "ctrlu":
+		bytesWritten, err = ds.ts.sendBytes([]byte{0x15}, "")
+		time.Sleep(ds.keyDelay)
+	case "ctrlw":
+		bytesWritten, err = ds.ts.sendBytes([]byte{0x17}, "")
 		time.Sleep(ds.keyDelay)
 	case "backspace":
 		for range max1(st.n) {
-			if err := ds.ts.sendBytes([]byte{127}); err != nil {
-				return err
+			n, e := ds.ts.sendBytes([]byte{127}, "")
+			bytesWritten += n
+			if e != nil {
+				err = e
+				break
 			}
 			time.Sleep(ds.keyDelay)
 		}
@@ -405,15 +491,44 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 		if st.n > 0 {
 			timeout = time.Duration(st.n) * time.Millisecond
 		}
-		return ds.ts.waitForText(ctx, st.text, timeout)
+		err = ds.ts.waitForText(ctx, "EXPECT", st.text, timeout)
+	case "expect_eventually":
+		timeout := ds.expectTimeout * 6
+		if st.n > 0 {
+			timeout = time.Duration(st.n) * time.Millisecond
+		}
+		err = ds.ts.waitForText(ctx, "EXPECT_EVENTUALLY", st.text, timeout)
+	case "expect_change":
+		if !ds.baselineValid {
+			return fmt.Errorf("EXPECT_CHANGE: no previous mutating action to compare against")
+		}
+		timeout := ds.expectTimeout
+		if st.n > 0 {
+			timeout = time.Duration(st.n) * time.Millisecond
+		}
+		err = ds.ts.waitForChange(ctx, ds.baselineSnapshot, timeout)
+	case "expect_regex":
+		timeout := ds.expectTimeout
+		if st.n > 0 {
+			timeout = time.Duration(st.n) * time.Millisecond
+		}
+		err = ds.ts.waitForRegex(ctx, "EXPECT_REGEX", st.re, timeout, false)
+	case "expect_screen_regex":
+		timeout := ds.expectTimeout
+		if st.n > 0 {
+			timeout = time.Duration(st.n) * time.Millisecond
+		}
+		err = ds.ts.waitForRegex(ctx, "EXPECT_SCREEN_REGEX", st.re, timeout, true)
 	case "expect_quiet":
-		return ds.ts.waitQuiet(ctx, time.Duration(st.n)*time.Millisecond, ds.expectTimeout)
+		err = ds.ts.waitQuiet(ctx, time.Duration(st.n)*time.Millisecond, ds.expectTimeout)
 	case "assert":
 		if !screenContains(ds.screenLines(), st.text) {
-			return fmt.Errorf("ASSERT %q: not on screen", st.text)
+			err = fmt.Errorf("ASSERT %q: not on screen", st.text)
 		}
 	case "select":
-		return ds.ts.selectLabel(ctx, st.text, ds.pointerRe, ds.keyDelay)
+		n, e := ds.ts.selectLabel(ctx, st.text, ds.pointerRe, ds.keyDelay)
+		bytesWritten += n
+		err = e
 	case "snapshot":
 		if !ds.interactive {
 			ds.dumpScreen(os.Stderr)
@@ -423,7 +538,7 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 			return fmt.Errorf("WAIT_CHILD_EXIT is only available in --script mode")
 		}
 		_, finalizeErr := ds.ts.waitChildExit(ctx)
-		return finalizeErr
+		err = finalizeErr
 	case "assert_exit":
 		if ds.interactive {
 			return fmt.Errorf("ASSERT_EXIT is only available in --script mode")
@@ -436,11 +551,15 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 			return fmt.Errorf("ASSERT_EXIT %d: child exit code %d", st.n, got)
 		}
 		ds.exitAsserted = true
-		return nil
+		err = nil
 	case "quit":
 		// handled by the caller
 	}
-	return nil
+
+	if bytesWritten > 0 {
+		ds.baselineValid = true
+	}
+	return err
 }
 
 // respond prints one interactive-protocol response to stdout: a status line
@@ -449,10 +568,10 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 func (ds *driveSession) respond(err error) {
 	status := "OK"
 	if err != nil {
-		status = "ERR " + err.Error()
+		status = "ERR " + ds.redactor.RedactString(err.Error())
 	}
 	row, col := ds.cursorPos()
-	lines := ds.screenLines()
+	lines, _, _, _, _ := ds.ts.redactedScreenSnapshot()
 
 	if ds.outputFormat == "jsonl" {
 		type jsonlResponse struct {
@@ -471,7 +590,7 @@ func (ds *driveSession) respond(err error) {
 	}
 
 	if err != nil {
-		fmt.Printf("ERR %v\n", err)
+		fmt.Printf("ERR %v\n", ds.redactor.RedactString(err.Error()))
 	} else {
 		fmt.Println("OK")
 	}
@@ -494,7 +613,8 @@ Use one of these modes:
 
 When both are supplied, trec runs the script first, then accepts interactive
 operations from stdin. Interactive operations include TEXT, TEXT_ENV, TEXT_FILE,
-ENTER, DOWN, UP, LEFT, RIGHT, SPACE, TAB, ESCAPE, CTRLC, BACKSPACE, WAIT, EXPECT,
+ENTER, DOWN, UP, LEFT, RIGHT, SPACE, TAB, ESCAPE, CTRLC, CTRLU, CLEAR_LINE, CTRLW, BACKSPACE, WAIT,
+EXPECT, EXPECT_EVENTUALLY, EXPECT_CHANGE, EXPECT_REGEX, EXPECT_SCREEN_REGEX,
 EXPECT_QUIET, ASSERT, SELECT, SNAPSHOT, and QUIT. Use TEXT_ENV/--secret-env or
 TEXT_FILE/--secret-file for credentials. Run "trec drive --help" for flags.`,
 		Args: cobra.ArbitraryArgs,
@@ -552,47 +672,40 @@ func runDrive(cmd *cobra.Command, rest []string) {
 		os.Exit(2)
 	}
 
+	redactor, err := newSecretRedactor(secretEnv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "trec drive: %v\n", err)
+		os.Exit(2)
+	}
+
+	printRedactedError := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		fmt.Fprintln(os.Stderr, redactor.RedactString(msg))
+	}
+
+	if err := addSecretFileSpecs(redactor, secretFiles); err != nil {
+		printRedactedError("trec drive: %v", err)
+		os.Exit(2)
+	}
+
 	pointerRe, err := regexp.Compile(*pointer)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "trec drive: bad --pointer regexp: %v\n", err)
+		printRedactedError("trec drive: bad --pointer regexp: %v", err)
 		os.Exit(2)
 	}
 
 	var steps []*driveStep
 	if *scriptPath != "" {
-		steps, err = loadDriveScript(*scriptPath)
+		steps, err = loadDriveScript(*scriptPath, redactor)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "trec drive: load script: %v\n", err)
+			printRedactedError("trec drive: load script: %v", err)
 			os.Exit(2)
 		}
 	}
 	if strictAgentValue {
 		for _, st := range steps {
 			if st.kind == "down" || st.kind == "up" {
-				fmt.Fprintf(os.Stderr, "trec drive: line %d: --strict-agent rejects %s; use SELECT <label> for menu choices\n", st.line, strings.ToUpper(st.kind))
-				os.Exit(2)
-			}
-		}
-	}
-	redactor, err := newSecretRedactor(secretEnv)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "trec drive: %v\n", err)
-		os.Exit(2)
-	}
-	if err := addSecretFileSpecs(redactor, secretFiles); err != nil {
-		fmt.Fprintf(os.Stderr, "trec drive: %v\n", err)
-		os.Exit(2)
-	}
-	for _, st := range steps {
-		switch st.kind {
-		case "text_env":
-			if err := redactor.addEnv(st.text); err != nil {
-				fmt.Fprintf(os.Stderr, "trec drive: line %d: %v\n", st.line, err)
-				os.Exit(2)
-			}
-		case "text_file":
-			if _, err := redactor.addFile(st.text); err != nil {
-				fmt.Fprintf(os.Stderr, "trec drive: line %d: %v\n", st.line, err)
+				printRedactedError("trec drive: line %d: --strict-agent rejects %s; use SELECT <label> for menu choices", st.line, strings.ToUpper(st.kind))
 				os.Exit(2)
 			}
 		}
@@ -652,7 +765,7 @@ func runDrive(cmd *cobra.Command, rest []string) {
 		ptyOut = io.TeeReader(ptmx, os.Stdout)
 	}
 
-	ts := newTerminalSession(ptmx, ptyOut, processCmd, *width, *height, recorder, false, nil)
+	ts := newTerminalSession(ptmx, ptyOut, processCmd, *width, *height, recorder, redactor, false, nil)
 
 	ds := &driveSession{
 		ts:            ts,
@@ -678,7 +791,8 @@ func runDrive(cmd *cobra.Command, rest []string) {
 			ds.marker(fmt.Sprintf("line %d: %s", st.line, st.raw))
 		}
 		if err := ds.applyStep(ctx, st); err != nil {
-			fmt.Fprintf(os.Stderr, "trec drive: FAILED at line %d (%s): %v\n", st.line, st.raw, err)
+			msg := fmt.Sprintf("trec drive: FAILED at line %d (%s): %v\n", st.line, st.raw, err)
+			fmt.Fprint(os.Stderr, ds.redactor.RedactString(msg))
 			ds.dumpScreen(os.Stderr)
 			ds.failureMarker(st, err)
 			if resultErr := writeSessionResult(*outputFile, ds.result("failed", -1, fmt.Sprintf("line %d: %v", st.line, err))); resultErr != nil {
@@ -839,14 +953,11 @@ interactiveDone:
 }
 
 func (ds *driveSession) result(status string, exitCode int, message string) sessionResult {
-	lines := ds.screenLines()
-	for i := range lines {
-		lines[i] = ds.redactor.RedactString(lines[i])
-	}
+	lines, _, _, _, _ := ds.ts.redactedScreenSnapshot()
 	return sessionResult{
 		Status:          status,
 		ExitCode:        exitCode,
-		Error:           message,
+		Error:           ds.redactor.RedactString(message),
 		DurationSeconds: time.Since(ds.ts.start).Seconds(),
 		FinalScreen:     lines,
 	}
