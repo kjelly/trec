@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +39,55 @@ func TestRecordPropagatesExitCodeAndWritesResult(t *testing.T) {
 	}
 	if !strings.Contains(string(result), "final-screen") {
 		t.Fatalf("record result is missing final screen:\n%s", result)
+	}
+	var summary sessionResult
+	if err := json.Unmarshal(result, &summary); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	castData, err := os.ReadFile(cast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(castData)
+	if !summary.Cast.Complete || summary.Cast.Algorithm != "sha256" || summary.Cast.SHA256 != hex.EncodeToString(digest[:]) || summary.Cast.ByteSize != int64(len(castData)) || summary.Cast.EventCount == 0 {
+		t.Fatalf("unexpected cast integrity metadata: %#v", summary.Cast)
+	}
+	if !strings.Contains(string(castData), `"trec_version":"dev"`) {
+		t.Fatalf("cast header is missing producer version:\n%s", castData)
+	}
+}
+
+func TestWriteSessionResultRecordsCastIntegrityAtomically(t *testing.T) {
+	dir := t.TempDir()
+	cast := filepath.Join(dir, "session.cast")
+	if err := writeCastFile(cast, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{
+		{sec: 0.25, typ: "o", data: "hello"},
+		{sec: 1.5, typ: "m", data: "checkpoint"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSessionResult(cast, sessionResult{Status: "success"}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resultPath(cast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result sessionResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Cast.Complete || result.Cast.EventCount != 2 || result.Cast.LastEventTime != 1.5 || result.Cast.ByteSize == 0 {
+		t.Fatalf("integrity = %#v", result.Cast)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".result.json.tmp-") {
+			t.Fatalf("temporary result was not cleaned up: %s", entry.Name())
+		}
 	}
 }
 

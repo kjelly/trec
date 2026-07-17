@@ -809,11 +809,12 @@ func runDrive(cmd *cobra.Command, rest []string) {
 	recorder := newRecordingWriter(bw, &bwMu, redactor)
 
 	hdr := castHeader{
-		Version:   2,
-		Width:     *width,
-		Height:    *height,
-		Timestamp: time.Now().Unix(),
-		Title:     *title,
+		Version:     2,
+		Width:       *width,
+		Height:      *height,
+		Timestamp:   time.Now().Unix(),
+		TrecVersion: appVersion,
+		Title:       *title,
 		Env: map[string]string{
 			"TERM": "xterm-256color",
 			"CI":   "1",
@@ -879,11 +880,14 @@ func runDrive(cmd *cobra.Command, rest []string) {
 			fmt.Fprint(os.Stderr, ds.redactor.RedactString(msg))
 			ds.dumpScreen(os.Stderr)
 			ds.failureMarker(st, time.Since(stepStarted), err)
-			if resultErr := writeSessionResult(*outputFile, ds.result("failed", -1, fmt.Sprintf("line %d: %v", st.line, err))); resultErr != nil {
-				fmt.Fprintf(os.Stderr, "trec drive: write summary: %v\n", resultErr)
-			}
 			if errClose := ts.close(); errClose != nil {
 				fmt.Fprintf(os.Stderr, "trec drive: finalize error: %v\n", errClose)
+			}
+			if err := f.Sync(); err != nil {
+				fmt.Fprintf(os.Stderr, "trec drive: sync cast: %v\n", err)
+			}
+			if resultErr := writeSessionResult(*outputFile, ds.result("failed", -1, fmt.Sprintf("line %d: %v", st.line, err))); resultErr != nil {
+				fmt.Fprintf(os.Stderr, "trec drive: write summary: %v\n", resultErr)
 			}
 			fmt.Fprintf(os.Stderr, "trec drive: recorded to %s — replay with: trec play %s\n", *outputFile, *outputFile)
 			os.Exit(1)
@@ -1017,6 +1021,13 @@ interactiveDone:
 			finalizeErr = fmt.Errorf("%w; close error: %v", finalizeErr, errClose)
 		} else {
 			finalizeErr = errClose
+		}
+	}
+	if err := f.Sync(); err != nil {
+		if finalizeErr != nil {
+			finalizeErr = fmt.Errorf("%w; sync cast: %v", finalizeErr, err)
+		} else {
+			finalizeErr = fmt.Errorf("sync cast: %w", err)
 		}
 	}
 

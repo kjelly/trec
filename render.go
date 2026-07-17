@@ -17,6 +17,8 @@ func newRenderCommand() *cobra.Command {
 		RunE:  runRender,
 	}
 	cmd.Flags().Bool("markers", false, "Print the screen state at every marker event")
+	cmd.Flags().String("marker-regex", "", "only render markers whose label matches this regexp (implies --markers)")
+	cmd.Flags().Int("marker-index", -1, "render one zero-based marker after filtering (implies --markers)")
 	cmd.Flags().Float64("at", -1, "Stop rendering and print the screen at this timestamp (seconds)")
 	cmd.Flags().String("output-format", "", "Output format (e.g. jsonl)")
 	return cmd
@@ -39,12 +41,20 @@ func validateRenderSize(width, height int) error {
 
 func runRender(cmd *cobra.Command, args []string) error {
 	markersOnly, _ := cmd.Flags().GetBool("markers")
+	markerPattern, _ := cmd.Flags().GetString("marker-regex")
+	markerIndex, _ := cmd.Flags().GetInt("marker-index")
 	atTime, _ := cmd.Flags().GetFloat64("at")
 	apiFormat, _ := cmd.Flags().GetString("output-format")
 	if apiFormat != "" && apiFormat != "jsonl" {
 		return fmt.Errorf("invalid --output-format %q; must be \"\" or \"jsonl\"", apiFormat)
 	}
 	jsonFormat := apiFormat == "jsonl"
+	if markerIndex < -1 {
+		return fmt.Errorf("--marker-index must be non-negative")
+	}
+	if markerPattern != "" || markerIndex >= 0 {
+		markersOnly = true
+	}
 
 	hdr, events, err := loadCastFile(args[0])
 	if err != nil {
@@ -53,20 +63,35 @@ func runRender(cmd *cobra.Command, args []string) error {
 	if err := validateRenderSize(hdr.Width, hdr.Height); err != nil {
 		return fmt.Errorf("trec render: %w", err)
 	}
+	markers, err := findMarkers(events, markerPattern, 0, -1)
+	if err != nil {
+		return fmt.Errorf("trec render: %w", err)
+	}
+	if markerIndex >= len(markers) {
+		return fmt.Errorf("trec render: --marker-index %d is out of range (matched markers: %d)", markerIndex, len(markers))
+	}
+	selectedMarkers := make(map[int]markerRef, len(markers))
+	if markerIndex >= 0 {
+		selectedMarkers[markers[markerIndex].eventIndex] = markers[markerIndex]
+	} else {
+		for _, marker := range markers {
+			selectedMarkers[marker.eventIndex] = marker
+		}
+	}
 
 	vt := vt10x.New(vt10x.WithSize(hdr.Width, hdr.Height))
-	for _, e := range events {
+	for eventIndex, e := range events {
 		if atTime >= 0 && e.sec > atTime {
 			break
 		}
 		if err := applyRenderEvent(vt, e); err != nil {
 			return fmt.Errorf("trec render: apply event at %.2fs: %w", e.sec, err)
 		}
-		if e.typ == "m" && markersOnly {
+		if marker, ok := selectedMarkers[eventIndex]; ok && markersOnly {
 			if jsonFormat {
-				printScreenJSON(vt, e.sec, e.data)
+				printScreenJSON(vt, marker.Time, marker.Label)
 			} else {
-				fmt.Printf("--- MARKER: %s [%.2fs] ---\n", e.data, e.sec)
+				fmt.Printf("--- MARKER %d: %s [%.2fs] ---\n", marker.Index, marker.Label, marker.Time)
 				printScreen(vt)
 				fmt.Println()
 			}

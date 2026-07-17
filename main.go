@@ -23,6 +23,7 @@ type castHeader struct {
 	Width        int               `json:"width"`
 	Height       int               `json:"height"`
 	Timestamp    int64             `json:"timestamp"`
+	TrecVersion  string            `json:"trec_version,omitempty"`
 	Command      string            `json:"command,omitempty"`
 	CommandLabel string            `json:"command_label,omitempty"`
 	Title        string            `json:"title,omitempty"`
@@ -74,7 +75,7 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringArray("secret-file", nil, "NAME=path whose file content is redacted from the recording (repeatable)")
 	cmd.PersistentFlags().Bool("record-command", false, "store the command in the cast header (redacted by --secret-env/--secret-file)")
 	cmd.PersistentFlags().String("command-label", "", "safe label stored in the cast header instead of the full command")
-	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand(), newMCPCommand(), newVersionCommand(), newRenderCommand(), newScanCommand())
+	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand(), newMarkersCommand(), newMCPCommand(), newVersionCommand(), newRenderCommand(), newScanCommand())
 	return cmd
 }
 
@@ -136,11 +137,12 @@ func runRecord(cmd *cobra.Command, args []string) {
 
 	// Write asciicast v2 header.
 	hdr := castHeader{
-		Version:   2,
-		Width:     width,
-		Height:    height,
-		Timestamp: time.Now().Unix(),
-		Title:     title,
+		Version:     2,
+		Width:       width,
+		Height:      height,
+		Timestamp:   time.Now().Unix(),
+		TrecVersion: appVersion,
+		Title:       title,
 		Env: map[string]string{
 			"TERM":  getenv("TERM", "xterm-256color"),
 			"SHELL": getenv("SHELL", "/bin/sh"),
@@ -246,15 +248,28 @@ func runRecord(cmd *cobra.Command, args []string) {
 	}()
 
 	// Forward our stdin to the PTY and record keyboard/mouse input events.
+	// The gate makes finalization deterministic: a read already blocked on
+	// stdin may wake after the child exits, but it must not append an event
+	// after the cast has been synced and its digest computed.
+	inputStopped := make(chan struct{})
+	var inputMu sync.Mutex
 	go func() {
 		buf := make([]byte, 4096)
 		for {
 			n, err := os.Stdin.Read(buf)
 			if n > 0 {
+				inputMu.Lock()
+				select {
+				case <-inputStopped:
+					inputMu.Unlock()
+					return
+				default:
+				}
 				elapsed := time.Since(startTime).Seconds()
 				ptmx.Write(buf[:n])
 				recorder.event(elapsed, "i", string(buf[:n]))
 				recorder.flush()
+				inputMu.Unlock()
 			}
 			if err != nil {
 				break
@@ -266,6 +281,9 @@ func runRecord(cmd *cobra.Command, args []string) {
 	processErr := processCmd.Wait()
 	ptmx.Close()
 	wg.Wait()
+	inputMu.Lock()
+	close(inputStopped)
+	inputMu.Unlock()
 	signal.Stop(sigWinch)
 	close(sigWinch)
 	<-winchDone
@@ -279,6 +297,9 @@ func runRecord(cmd *cobra.Command, args []string) {
 	}
 	if err := recorder.getError(); err != nil && recErr == nil {
 		recErr = err
+	}
+	if err := f.Sync(); err != nil && recErr == nil {
+		recErr = fmt.Errorf("sync cast file: %w", err)
 	}
 	exitCode := 0
 	if processCmd.ProcessState != nil {

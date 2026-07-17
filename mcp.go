@@ -244,11 +244,12 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 			recorder = newRecordingWriter(bw, &bwMu, redactor)
 
 			hdr := castHeader{
-				Version:   2,
-				Width:     int(size.Cols),
-				Height:    int(size.Rows),
-				Timestamp: time.Now().Unix(),
-				Title:     mcpOpts.RecordTitle,
+				Version:     2,
+				Width:       int(size.Cols),
+				Height:      int(size.Rows),
+				Timestamp:   time.Now().Unix(),
+				TrecVersion: appVersion,
+				Title:       mcpOpts.RecordTitle,
 				Env: map[string]string{
 					"TERM": "xterm-256color",
 					"CI":   "1",
