@@ -72,9 +72,17 @@ func TestParseDriveLifecycleSteps(t *testing.T) {
 	if err != nil || textFile.kind != "text_file" || textFile.text != "/run/secrets/password" {
 		t.Fatalf("TEXT_FILE = %#v, %v", textFile, err)
 	}
+	replaceEnv, err := parseDriveLine("REPLACE_TEXT_ENV APP_PASSWORD", 1)
+	if err != nil || replaceEnv.kind != "replace_text_env" || replaceEnv.text != "APP_PASSWORD" {
+		t.Fatalf("REPLACE_TEXT_ENV = %#v, %v", replaceEnv, err)
+	}
 	wait, err := parseDriveLine("WAIT_CHILD_EXIT", 1)
 	if err != nil || wait.kind != "wait_child_exit" {
 		t.Fatalf("WAIT_CHILD_EXIT = %#v, %v", wait, err)
+	}
+	timedWait, err := parseDriveLine("WAIT_CHILD_EXIT@2500", 1)
+	if err != nil || timedWait.kind != "wait_child_exit" || !timedWait.hasTimeout || timedWait.timeout != 2500 {
+		t.Fatalf("WAIT_CHILD_EXIT@2500 = %#v, %v", timedWait, err)
 	}
 
 	assert, err := parseDriveLine("ASSERT_EXIT 7", 2)
@@ -89,7 +97,7 @@ func TestParseDriveLifecycleSteps(t *testing.T) {
 		t.Fatal("interactive ASSERT_EXIT unexpectedly succeeded")
 	}
 
-	for _, line := range []string{"WAIT_CHILD_EXIT extra", "ASSERT_EXIT", "ASSERT_EXIT -1"} {
+	for _, line := range []string{"WAIT_CHILD_EXIT extra", "WAIT_CHILD_EXIT@0", "WAIT_CHILD_EXIT@bad", "ASSERT_EXIT", "ASSERT_EXIT -1"} {
 		if _, err := parseDriveLine(line, 3); err == nil {
 			t.Errorf("%q unexpectedly parsed", line)
 		}
@@ -117,6 +125,10 @@ func TestParseJSONDriveSteps(t *testing.T) {
 	if err != nil || step4.kind != "assert_exit" || step4.n != 0 || !step4.hasN {
 		t.Fatalf("failed to parse valid JSON assert_exit 0 step: %#v, %v", step4, err)
 	}
+	step5, err := parseDriveLine(`{"kind":"wait_child_exit","timeout_ms":2500}`, 5)
+	if err != nil || step5.kind != "wait_child_exit" || !step5.hasTimeout || step5.timeout != 2500 {
+		t.Fatalf("failed to parse timed wait step: %#v, %v", step5, err)
+	}
 
 	// 2. Invalid/Unknown JSON steps - should be rejected with errors
 	invalidLines := []struct {
@@ -130,6 +142,7 @@ func TestParseJSONDriveSteps(t *testing.T) {
 		{`{"kind": "text_file", "text": ""}`, "TEXT_FILE needs a path"},
 		{`{"kind": "select", "text": ""}`, "SELECT needs a label"},
 		{`{"kind": "wait_child_exit", "text": "extra"}`, "WAIT_CHILD_EXIT takes no arguments"},
+		{`{"kind": "wait_child_exit", "timeout_ms": 0}`, "WAIT_CHILD_EXIT needs a positive timeout duration"},
 		{`{"kind": "assert_exit", "n": -1}`, "ASSERT_EXIT needs a non-negative exit code"},
 		{`{"kind": "assert_exit"}`, "ASSERT_EXIT needs an exit code"},
 		{`{"kind": "expect", "text": "ready", "n": 0}`, "EXPECT needs a positive timeout duration"},
@@ -239,6 +252,76 @@ func TestDriveNavigationStepsSendExpectedEscapeSequences(t *testing.T) {
 	}
 	if string(got) != want {
 		t.Fatalf("navigation bytes = %q, want %q", got, want)
+	}
+}
+
+func TestReplaceTextClearsLineAndRedactsSecretInput(t *testing.T) {
+	in := &mockWriter{}
+	var cast bytes.Buffer
+	var mu sync.Mutex
+	redactor := &secretRedactor{}
+	redactor.add("APP_PASSWORD", "new-secret")
+	recorder := newRecordingWriter(bufio.NewWriter(&cast), &mu, redactor)
+	ts := &terminalSession{
+		in:       in,
+		start:    time.Now(),
+		recorder: recorder,
+		redactor: redactor,
+	}
+
+	written, err := ts.replaceText("new-secret", "APP_PASSWORD", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != len("new-secret")+1 {
+		t.Fatalf("written = %d", written)
+	}
+	if got := string(in.written); got != "\x15new-secret" {
+		t.Fatalf("terminal input = %q", got)
+	}
+	if err := recorder.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cast.String(), "new-secret") || !strings.Contains(cast.String(), "redacted:APP_PASSWORD") {
+		t.Fatalf("cast did not redact replacement input: %s", cast.String())
+	}
+}
+
+func TestStrictAgentRejectsLiteralSecretScreenAndMarkersHideText(t *testing.T) {
+	in := &mockWriter{}
+	var cast bytes.Buffer
+	var mu sync.Mutex
+	redactor := &secretRedactor{}
+	recorder := newRecordingWriter(bufio.NewWriter(&cast), &mu, redactor)
+	ts := &terminalSession{
+		in:       in,
+		start:    time.Now(),
+		cols:     80,
+		rows:     24,
+		vt:       vt10x.New(vt10x.WithSize(80, 24)),
+		recorder: recorder,
+		redactor: redactor,
+	}
+	ts.feedOutput([]byte("Enter password:"))
+	ds := &driveSession{ts: ts, redactor: redactor, strictAgent: true, stepMarkers: true}
+	step, err := parseDriveLine("TEXT literal-secret-value", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds.stepMarker("START", step, 0)
+	err = ds.applyStep(context.Background(), step)
+	if err == nil || !strings.Contains(err.Error(), "secret-like screen") {
+		t.Fatalf("apply error = %v", err)
+	}
+	ds.failureMarker(step, time.Millisecond, err)
+	if err := recorder.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cast.String(), "literal-secret-value") {
+		t.Fatalf("literal text leaked into marker: %s", cast.String())
+	}
+	if !strings.Contains(cast.String(), "literal 20 bytes") {
+		t.Fatalf("safe marker description missing: %s", cast.String())
 	}
 }
 
@@ -507,20 +590,30 @@ func TestDriveWaitChildExitAndAssertExit(t *testing.T) {
 		return string(output), string(cast)
 	}
 
-	t.Run("wait ignores post-input timeout and accepts zero", func(t *testing.T) {
-		output, cast := run(t, "WAIT_CHILD_EXIT\nASSERT_EXIT 0\n", "sleep 2; printf done", true)
+	t.Run("per-step timeout permits an explicitly long wait", func(t *testing.T) {
+		output, cast := run(t, "WAIT_CHILD_EXIT@3000\nASSERT_EXIT 0\n", "sleep 2; printf done", true)
 		if !strings.Contains(output, "process exited 0") {
 			t.Fatalf("missing successful exit report:\n%s", output)
 		}
 		for _, want := range []string{
-			"STEP_START line 1: WAIT_CHILD_EXIT",
-			"STEP_OK line 1: WAIT_CHILD_EXIT",
+			"STEP_START line 1: WAIT_CHILD_EXIT@3000",
+			"STEP_OK line 1: WAIT_CHILD_EXIT@3000",
 			"STEP_START line 2: ASSERT_EXIT 0",
 			"STEP_OK line 2: ASSERT_EXIT 0",
 		} {
 			if !strings.Contains(cast, want) {
 				t.Fatalf("cast is missing lifecycle marker %q:\n%s", want, cast)
 			}
+		}
+	})
+
+	t.Run("global timeout bounds wait", func(t *testing.T) {
+		output, cast := run(t, "WAIT_CHILD_EXIT\n", "sleep 2; printf done", false)
+		if !strings.Contains(output, "WAIT_CHILD_EXIT: timeout after 1s") {
+			t.Fatalf("missing timeout report:\n%s", output)
+		}
+		if !strings.Contains(cast, "STEP_FAILED line 1: WAIT_CHILD_EXIT") {
+			t.Fatalf("cast is missing timeout marker:\n%s", cast)
 		}
 	})
 

@@ -281,6 +281,17 @@ func TestMCPRecordingFinalizeAndTruncate(t *testing.T) {
 	if !strings.Contains(content, "world") {
 		t.Fatalf("cast content was not finalized correctly (missing final outputs): %s", content)
 	}
+	resultData, err := os.ReadFile(resultPath(tmpCast))
+	if err != nil {
+		t.Fatalf("recording result was not finalized: %v", err)
+	}
+	var result sessionResult
+	if err := json.Unmarshal(resultData, &result); err != nil {
+		t.Fatalf("decode recording result: %v", err)
+	}
+	if result.Status != "success" || result.ExitCode != 0 || !result.Cast.Complete || !result.Scan.Complete {
+		t.Fatalf("recording result = %#v", result)
+	}
 
 	// 2. Test keepRaw buffer truncation
 	s2 := &mcpServer{sessions: map[string]*terminalSession{}}
@@ -307,6 +318,61 @@ func TestMCPRecordingFinalizeAndTruncate(t *testing.T) {
 	}
 	if len(stdout) > 600*1024 { // Should be capped around 512KB
 		t.Fatalf("expected stdout length to be capped around 512KB, got %d", len(stdout))
+	}
+}
+
+func TestMCPCastVerifyReturnsStructuredFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "missing-result.cast")
+	if err := writeCastFile(path, castHeader{Version: 2, Width: 80, Height: 24}, nil); err != nil {
+		t.Fatal(err)
+	}
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+	raw, _ := json.Marshal(map[string]any{"paths": []string{path}})
+	value, err := s.tool(context.Background(), "cast_verify", raw)
+	if err == nil || !errors.Is(err, errVerificationFailed) {
+		t.Fatalf("cast_verify error = %v", err)
+	}
+	report, ok := value.(verificationReport)
+	if !ok || report.Valid || report.Checked != 1 || report.Failed != 1 {
+		t.Fatalf("cast_verify value = %#v", value)
+	}
+}
+
+func TestMCPRecordingResultTransitionsFromInProgress(t *testing.T) {
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+	cast := filepath.Join(t.TempDir(), "lifecycle.cast")
+	request, _ := json.Marshal(map[string]any{
+		"command":     []string{"sleep", "10"},
+		"record_file": cast,
+	})
+	value, err := s.tool(context.Background(), "terminal_start", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := value.(map[string]string)["session_id"]
+
+	readResult := func() sessionResult {
+		t.Helper()
+		data, err := os.ReadFile(resultPath(cast))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result sessionResult
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	if result := readResult(); result.Status != "in_progress" || result.Cast.Complete {
+		t.Fatalf("initial result = %#v", result)
+	}
+	if _, err := s.tool(context.Background(), "terminal_close", []byte(`{"session_id":"`+sessionID+`"}`)); err != nil {
+		t.Fatal(err)
+	}
+	result := readResult()
+	if result.Status != "failed" || result.ExitCode == 0 || !result.Cast.Complete || !result.Scan.Complete {
+		t.Fatalf("final result = %#v", result)
 	}
 }
 
@@ -840,6 +906,9 @@ func TestMCPE2EStdio(t *testing.T) {
 	}
 	if !strings.Contains(string(listMsg.Result), `"terminal_select"`) {
 		t.Fatalf("expected 'terminal_select' tool in tools/list result, got: %s", string(listMsg.Result))
+	}
+	if !strings.Contains(string(listMsg.Result), `"cast_verify"`) {
+		t.Fatalf("expected 'cast_verify' tool in tools/list result, got: %s", string(listMsg.Result))
 	}
 
 	// 4. Send call to terminal_select with invalid parameters to test parameter validation over stdio JSON-RPC

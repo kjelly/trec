@@ -34,6 +34,7 @@ type terminalSession struct {
 	recorder     *recordingWriter
 	redactor     *secretRedactor
 	extraClosers []io.Closer
+	finalizeHook func(*terminalSession) error
 
 	writeMu sync.Mutex
 	closed  bool
@@ -44,6 +45,7 @@ type terminalSession struct {
 	exitErr   error
 
 	done         chan struct{} // Closed when the read loop completes
+	processDone  chan struct{} // Closed after process status is captured
 	closeInOnce  sync.Once
 	finalizeOnce sync.Once
 	finalizeErr  error
@@ -53,6 +55,14 @@ type terminalSession struct {
 
 	tainted  bool
 	taintBuf string
+}
+
+type terminalSessionOption func(*terminalSession)
+
+func withTerminalFinalizeHook(hook func(*terminalSession) error) terminalSessionOption {
+	return func(ts *terminalSession) {
+		ts.finalizeHook = hook
+	}
 }
 
 type screenSnapshot struct {
@@ -94,7 +104,7 @@ func normalizeScreen(screenText string) []string {
 	return lines
 }
 
-func newTerminalSession(in io.WriteCloser, out io.Reader, cmd *exec.Cmd, cols, rows int, recorder *recordingWriter, redactor *secretRedactor, keepRaw bool, extraClosers []io.Closer) *terminalSession {
+func newTerminalSession(in io.WriteCloser, out io.Reader, cmd *exec.Cmd, cols, rows int, recorder *recordingWriter, redactor *secretRedactor, keepRaw bool, extraClosers []io.Closer, options ...terminalSessionOption) *terminalSession {
 	ts := &terminalSession{
 		in:           in,
 		out:          out,
@@ -109,7 +119,11 @@ func newTerminalSession(in io.WriteCloser, out io.Reader, cmd *exec.Cmd, cols, r
 		redactor:     redactor,
 		extraClosers: extraClosers,
 		done:         make(chan struct{}),
+		processDone:  make(chan struct{}),
 		teardownDone: make(chan struct{}),
+	}
+	for _, option := range options {
+		option(ts)
 	}
 
 	go ts.readLoop()
@@ -139,16 +153,20 @@ func (ts *terminalSession) waitProcess() {
 	}
 	<-ts.done // wait for read loop to naturally drain and complete
 
-	ts.teardown()
-
 	ts.processMu.Lock()
-	ts.exited = true
 	ts.exitErr = err
 	if ts.cmd != nil && ts.cmd.ProcessState != nil {
 		ts.exitCode = ts.cmd.ProcessState.ExitCode()
 	} else {
 		ts.exitCode = -1
 	}
+	ts.processMu.Unlock()
+	close(ts.processDone)
+
+	ts.teardown()
+
+	ts.processMu.Lock()
+	ts.exited = true
 	ts.processMu.Unlock()
 }
 
@@ -461,6 +479,21 @@ func (ts *terminalSession) sendText(text string, secretLabel string, keyDelay ti
 	return ts.sendTextLocked(text, secretLabel, keyDelay)
 }
 
+func (ts *terminalSession) replaceText(text string, secretLabel string, keyDelay time.Duration) (int, error) {
+	ts.writeMu.Lock()
+	defer ts.writeMu.Unlock()
+
+	written, err := ts.sendBytesLocked([]byte{0x15}, "")
+	if err != nil {
+		return written, err
+	}
+	if keyDelay > 0 {
+		time.Sleep(keyDelay)
+	}
+	n, err := ts.sendTextLocked(text, secretLabel, keyDelay)
+	return written + n, err
+}
+
 func (ts *terminalSession) selectLabel(ctx context.Context, label string, pointerRe *regexp.Regexp, keyDelay time.Duration) (int, error) {
 	if label == "" {
 		return 0, fmt.Errorf("SELECT needs a non-empty label")
@@ -574,6 +607,11 @@ func (ts *terminalSession) finalize() error {
 				errs = append(errs, fmt.Sprintf("close resource: %v", err))
 			}
 		}
+		if ts.finalizeHook != nil {
+			if err := ts.finalizeHook(ts); err != nil {
+				errs = append(errs, fmt.Sprintf("finalize hook: %v", err))
+			}
+		}
 		if len(errs) > 0 {
 			ts.finalizeErr = fmt.Errorf("finalize failed: %s", strings.Join(errs, "; "))
 		}
@@ -608,9 +646,15 @@ func (ts *terminalSession) close() error {
 	if ts.cmd != nil && ts.cmd.Process != nil {
 		_ = ts.cmd.Process.Kill()
 	}
-	<-ts.done
+	<-ts.processDone
 	ts.teardown()
 	return ts.finalizeErr
+}
+
+func (ts *terminalSession) getProcessResult() (code int, err error) {
+	ts.processMu.Lock()
+	defer ts.processMu.Unlock()
+	return ts.exitCode, ts.exitErr
 }
 
 // readRaw reads all buffered raw output since the last call, returning it and whether it was truncated.

@@ -41,13 +41,17 @@ const (
 )
 
 func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
-	server := mcpserver.NewMCPServer("trec", appVersion, mcpserver.WithToolCapabilities(false), mcpserver.WithRecovery())
+	server := mcpserver.NewMCPServer("trec", currentBuildMetadata().DisplayVersion(), mcpserver.WithToolCapabilities(false), mcpserver.WithRecovery())
 	add := func(name string, tool mcp.Tool) {
 		server.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return s.handleCallTool(ctx, name, req)
 		})
 	}
 	add("run", mcp.NewTool("run", mcp.WithDescription("Run any local command once."), mcp.WithArray("command", mcp.Required(), mcp.WithStringItems(), mcp.Description("Argv: command name followed by its arguments, e.g. [\"echo\", \"hi\"].")), mcp.WithString("stdin"), mcp.WithNumber("timeout_seconds"), mcp.WithString("working_directory")))
+	add("cast_verify", mcp.NewTool("cast_verify",
+		mcp.WithDescription("Verify cast completion, result integrity, and secret-scan safety."),
+		mcp.WithArray("paths", mcp.Required(), mcp.WithStringItems(), mcp.Description("Cast files or directories containing .cast files.")),
+	))
 	add("terminal_start", mcp.NewTool("terminal_start",
 		mcp.WithDescription("Start a persistent terminal process."),
 		mcp.WithArray("command", mcp.Required(), mcp.WithStringItems(), mcp.Description("Argv: command name followed by its arguments, e.g. [\"bash\"].")),
@@ -175,6 +179,24 @@ func mcpErrorWithScreen(e error, ss *terminalSession) error {
 
 func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, error) {
 	switch name {
+	case "cast_verify":
+		var args struct {
+			Paths []string `json:"paths"`
+		}
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return nil, err
+		}
+		if len(args.Paths) == 0 {
+			return nil, fmt.Errorf("paths is required")
+		}
+		report, err := verifyPaths(args.Paths)
+		if err != nil {
+			return nil, err
+		}
+		if !report.Valid {
+			return report, fmt.Errorf("%w: %d of %d cast(s) failed", errVerificationFailed, report.Failed, report.Checked)
+		}
+		return report, nil
 	case "run":
 		a, in, to, dir, e := commandFrom(raw)
 		if e != nil {
@@ -230,12 +252,9 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 
 		var recorder *recordingWriter
 		var extraClosers []io.Closer
+		var pending sessionResult
 		if mcpOpts.RecordFile != "" {
-			if _, err := os.Stat(mcpOpts.RecordFile); err == nil {
-				return nil, fmt.Errorf("record_file %q already exists", mcpOpts.RecordFile)
-			}
-
-			f, err := os.OpenFile(mcpOpts.RecordFile, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+			f, err := prepareRecordingOutput(mcpOpts.RecordFile, false)
 			if err != nil {
 				return nil, err
 			}
@@ -243,12 +262,14 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 			var bwMu sync.Mutex
 			recorder = newRecordingWriter(bw, &bwMu, redactor)
 
+			build := currentBuildMetadata()
 			hdr := castHeader{
 				Version:     2,
 				Width:       int(size.Cols),
 				Height:      int(size.Rows),
 				Timestamp:   time.Now().Unix(),
-				TrecVersion: appVersion,
+				TrecVersion: build.DisplayVersion(),
+				TrecBuild:   build,
 				Title:       mcpOpts.RecordTitle,
 				Env: map[string]string{
 					"TERM": "xterm-256color",
@@ -270,6 +291,14 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 				os.Remove(mcpOpts.RecordFile)
 				return nil, fmt.Errorf("write header: %w", err)
 			}
+			pending = newPendingSessionResult(time.Now())
+			if err := writePendingSessionResult(mcpOpts.RecordFile, pending); err != nil {
+				for _, cl := range extraClosers {
+					cl.Close()
+				}
+				os.Remove(mcpOpts.RecordFile)
+				return nil, fmt.Errorf("write pending result: %w", err)
+			}
 		}
 
 		c := exec.Command(a[0], a[1:]...)
@@ -281,12 +310,43 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 				cl.Close()
 			}
 			if mcpOpts.RecordFile != "" {
-				os.Remove(mcpOpts.RecordFile)
+				_ = writeSessionResult(mcpOpts.RecordFile, sessionResult{
+					SessionID: pending.SessionID,
+					StartedAt: pending.StartedAt,
+					Status:    "failed",
+					ExitCode:  -1,
+					Error:     fmt.Sprintf("start command: %v", e),
+				})
 			}
 			return nil, e
 		}
 
-		ts := newTerminalSession(ptmx, ptmx, c, int(size.Cols), int(size.Rows), recorder, redactor, true, extraClosers)
+		var options []terminalSessionOption
+		if mcpOpts.RecordFile != "" {
+			recordPath := mcpOpts.RecordFile
+			options = append(options, withTerminalFinalizeHook(func(ts *terminalSession) error {
+				exitCode, processErr := ts.getProcessResult()
+				status := "success"
+				message := ""
+				if processErr != nil || exitCode != 0 {
+					status = "failed"
+					if processErr != nil {
+						message = processErr.Error()
+					}
+				}
+				lines, _, _, _, _ := ts.redactedScreenSnapshot()
+				return writeSessionResult(recordPath, sessionResult{
+					SessionID:       pending.SessionID,
+					StartedAt:       pending.StartedAt,
+					Status:          status,
+					ExitCode:        exitCode,
+					Error:           message,
+					DurationSeconds: time.Since(ts.start).Seconds(),
+					FinalScreen:     lines,
+				})
+			}))
+		}
+		ts := newTerminalSession(ptmx, ptmx, c, int(size.Cols), int(size.Rows), recorder, redactor, true, extraClosers, options...)
 		s.mu.Lock()
 		s.next++
 		id := "session-" + strconv.Itoa(s.next)

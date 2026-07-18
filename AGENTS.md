@@ -39,7 +39,8 @@ Use **Go modules** (`go 1.25.5`):
 - Shared types: `castHeader` (main.go), `castEvent` (play.go), `recordingWriter` (redact.go), and `loadCastFile`/`writeCastFile` (cast.go).
 - PTY output is mirrored to stdout and recorded; stdin is forwarded to the PTY and recorded as `"i"` events.
 - `drive` sets `TERM=xterm-256color` and `CI=1` for deterministic TUI rendering under a non-interactive PTY.
-- `record` and `drive` write `<cast>.result.json` only after the cast is flushed and synced. Treat `cast.complete`, `cast.sha256`, and `cast.byte_size` as required evidence before trusting a completed recording.
+- `record`, `drive`, and MCP `terminal_start` recordings create an `in_progress` `<cast>.result.json`, then replace it with final integrity metadata only after the cast is finalized. Recording starts refuse to overwrite an existing cast or result unless `--force` is explicit. Use the `verify` subcommand or MCP `cast_verify` to gate status, integrity, and secret-scan safety together.
+- Development builds expose their VCS revision and dirty state in `version`, cast headers, and result metadata; do not treat a bare `dev` string as sufficient provenance.
 - `html` and `serve` refuse casts with secret-scan findings by default; bypassing this requires the explicit `--allow-scan-findings` flag after review.
 - `.gitignore` ignores `trec`, `terminal-record`, and `*.cast`.
 

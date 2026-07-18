@@ -9,16 +9,22 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"time"
 )
 
 // sessionResult is a machine-readable completion record written next to a cast.
 type sessionResult struct {
+	SessionID       string            `json:"session_id,omitempty"`
+	StartedAt       string            `json:"started_at,omitempty"`
 	Status          string            `json:"status"`
 	ExitCode        int               `json:"exit_code"`
 	Error           string            `json:"error,omitempty"`
 	DurationSeconds float64           `json:"duration_seconds"`
 	FinalScreen     []string          `json:"final_screen,omitempty"`
 	Snapshots       []sessionSnapshot `json:"snapshots,omitempty"`
+	Build           buildMetadata     `json:"build"`
+	Scan            scanSummary       `json:"scan"`
 	Cast            castIntegrity     `json:"cast"`
 }
 
@@ -33,30 +39,104 @@ type sessionSnapshot struct {
 // The digest covers the exact on-disk bytes, including the header and every
 // event line.
 type castIntegrity struct {
-	SchemaVersion int     `json:"schema_version"`
-	Complete      bool    `json:"complete"`
-	Algorithm     string  `json:"algorithm"`
-	SHA256        string  `json:"sha256"`
-	ByteSize      int64   `json:"byte_size"`
-	EventCount    int     `json:"event_count"`
-	LastEventTime float64 `json:"last_event_time"`
-	Producer      string  `json:"producer"`
-	Version       string  `json:"version"`
+	SchemaVersion int           `json:"schema_version"`
+	Complete      bool          `json:"complete"`
+	Algorithm     string        `json:"algorithm"`
+	SHA256        string        `json:"sha256"`
+	ByteSize      int64         `json:"byte_size"`
+	EventCount    int           `json:"event_count"`
+	LastEventTime float64       `json:"last_event_time"`
+	Producer      string        `json:"producer"`
+	Version       string        `json:"version"`
+	Build         buildMetadata `json:"build"`
 }
 
 func resultPath(castPath string) string { return castPath + ".result.json" }
+
+type scanSummary struct {
+	Complete      bool     `json:"complete"`
+	FindingsCount int      `json:"findings_count"`
+	Rules         []string `json:"rules,omitempty"`
+	SafeToShare   bool     `json:"safe_to_share"`
+	Error         string   `json:"error,omitempty"`
+}
+
+func summarizeScan(path string) scanSummary {
+	findings, err := scanCast(path)
+	if err != nil {
+		return scanSummary{Complete: false, SafeToShare: false, Error: err.Error()}
+	}
+	ruleSet := make(map[string]struct{})
+	for _, finding := range findings {
+		ruleSet[finding.Rule] = struct{}{}
+	}
+	rules := make([]string, 0, len(ruleSet))
+	for rule := range ruleSet {
+		rules = append(rules, rule)
+	}
+	sort.Strings(rules)
+	return scanSummary{
+		Complete:      true,
+		FindingsCount: len(findings),
+		Rules:         rules,
+		SafeToShare:   len(findings) == 0,
+	}
+}
+
+func newPendingSessionResult(started time.Time) sessionResult {
+	build := currentBuildMetadata()
+	return sessionResult{
+		SessionID: fmt.Sprintf("%d-%d", started.UnixNano(), os.Getpid()),
+		StartedAt: started.UTC().Format(time.RFC3339Nano),
+		Status:    "in_progress",
+		ExitCode:  -1,
+		Build:     build,
+		Scan:      scanSummary{Complete: false, SafeToShare: false},
+		Cast:      castIntegrity{SchemaVersion: 1, Complete: false, Algorithm: "sha256", Producer: "trec", Version: build.DisplayVersion(), Build: build},
+	}
+}
+
+func writePendingSessionResult(castPath string, result sessionResult) error {
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode pending result: %w", err)
+	}
+	return writeFileAtomic(resultPath(castPath), append(data, '\n'), 0o644)
+}
 
 func writeSessionResult(castPath string, result sessionResult) error {
 	integrity, err := inspectCastIntegrity(castPath)
 	if err != nil {
 		return fmt.Errorf("inspect cast: %w", err)
 	}
+	result.Build = currentBuildMetadata()
+	result.Scan = summarizeScan(castPath)
 	result.Cast = integrity
 	b, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode result: %w", err)
 	}
 	return writeFileAtomic(resultPath(castPath), append(b, '\n'), 0o644)
+}
+
+func prepareRecordingOutput(path string, force bool) (*os.File, error) {
+	if path == "" {
+		return nil, fmt.Errorf("output path is empty")
+	}
+	if !force {
+		for _, candidate := range []string{path, resultPath(path)} {
+			if _, err := os.Stat(candidate); err == nil {
+				return nil, fmt.Errorf("%s already exists; use --force to replace the cast and result sidecar", candidate)
+			} else if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("inspect %s: %w", candidate, err)
+			}
+		}
+		return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	}
+	if err := os.Remove(resultPath(path)); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("remove stale result %s: %w", resultPath(path), err)
+	}
+	return os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 }
 
 func inspectCastIntegrity(path string) (castIntegrity, error) {
@@ -110,6 +190,11 @@ func inspectCastIntegrity(path string) (castIntegrity, error) {
 		return castIntegrity{}, fmt.Errorf("read: %w", err)
 	}
 
+	build := header.TrecBuild
+	version := header.TrecVersion
+	if version == "" {
+		version = build.DisplayVersion()
+	}
 	return castIntegrity{
 		SchemaVersion: 1,
 		Complete:      true,
@@ -119,7 +204,8 @@ func inspectCastIntegrity(path string) (castIntegrity, error) {
 		EventCount:    eventCount,
 		LastEventTime: lastTime,
 		Producer:      "trec",
-		Version:       appVersion,
+		Version:       version,
+		Build:         build,
 	}, nil
 }
 

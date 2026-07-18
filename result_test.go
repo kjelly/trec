@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRecordPropagatesExitCodeAndWritesResult(t *testing.T) {
@@ -52,8 +53,11 @@ func TestRecordPropagatesExitCodeAndWritesResult(t *testing.T) {
 	if !summary.Cast.Complete || summary.Cast.Algorithm != "sha256" || summary.Cast.SHA256 != hex.EncodeToString(digest[:]) || summary.Cast.ByteSize != int64(len(castData)) || summary.Cast.EventCount == 0 {
 		t.Fatalf("unexpected cast integrity metadata: %#v", summary.Cast)
 	}
-	if !strings.Contains(string(castData), `"trec_version":"dev"`) {
-		t.Fatalf("cast header is missing producer version:\n%s", castData)
+	if !strings.Contains(string(castData), `"trec_version":`) || !strings.Contains(string(castData), `"trec_build":`) {
+		t.Fatalf("cast header is missing traceable producer build metadata:\n%s", castData)
+	}
+	if currentBuildMetadata().Revision != "" && !strings.Contains(string(castData), `"revision":`) {
+		t.Fatalf("cast header is missing available VCS revision:\n%s", castData)
 	}
 }
 
@@ -80,6 +84,9 @@ func TestWriteSessionResultRecordsCastIntegrityAtomically(t *testing.T) {
 	if !result.Cast.Complete || result.Cast.EventCount != 2 || result.Cast.LastEventTime != 1.5 || result.Cast.ByteSize == 0 {
 		t.Fatalf("integrity = %#v", result.Cast)
 	}
+	if !result.Scan.Complete || !result.Scan.SafeToShare || result.Scan.FindingsCount != 0 {
+		t.Fatalf("scan = %#v, want completed safe scan", result.Scan)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -88,6 +95,133 @@ func TestWriteSessionResultRecordsCastIntegrityAtomically(t *testing.T) {
 		if strings.Contains(entry.Name(), ".result.json.tmp-") {
 			t.Fatalf("temporary result was not cleaned up: %s", entry.Name())
 		}
+	}
+}
+
+func TestPrepareRecordingOutputPreventsStaleResult(t *testing.T) {
+	dir := t.TempDir()
+	cast := filepath.Join(dir, "session.cast")
+	if err := os.WriteFile(cast, []byte("old cast"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resultPath(cast), []byte("old result"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := prepareRecordingOutput(cast, false); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("prepare without force error = %v, want overwrite refusal", err)
+	}
+
+	f, err := prepareRecordingOutput(cast, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("new cast"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(resultPath(cast)); !os.IsNotExist(err) {
+		t.Fatalf("stale result still exists: %v", err)
+	}
+	data, err := os.ReadFile(cast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new cast" {
+		t.Fatalf("cast = %q, want replacement", data)
+	}
+}
+
+func TestPendingResultIsExplicitlyIncomplete(t *testing.T) {
+	cast := filepath.Join(t.TempDir(), "pending.cast")
+	pending := newPendingSessionResult(time.Unix(123, 456))
+	if err := writePendingSessionResult(cast, pending); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resultPath(cast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result sessionResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "in_progress" || result.ExitCode != -1 || result.Cast.Complete || result.Scan.Complete || result.Scan.SafeToShare {
+		t.Fatalf("pending result = %#v", result)
+	}
+	if result.SessionID == "" || result.StartedAt == "" {
+		t.Fatalf("pending result lacks identity: %#v", result)
+	}
+}
+
+func TestWriteSessionResultIncludesBlockingScanSummary(t *testing.T) {
+	cast := filepath.Join(t.TempDir(), "secret.cast")
+	if err := writeCastFile(cast, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{
+		{sec: 1, typ: "o", data: "password=exposed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSessionResult(cast, sessionResult{Status: "success", ExitCode: 0}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resultPath(cast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result sessionResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Scan.Complete || result.Scan.SafeToShare || result.Scan.FindingsCount != 1 {
+		t.Fatalf("scan = %#v, want one blocking finding", result.Scan)
+	}
+}
+
+func TestRecordRefusesOverwriteUnlessForced(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "trec")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build trec: %v\n%s", err, output)
+	}
+	cast := filepath.Join(t.TempDir(), "record.cast")
+	run := func(args ...string) ([]byte, error) {
+		command := append([]string{"-o", cast}, args...)
+		return exec.Command(binary, command...).CombinedOutput()
+	}
+
+	if output, err := run("--", "sh", "-c", "printf first"); err != nil {
+		t.Fatalf("first record: %v\n%s", err, output)
+	}
+	first, err := os.ReadFile(cast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := run("--", "sh", "-c", "printf second")
+	if err == nil || !strings.Contains(string(output), "--force") {
+		t.Fatalf("overwrite error = %v\n%s", err, output)
+	}
+	unchanged, err := os.ReadFile(cast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(unchanged) != string(first) {
+		t.Fatal("refused overwrite modified the cast")
+	}
+
+	if output, err := run("--force", "--", "sh", "-c", "printf second"); err != nil {
+		t.Fatalf("forced record: %v\n%s", err, output)
+	}
+	replaced, err := os.ReadFile(cast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(replaced), "first") || !strings.Contains(string(replaced), "second") {
+		t.Fatalf("forced cast was not replaced:\n%s", replaced)
+	}
+	result := verifyCast(cast)
+	if !result.Valid {
+		t.Fatalf("forced replacement did not produce valid evidence: %#v", result)
 	}
 }
 

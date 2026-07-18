@@ -24,6 +24,7 @@ type castHeader struct {
 	Height       int               `json:"height"`
 	Timestamp    int64             `json:"timestamp"`
 	TrecVersion  string            `json:"trec_version,omitempty"`
+	TrecBuild    buildMetadata     `json:"trec_build,omitempty"`
 	Command      string            `json:"command,omitempty"`
 	CommandLabel string            `json:"command_label,omitempty"`
 	Title        string            `json:"title,omitempty"`
@@ -62,12 +63,13 @@ func newRootCommand() *cobra.Command {
 		Use:           "trec [record-options] [-- command [args...]]",
 		Short:         "Record, play, and inspect terminal sessions",
 		Long:          "trec records terminal sessions in asciicast v2 format, then plays, annotates, exports, and serves them.",
-		Version:       appVersion,
+		Version:       currentBuildMetadata().DisplayVersion(),
 		Args:          cobra.ArbitraryArgs,
 		Run:           runRecord,
 		SilenceErrors: true,
 	}
 	cmd.Flags().StringP("output", "o", "", "output file (default: record_TIMESTAMP.cast)")
+	cmd.Flags().Bool("force", false, "replace an existing cast and its result sidecar")
 	cmd.Flags().IntP("width", "W", 0, "terminal width (default: current terminal width)")
 	cmd.Flags().IntP("height", "H", 0, "terminal height (default: current terminal height)")
 	cmd.Flags().String("title", "", "session title stored in the cast file")
@@ -75,7 +77,7 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringArray("secret-file", nil, "NAME=path whose file content is redacted from the recording (repeatable)")
 	cmd.PersistentFlags().Bool("record-command", false, "store the command in the cast header (redacted by --secret-env/--secret-file)")
 	cmd.PersistentFlags().String("command-label", "", "safe label stored in the cast header instead of the full command")
-	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand(), newMarkersCommand(), newMCPCommand(), newVersionCommand(), newRenderCommand(), newScanCommand())
+	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand(), newMarkersCommand(), newMCPCommand(), newVersionCommand(), newRenderCommand(), newScanCommand(), newVerifyCommand())
 	return cmd
 }
 
@@ -88,6 +90,7 @@ func runRecord(cmd *cobra.Command, args []string) {
 	secretFiles, _ := cmd.Flags().GetStringArray("secret-file")
 	recordCommand, _ := cmd.Flags().GetBool("record-command")
 	commandLabel, _ := cmd.Flags().GetString("command-label")
+	force, _ := cmd.Flags().GetBool("force")
 	redactor, err := newSecretRedactor(secretEnv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "trec: %v\n", err)
@@ -124,7 +127,7 @@ func runRecord(cmd *cobra.Command, args []string) {
 	if outputFile == "" {
 		outputFile = fmt.Sprintf("record_%s.cast", time.Now().Format("20060102_150405"))
 	}
-	f, err := os.Create(outputFile)
+	f, err := prepareRecordingOutput(outputFile, force)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create output file: %v\n", err)
 		os.Exit(1)
@@ -136,12 +139,14 @@ func runRecord(cmd *cobra.Command, args []string) {
 	recorder := newRecordingWriter(bw, &bwMu, redactor)
 
 	// Write asciicast v2 header.
+	build := currentBuildMetadata()
 	hdr := castHeader{
 		Version:     2,
 		Width:       width,
 		Height:      height,
 		Timestamp:   time.Now().Unix(),
-		TrecVersion: appVersion,
+		TrecVersion: build.DisplayVersion(),
+		TrecBuild:   build,
 		Title:       title,
 		Env: map[string]string{
 			"TERM":  getenv("TERM", "xterm-256color"),
@@ -160,6 +165,12 @@ func runRecord(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "failed to write header: %v\n", err)
 		os.Exit(1)
 	}
+	started := time.Now()
+	pending := newPendingSessionResult(started)
+	if err := writePendingSessionResult(outputFile, pending); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write recording summary: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Start the command under a PTY.
 	processCmd := exec.Command(args[0], args[1:]...)
@@ -168,11 +179,19 @@ func runRecord(cmd *cobra.Command, args []string) {
 		Cols: uint16(width),
 	})
 	if err != nil {
+		_ = f.Sync()
+		_ = writeSessionResult(outputFile, sessionResult{
+			SessionID: pending.SessionID,
+			StartedAt: pending.StartedAt,
+			Status:    "failed",
+			ExitCode:  -1,
+			Error:     fmt.Sprintf("start command: %v", err),
+		})
 		fmt.Fprintf(os.Stderr, "failed to start %q: %v\n", args[0], err)
 		os.Exit(1)
 	}
 
-	startTime := time.Now()
+	startTime := started
 	finalVT := vt10x.New(vt10x.WithSize(width, height))
 	var finalVTMu sync.Mutex
 
@@ -318,7 +337,15 @@ func runRecord(cmd *cobra.Command, args []string) {
 	finalVTMu.Lock()
 	finalScreen := redactor.redactScreen(normalizeScreen(finalVT.String()))
 	finalVTMu.Unlock()
-	if err := writeSessionResult(outputFile, sessionResult{Status: status, ExitCode: exitCode, Error: message, DurationSeconds: time.Since(startTime).Seconds(), FinalScreen: finalScreen}); err != nil {
+	if err := writeSessionResult(outputFile, sessionResult{
+		SessionID:       pending.SessionID,
+		StartedAt:       pending.StartedAt,
+		Status:          status,
+		ExitCode:        exitCode,
+		Error:           message,
+		DurationSeconds: time.Since(startTime).Seconds(),
+		FinalScreen:     finalScreen,
+	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing recording summary: %v\n", err)
 		if recErr == nil {
 			recErr = err
