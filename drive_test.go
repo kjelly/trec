@@ -104,6 +104,79 @@ func TestParseDriveLifecycleSteps(t *testing.T) {
 	}
 }
 
+func TestParseDriveInlineCommentsAndGuardedActions(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		kind string
+		text string
+		raw  string
+	}{
+		{"ENTER # submit the form", "enter", "", "ENTER"},
+		{"ENTER_IF Confirm deployment # only on the confirmation screen", "enter_if", "Confirm deployment", "ENTER_IF Confirm deployment"},
+		{"CHOOSE save & exit # select and submit", "choose", "save & exit", "CHOOSE save & exit"},
+		{"EXPECT issue#123 # embedded hashes remain literal", "expect", "issue#123", "EXPECT issue#123"},
+	} {
+		step, err := parseDriveLine(tc.line, 7)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.line, err)
+		}
+		if step.kind != tc.kind || step.text != tc.text || step.raw != tc.raw {
+			t.Errorf("parse %q = kind %q text %q raw %q", tc.line, step.kind, step.text, step.raw)
+		}
+	}
+
+	jsonStep, err := parseDriveLine(`{"kind":"text","text":"value # literal"}`, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jsonStep.text != "value # literal" {
+		t.Fatalf("JSON text = %q", jsonStep.text)
+	}
+	for _, line := range []string{"ENTER unexpected", "SPACE extra", "QUIT now", `{"kind":"enter","text":"unexpected"}`} {
+		if _, err := parseDriveLine(line, 9); err == nil {
+			t.Errorf("%q unexpectedly accepted an argument", line)
+		}
+	}
+}
+
+func TestLintDriveStepsRejectsBlindTransitionsAndChecksExitPair(t *testing.T) {
+	parse := func(lines ...string) []*driveStep {
+		t.Helper()
+		var steps []*driveStep
+		for i, line := range lines {
+			step, err := parseDriveLine(line, i+1)
+			if err != nil {
+				t.Fatalf("parse %q: %v", line, err)
+			}
+			steps = append(steps, step)
+		}
+		return steps
+	}
+
+	bad := lintDriveSteps(parse(
+		"ENTER",
+		"EXPECT_QUIET 5000",
+		"ENTER",
+		"SELECT save",
+		"WAIT_CHILD_EXIT@3600000",
+	), true)
+	if len(bad) < 4 {
+		t.Fatalf("findings = %#v, want blind ENTER, SELECT, long wait, and exit-pair findings", bad)
+	}
+
+	good := lintDriveSteps(parse(
+		"EXPECT Inventory",
+		"ENTER",
+		"ENTER_IF Confirm deployment",
+		"CHOOSE save & exit",
+		"WAIT_CHILD_EXIT@120000",
+		"ASSERT_EXIT 0",
+	), true)
+	if len(good) != 0 {
+		t.Fatalf("guarded script findings = %#v", good)
+	}
+}
+
 func TestParseJSONDriveSteps(t *testing.T) {
 	// 1. Valid JSON steps
 	step1, err := parseDriveLine(`{"kind": "text", "text": "hello"}`, 1)
@@ -605,6 +678,9 @@ func TestDriveWaitChildExitAndAssertExit(t *testing.T) {
 				t.Fatalf("cast is missing lifecycle marker %q:\n%s", want, cast)
 			}
 		}
+		if strings.LastIndex(cast, "SESSION_END status=success exit_code=0") < strings.LastIndex(cast, "STEP_OK line 2: ASSERT_EXIT 0") {
+			t.Fatalf("SESSION_END is not the final lifecycle marker:\n%s", cast)
+		}
 	})
 
 	t.Run("global timeout bounds wait", func(t *testing.T) {
@@ -638,6 +714,54 @@ func TestDriveWaitChildExitAndAssertExit(t *testing.T) {
 			t.Fatalf("successful assertion recorded failure:\n%s", cast)
 		}
 	})
+}
+
+func TestDriveSignalFinalizesAbortedRecording(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "trec")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build trec: %v\n%s", err, output)
+	}
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "signal.drive")
+	castPath := filepath.Join(dir, "signal.cast")
+	if err := os.WriteFile(scriptPath, []byte("WAIT_CHILD_EXIT@60000\nASSERT_EXIT 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "drive", "--script", scriptPath, "-o", castPath, "--", "sh", "-c", "printf ready; sleep 30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		data, _ := os.ReadFile(castPath)
+		if strings.Contains(string(data), "STEP_START line 1: WAIT_CHILD_EXIT@60000") {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatalf("drive did not enter WAIT_CHILD_EXIT:\n%s", data)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("interrupted drive unexpectedly exited 0")
+	}
+
+	data, err := os.ReadFile(resultPath(castPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result sessionResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "aborted" || result.Cast.Complete == false || !result.Cast.SessionEnd || result.LastStep == nil || result.LastStep.Phase != "failed" {
+		t.Fatalf("aborted result = %#v", result)
+	}
 }
 
 func TestDriveSnapshotPersistsRedactedScreenAndLabel(t *testing.T) {

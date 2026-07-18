@@ -53,11 +53,44 @@ func TestRecordPropagatesExitCodeAndWritesResult(t *testing.T) {
 	if !summary.Cast.Complete || summary.Cast.Algorithm != "sha256" || summary.Cast.SHA256 != hex.EncodeToString(digest[:]) || summary.Cast.ByteSize != int64(len(castData)) || summary.Cast.EventCount == 0 {
 		t.Fatalf("unexpected cast integrity metadata: %#v", summary.Cast)
 	}
+	if !summary.Cast.SessionEnd || !strings.Contains(string(castData), "SESSION_END status=failed exit_code=7") {
+		t.Fatalf("recording lacks completion marker: %#v\n%s", summary.Cast, castData)
+	}
 	if !strings.Contains(string(castData), `"trec_version":`) || !strings.Contains(string(castData), `"trec_build":`) {
 		t.Fatalf("cast header is missing traceable producer build metadata:\n%s", castData)
 	}
 	if currentBuildMetadata().Revision != "" && !strings.Contains(string(castData), `"revision":`) {
 		t.Fatalf("cast header is missing available VCS revision:\n%s", castData)
+	}
+}
+
+func TestSessionScriptProvenanceIsHashedNormalizedAndRedacted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "steps.drive")
+	const secret = "do-not-store-this"
+	script := "EXPECT prompt # comment\nTEXT " + secret + "\nENTER_IF prompt # submit\n"
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	redactor := &secretRedactor{}
+	redactor.add("PASSWORD", secret)
+	steps, err := loadDriveScript(path, redactor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := buildSessionScript(path, steps, redactor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.SHA256 == "" || info.StepCount != 3 {
+		t.Fatalf("script provenance = %#v", info)
+	}
+	joined := strings.Join(info.NormalizedSteps, "\n")
+	if strings.Contains(joined, secret) || strings.Contains(joined, "comment") {
+		t.Fatalf("normalized script leaked literal/comment: %s", joined)
+	}
+	if !strings.Contains(joined, "TEXT <literal") || !strings.Contains(joined, "ENTER_IF prompt") {
+		t.Fatalf("normalized script = %s", joined)
 	}
 }
 

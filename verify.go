@@ -13,14 +13,16 @@ import (
 )
 
 type castVerification struct {
-	Path        string        `json:"path"`
-	Valid       bool          `json:"valid"`
-	Issues      []string      `json:"issues,omitempty"`
-	Status      string        `json:"status,omitempty"`
-	ExitCode    int           `json:"exit_code"`
-	Integrity   castIntegrity `json:"integrity"`
-	Scan        scanSummary   `json:"scan"`
-	ResultBuild buildMetadata `json:"result_build,omitempty"`
+	Path           string        `json:"path"`
+	Valid          bool          `json:"valid"`
+	Issues         []string      `json:"issues,omitempty"`
+	Status         string        `json:"status,omitempty"`
+	ExitCode       int           `json:"exit_code"`
+	Integrity      castIntegrity `json:"integrity"`
+	Scan           scanSummary   `json:"scan"`
+	ResultBuild    buildMetadata `json:"result_build,omitempty"`
+	UpdatedAt      string        `json:"updated_at,omitempty"`
+	UnfinishedStep string        `json:"unfinished_step,omitempty"`
 }
 
 type verificationReport struct {
@@ -79,6 +81,10 @@ func verifyCast(path string) castVerification {
 	}
 	verification.Integrity = observed
 	verification.Scan = summarizeScan(path)
+	verification.UnfinishedStep = unfinishedDriveStep(path)
+	if verification.UnfinishedStep != "" {
+		verification.Issues = append(verification.Issues, "unfinished drive step: "+verification.UnfinishedStep)
+	}
 
 	data, err := os.ReadFile(resultPath(path))
 	if err != nil {
@@ -95,26 +101,35 @@ func verifyCast(path string) castVerification {
 			verification.Status = result.Status
 			verification.ExitCode = result.ExitCode
 			verification.ResultBuild = result.Build
+			verification.UpdatedAt = result.UpdatedAt
 			if result.Status != "success" {
-				verification.Issues = append(verification.Issues, fmt.Sprintf("result status is %q", result.Status))
+				message := fmt.Sprintf("result status is %q", result.Status)
+				if result.Status == "in_progress" && result.UpdatedAt != "" {
+					message += " (last updated " + result.UpdatedAt + ")"
+				}
+				verification.Issues = append(verification.Issues, message)
 			}
 			if result.ExitCode != 0 {
 				verification.Issues = append(verification.Issues, fmt.Sprintf("result exit_code is %d", result.ExitCode))
 			}
 			if !result.Cast.Complete {
 				verification.Issues = append(verification.Issues, "result cast.complete is false")
-			}
-			if result.Cast.Algorithm != "sha256" {
-				verification.Issues = append(verification.Issues, fmt.Sprintf("result cast.algorithm is %q", result.Cast.Algorithm))
-			}
-			if result.Cast.SHA256 != observed.SHA256 {
-				verification.Issues = append(verification.Issues, "cast sha256 does not match result")
-			}
-			if result.Cast.ByteSize != observed.ByteSize {
-				verification.Issues = append(verification.Issues, fmt.Sprintf("cast byte size %d does not match result %d", observed.ByteSize, result.Cast.ByteSize))
-			}
-			if result.Cast.EventCount != observed.EventCount {
-				verification.Issues = append(verification.Issues, fmt.Sprintf("cast event count %d does not match result %d", observed.EventCount, result.Cast.EventCount))
+			} else {
+				if result.Cast.Algorithm != "sha256" {
+					verification.Issues = append(verification.Issues, fmt.Sprintf("result cast.algorithm is %q", result.Cast.Algorithm))
+				}
+				if result.Cast.SHA256 != observed.SHA256 {
+					verification.Issues = append(verification.Issues, "cast sha256 does not match result")
+				}
+				if result.Cast.ByteSize != observed.ByteSize {
+					verification.Issues = append(verification.Issues, fmt.Sprintf("cast byte size %d does not match result %d", observed.ByteSize, result.Cast.ByteSize))
+				}
+				if result.Cast.EventCount != observed.EventCount {
+					verification.Issues = append(verification.Issues, fmt.Sprintf("cast event count %d does not match result %d", observed.EventCount, result.Cast.EventCount))
+				}
+				if result.Cast.SchemaVersion >= 2 && !observed.SessionEnd {
+					verification.Issues = append(verification.Issues, "cast is missing the required SESSION_END marker")
+				}
 			}
 		}
 	}
@@ -126,6 +141,41 @@ func verifyCast(path string) castVerification {
 	}
 	verification.Valid = len(verification.Issues) == 0
 	return verification
+}
+
+func unfinishedDriveStep(path string) string {
+	_, events, err := loadCastFile(path)
+	if err != nil {
+		return ""
+	}
+	activeLine := -1
+	active := ""
+	for _, event := range events {
+		if event.typ != "m" {
+			continue
+		}
+		var line int
+		if strings.HasPrefix(event.data, "STEP_START line ") {
+			if _, err := fmt.Sscanf(event.data, "STEP_START line %d:", &line); err == nil {
+				activeLine = line
+				active = event.data
+			}
+			continue
+		}
+		if strings.HasPrefix(event.data, "STEP_OK line ") {
+			if _, err := fmt.Sscanf(event.data, "STEP_OK line %d:", &line); err == nil && line == activeLine {
+				activeLine = -1
+				active = ""
+			}
+		}
+		if strings.HasPrefix(event.data, "STEP_FAILED line ") {
+			if _, err := fmt.Sscanf(event.data, "STEP_FAILED line %d:", &line); err == nil && line == activeLine {
+				activeLine = -1
+				active = ""
+			}
+		}
+	}
+	return active
 }
 
 func verifyPaths(paths []string) (verificationReport, error) {

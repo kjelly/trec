@@ -31,18 +31,21 @@ type terminalSession struct {
 	rawOut  bytes.Buffer
 	lastOut time.Time
 
-	recorder     *recordingWriter
-	redactor     *secretRedactor
-	extraClosers []io.Closer
-	finalizeHook func(*terminalSession) error
+	recorder       *recordingWriter
+	redactor       *secretRedactor
+	extraClosers   []io.Closer
+	finalizeHook   func(*terminalSession) error
+	emitSessionEnd bool
 
 	writeMu sync.Mutex
 	closed  bool
 
-	processMu sync.Mutex
-	exited    bool
-	exitCode  int
-	exitErr   error
+	processMu   sync.Mutex
+	exited      bool
+	exitCode    int
+	exitErr     error
+	closeStatus string
+	closeReason string
 
 	done         chan struct{} // Closed when the read loop completes
 	processDone  chan struct{} // Closed after process status is captured
@@ -62,6 +65,12 @@ type terminalSessionOption func(*terminalSession)
 func withTerminalFinalizeHook(hook func(*terminalSession) error) terminalSessionOption {
 	return func(ts *terminalSession) {
 		ts.finalizeHook = hook
+	}
+}
+
+func withSessionEndMarker(enabled bool) terminalSessionOption {
+	return func(ts *terminalSession) {
+		ts.emitSessionEnd = enabled
 	}
 }
 
@@ -106,21 +115,22 @@ func normalizeScreen(screenText string) []string {
 
 func newTerminalSession(in io.WriteCloser, out io.Reader, cmd *exec.Cmd, cols, rows int, recorder *recordingWriter, redactor *secretRedactor, keepRaw bool, extraClosers []io.Closer, options ...terminalSessionOption) *terminalSession {
 	ts := &terminalSession{
-		in:           in,
-		out:          out,
-		cmd:          cmd,
-		start:        time.Now(),
-		cols:         cols,
-		rows:         rows,
-		vt:           vt10x.New(vt10x.WithSize(cols, rows)),
-		lastOut:      time.Now(),
-		keepRaw:      keepRaw,
-		recorder:     recorder,
-		redactor:     redactor,
-		extraClosers: extraClosers,
-		done:         make(chan struct{}),
-		processDone:  make(chan struct{}),
-		teardownDone: make(chan struct{}),
+		in:             in,
+		out:            out,
+		cmd:            cmd,
+		start:          time.Now(),
+		cols:           cols,
+		rows:           rows,
+		vt:             vt10x.New(vt10x.WithSize(cols, rows)),
+		lastOut:        time.Now(),
+		keepRaw:        keepRaw,
+		recorder:       recorder,
+		redactor:       redactor,
+		extraClosers:   extraClosers,
+		done:           make(chan struct{}),
+		processDone:    make(chan struct{}),
+		teardownDone:   make(chan struct{}),
+		emitSessionEnd: true,
 	}
 	for _, option := range options {
 		option(ts)
@@ -597,6 +607,19 @@ func (ts *terminalSession) finalize() error {
 		if ts.recorder != nil {
 			_ = ts.recorder.flushInput()
 			_ = ts.recorder.flushOutput()
+			if ts.emitSessionEnd {
+				exitCode, processErr := ts.getProcessResult()
+				status := "success"
+				if processErr != nil || exitCode != 0 {
+					status = "failed"
+				}
+				if closeStatus, _ := ts.getCloseDisposition(); closeStatus != "" {
+					status = closeStatus
+				}
+				if err := ts.recorder.event(time.Since(ts.start).Seconds(), "m", fmt.Sprintf("SESSION_END status=%s exit_code=%d", status, exitCode)); err != nil {
+					errs = append(errs, fmt.Sprintf("record session end: %v", err))
+				}
+			}
 			_ = ts.recorder.flush()
 			if err := ts.recorder.getError(); err != nil {
 				errs = append(errs, fmt.Sprintf("recording error: %v", err))
@@ -633,6 +656,22 @@ func (ts *terminalSession) teardown() {
 }
 
 func (ts *terminalSession) close() error {
+	return ts.closeWithStatus("", "")
+}
+
+func (ts *terminalSession) closeWithReason(reason string) error {
+	return ts.closeWithStatus("aborted", reason)
+}
+
+func (ts *terminalSession) closeWithStatus(status, reason string) error {
+	if reason != "" {
+		ts.processMu.Lock()
+		if ts.closeReason == "" {
+			ts.closeStatus = status
+			ts.closeReason = reason
+		}
+		ts.processMu.Unlock()
+	}
 	ts.writeMu.Lock()
 	if ts.closed {
 		ts.writeMu.Unlock()
@@ -649,6 +688,17 @@ func (ts *terminalSession) close() error {
 	<-ts.processDone
 	ts.teardown()
 	return ts.finalizeErr
+}
+
+func (ts *terminalSession) getCloseReason() string {
+	_, reason := ts.getCloseDisposition()
+	return reason
+}
+
+func (ts *terminalSession) getCloseDisposition() (status, reason string) {
+	ts.processMu.Lock()
+	defer ts.processMu.Unlock()
+	return ts.closeStatus, ts.closeReason
 }
 
 func (ts *terminalSession) getProcessResult() (code int, err error) {
@@ -703,15 +753,12 @@ func (ts *terminalSession) resize(cols, rows int) error {
 }
 
 func (ts *terminalSession) waitChildExit(ctx context.Context) (processExitErr error, finalizeErr error) {
-	for {
-		if err := ctx.Err(); err != nil {
-			return err, nil
-		}
-		exited, _, _ := ts.getExitState()
-		if exited {
-			return ts.exitErr, ts.finalizeErr
-		}
-		time.Sleep(50 * time.Millisecond)
+	select {
+	case <-ctx.Done():
+		return ctx.Err(), nil
+	case <-ts.teardownDone:
+		_, err := ts.getProcessResult()
+		return err, ts.finalizeErr
 	}
 }
 

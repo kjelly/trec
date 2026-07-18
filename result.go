@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -17,15 +18,52 @@ import (
 type sessionResult struct {
 	SessionID       string            `json:"session_id,omitempty"`
 	StartedAt       string            `json:"started_at,omitempty"`
+	UpdatedAt       string            `json:"updated_at,omitempty"`
 	Status          string            `json:"status"`
 	ExitCode        int               `json:"exit_code"`
 	Error           string            `json:"error,omitempty"`
 	DurationSeconds float64           `json:"duration_seconds"`
 	FinalScreen     []string          `json:"final_screen,omitempty"`
 	Snapshots       []sessionSnapshot `json:"snapshots,omitempty"`
+	Script          *sessionScript    `json:"script,omitempty"`
+	LastStep        *sessionStep      `json:"last_step,omitempty"`
 	Build           buildMetadata     `json:"build"`
 	Scan            scanSummary       `json:"scan"`
 	Cast            castIntegrity     `json:"cast"`
+}
+
+type sessionScript struct {
+	SHA256          string   `json:"sha256"`
+	StepCount       int      `json:"step_count"`
+	NormalizedSteps []string `json:"normalized_steps,omitempty"`
+}
+
+type sessionStep struct {
+	Line      int    `json:"line"`
+	Operation string `json:"operation"`
+	Phase     string `json:"phase"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+func buildSessionScript(path string, steps []*driveStep, redactor *secretRedactor) (*sessionScript, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read script provenance: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	normalized := make([]string, 0, len(steps))
+	for _, step := range steps {
+		description := safeStepDescription(step)
+		if redactor != nil {
+			description = redactor.RedactString(description)
+		}
+		normalized = append(normalized, description)
+	}
+	return &sessionScript{
+		SHA256:          hex.EncodeToString(sum[:]),
+		StepCount:       len(steps),
+		NormalizedSteps: normalized,
+	}, nil
 }
 
 type sessionSnapshot struct {
@@ -46,6 +84,7 @@ type castIntegrity struct {
 	ByteSize      int64         `json:"byte_size"`
 	EventCount    int           `json:"event_count"`
 	LastEventTime float64       `json:"last_event_time"`
+	SessionEnd    bool          `json:"session_end"`
 	Producer      string        `json:"producer"`
 	Version       string        `json:"version"`
 	Build         buildMetadata `json:"build"`
@@ -88,15 +127,17 @@ func newPendingSessionResult(started time.Time) sessionResult {
 	return sessionResult{
 		SessionID: fmt.Sprintf("%d-%d", started.UnixNano(), os.Getpid()),
 		StartedAt: started.UTC().Format(time.RFC3339Nano),
+		UpdatedAt: started.UTC().Format(time.RFC3339Nano),
 		Status:    "in_progress",
 		ExitCode:  -1,
 		Build:     build,
 		Scan:      scanSummary{Complete: false, SafeToShare: false},
-		Cast:      castIntegrity{SchemaVersion: 1, Complete: false, Algorithm: "sha256", Producer: "trec", Version: build.DisplayVersion(), Build: build},
+		Cast:      castIntegrity{SchemaVersion: 2, Complete: false, Algorithm: "sha256", Producer: "trec", Version: build.DisplayVersion(), Build: build},
 	}
 }
 
 func writePendingSessionResult(castPath string, result sessionResult) error {
+	result.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode pending result: %w", err)
@@ -110,6 +151,7 @@ func writeSessionResult(castPath string, result sessionResult) error {
 		return fmt.Errorf("inspect cast: %w", err)
 	}
 	result.Build = currentBuildMetadata()
+	result.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	result.Scan = summarizeScan(castPath)
 	result.Cast = integrity
 	b, err := json.MarshalIndent(result, "", "  ")
@@ -169,6 +211,7 @@ func inspectCastIntegrity(path string) (castIntegrity, error) {
 
 	eventCount := 0
 	lastTime := 0.0
+	sessionEnd := false
 	lineNo := 1
 	for scanner.Scan() {
 		lineNo++
@@ -184,6 +227,9 @@ func inspectCastIntegrity(path string) (castIntegrity, error) {
 			return castIntegrity{}, fmt.Errorf("invalid event at line %d: timestamp %.9f is earlier than %.9f", lineNo, event.sec, lastTime)
 		}
 		lastTime = event.sec
+		if event.typ == "m" && strings.HasPrefix(event.data, "SESSION_END ") {
+			sessionEnd = true
+		}
 		eventCount++
 	}
 	if err := scanner.Err(); err != nil {
@@ -195,14 +241,19 @@ func inspectCastIntegrity(path string) (castIntegrity, error) {
 	if version == "" {
 		version = build.DisplayVersion()
 	}
+	schemaVersion := 1
+	if sessionEnd {
+		schemaVersion = 2
+	}
 	return castIntegrity{
-		SchemaVersion: 1,
+		SchemaVersion: schemaVersion,
 		Complete:      true,
 		Algorithm:     "sha256",
 		SHA256:        hex.EncodeToString(hash.Sum(nil)),
 		ByteSize:      info.Size(),
 		EventCount:    eventCount,
 		LastEventTime: lastTime,
+		SessionEnd:    sessionEnd,
 		Producer:      "trec",
 		Version:       version,
 		Build:         build,

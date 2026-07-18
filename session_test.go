@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -123,9 +124,8 @@ func TestSendTextFilePartialWrite(t *testing.T) {
 	redactor := &secretRedactor{}
 	recorder := newRecordingWriter(bufio.NewWriter(castBuf), &mu, redactor)
 
-	dummyOut, _ := os.Open(os.DevNull)
-	defer dummyOut.Close()
-	ts := newTerminalSession(in, dummyOut, nil, 80, 24, recorder, redactor, false, nil)
+	dummyOutR, dummyOutW := io.Pipe()
+	ts := newTerminalSession(in, dummyOutR, nil, 80, 24, recorder, redactor, false, nil)
 
 	// Simulating TEXT_FILE which passes value, "file"
 	n, err := ts.sendText("abcdef", "file", 0)
@@ -134,6 +134,12 @@ func TestSendTextFilePartialWrite(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("expected 2 bytes written, got %d", n)
+	}
+	if err := dummyOutW.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ts.waitChildExit(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	recorder.flush()
 

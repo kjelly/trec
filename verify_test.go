@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeVerifiableCast(t *testing.T, dir, name, output string) string {
@@ -75,4 +76,29 @@ func TestVerifyCastRejectsMissingStaleAndUnsafeResults(t *testing.T) {
 			t.Fatalf("verification = %#v", result)
 		}
 	})
+}
+
+func TestVerifyDiagnosesUnfinishedStepWithoutPendingHashNoise(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "unfinished.cast")
+	if err := writeCastFile(path, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{
+		{sec: 0.1, typ: "m", data: "STEP_START line 46: WAIT_CHILD_EXIT@3600000"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending := newPendingSessionResult(time.Now())
+	pending.LastStep = &sessionStep{Line: 46, Operation: "WAIT_CHILD_EXIT@3600000", Phase: "started"}
+	if err := writePendingSessionResult(path, pending); err != nil {
+		t.Fatal(err)
+	}
+	result := verifyCast(path)
+	issues := strings.Join(result.Issues, "\n")
+	if result.Valid || result.UnfinishedStep == "" || !strings.Contains(issues, "unfinished drive step") {
+		t.Fatalf("verification = %#v", result)
+	}
+	for _, noisy := range []string{"sha256 does not match", "byte size", "event count"} {
+		if strings.Contains(issues, noisy) {
+			t.Fatalf("pending verification contains derivative noise %q:\n%s", noisy, issues)
+		}
+	}
 }

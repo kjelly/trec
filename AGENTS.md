@@ -40,6 +40,8 @@ Use **Go modules** (`go 1.25.5`):
 - PTY output is mirrored to stdout and recorded; stdin is forwarded to the PTY and recorded as `"i"` events.
 - `drive` sets `TERM=xterm-256color` and `CI=1` for deterministic TUI rendering under a non-interactive PTY.
 - `record`, `drive`, and MCP `terminal_start` recordings create an `in_progress` `<cast>.result.json`, then replace it with final integrity metadata only after the cast is finalized. Recording starts refuse to overwrite an existing cast or result unless `--force` is explicit. Use the `verify` subcommand or MCP `cast_verify` to gate status, integrity, and secret-scan safety together.
+- Completed recordings append a `SESSION_END` marker. Drive results retain the script SHA-256, redacted normalized steps, last-step progress, and update timestamp; `verify` reports unmatched step markers.
+- Agent-authored scripts should pass `trec drive lint --strict <script>` and use `ENTER_IF`/`CHOOSE` for screen-conditioned actions. Inline comments begin with a whitespace-delimited `#`; use JSON steps for literal text containing ` #`.
 - Development builds expose their VCS revision and dirty state in `version`, cast headers, and result metadata; do not treat a bare `dev` string as sufficient provenance.
 - `html` and `serve` refuse casts with secret-scan findings by default; bypassing this requires the explicit `--allow-scan-findings` flag after review.
 - `.gitignore` ignores `trec`, `terminal-record`, and `*.cast`.

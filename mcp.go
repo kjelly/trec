@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -109,9 +110,54 @@ func (s *mcpServer) handleCallTool(ctx context.Context, name string, req mcp.Cal
 
 func runMCP() {
 	s := &mcpServer{sessions: map[string]*terminalSession{}}
+	defer func() {
+		if err := s.closeAllSessions("mcp stdio transport closed"); err != nil {
+			fmt.Fprintln(os.Stderr, "trec mcp: close sessions:", err)
+		}
+	}()
 	server := newMCPProtocolServer(s)
 	if err := mcpserver.ServeStdio(server); err != nil {
 		fmt.Fprintln(os.Stderr, "trec mcp:", err)
+	}
+}
+
+func runCommandWithGracefulTimeout(c *exec.Cmd, timeout time.Duration) (err error, timedOut bool, forcedKill bool) {
+	if c.SysProcAttr == nil {
+		c.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	c.SysProcAttr.Setpgid = true
+	if err := c.Start(); err != nil {
+		return err, false, false
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Wait()
+	}()
+	if timeout <= 0 {
+		return <-done, false, false
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err, false, false
+	case <-timer.C:
+		timedOut = true
+	}
+
+	if err := syscall.Kill(-c.Process.Pid, syscall.SIGTERM); err != nil {
+		_ = c.Process.Signal(syscall.SIGTERM)
+	}
+	grace := time.NewTimer(2 * time.Second)
+	defer grace.Stop()
+	select {
+	case err := <-done:
+		return err, true, false
+	case <-grace.C:
+		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+		_ = c.Process.Kill()
+		return <-done, true, true
 	}
 }
 
@@ -208,13 +254,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 		var out, er bytes.Buffer
 		c.Stdout = &out
 		c.Stderr = &er
-		if to > 0 {
-			timer := time.AfterFunc(time.Duration(to)*time.Second, func() { _ = c.Process.Kill() })
-			e = c.Run()
-			timer.Stop()
-		} else {
-			e = c.Run()
-		}
+		e, timedOut, forcedKill := runCommandWithGracefulTimeout(c, time.Duration(to)*time.Second)
 		code := 0
 		if e != nil {
 			code = 1
@@ -222,7 +262,13 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 				code = x.ExitCode()
 			}
 		}
-		return map[string]any{"stdout": out.String(), "stderr": er.String(), "exit_code": code}, nil
+		return map[string]any{
+			"stdout":      out.String(),
+			"stderr":      er.String(),
+			"exit_code":   code,
+			"timed_out":   timedOut,
+			"forced_kill": forcedKill,
+		}, nil
 	case "terminal_start":
 		a, _, _, dir, e := commandFrom(raw)
 		if e != nil {
@@ -333,6 +379,10 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 					if processErr != nil {
 						message = processErr.Error()
 					}
+				}
+				if reason := ts.getCloseReason(); reason != "" {
+					status = "aborted"
+					message = reason
 				}
 				lines, _, _, _, _ := ts.redactedScreenSnapshot()
 				return writeSessionResult(recordPath, sessionResult{
@@ -529,7 +579,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 		if e != nil {
 			return nil, e
 		}
-		errClose := ss.close()
+		errClose := ss.closeWithReason("terminal_close requested")
 		s.mu.Lock()
 		delete(s.sessions, a.SessionID)
 		s.mu.Unlock()
@@ -548,6 +598,28 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 	}
 	return nil, fmt.Errorf("unknown tool %q", name)
 }
+
+func (s *mcpServer) closeAllSessions(reason string) error {
+	s.mu.Lock()
+	sessions := make([]*terminalSession, 0, len(s.sessions))
+	for id, session := range s.sessions {
+		sessions = append(sessions, session)
+		delete(s.sessions, id)
+	}
+	s.mu.Unlock()
+
+	var closeErrors []string
+	for _, session := range sessions {
+		if err := session.closeWithReason(reason); err != nil {
+			closeErrors = append(closeErrors, err.Error())
+		}
+	}
+	if len(closeErrors) > 0 {
+		return fmt.Errorf("%s", strings.Join(closeErrors, "; "))
+	}
+	return nil
+}
+
 func (s *mcpServer) session(id string) (*terminalSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

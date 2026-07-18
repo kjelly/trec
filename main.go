@@ -296,8 +296,34 @@ func runRecord(cmd *cobra.Command, args []string) {
 		}
 	}()
 
+	// Give the child a chance to exit cleanly when trec itself is terminated.
+	// This lets us flush the cast and write an aborted result instead of
+	// leaving a permanent in_progress sidecar.
+	terminationSignals := make(chan os.Signal, 1)
+	signal.Notify(terminationSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	processDone := make(chan struct{})
+	terminationDone := make(chan struct{})
+	var terminationSignal os.Signal
+	go func() {
+		defer close(terminationDone)
+		select {
+		case sig := <-terminationSignals:
+			terminationSignal = sig
+			_ = processCmd.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-processDone:
+			case <-time.After(2 * time.Second):
+				_ = processCmd.Process.Kill()
+			}
+		case <-processDone:
+		}
+	}()
+
 	// Block until the recorded program exits.
 	processErr := processCmd.Wait()
+	close(processDone)
+	signal.Stop(terminationSignals)
+	<-terminationDone
 	ptmx.Close()
 	wg.Wait()
 	inputMu.Lock()
@@ -307,8 +333,26 @@ func runRecord(cmd *cobra.Command, args []string) {
 	close(sigWinch)
 	<-winchDone
 
+	exitCode := 0
+	if processCmd.ProcessState != nil {
+		exitCode = processCmd.ProcessState.ExitCode()
+	}
+	status := "success"
+	message := ""
+	if processErr != nil {
+		status = "failed"
+		message = processErr.Error()
+	}
+	if terminationSignal != nil {
+		status = "aborted"
+		message = "trec interrupted by " + terminationSignal.String()
+	}
+
 	var recErr error
 	if err := recorder.flushOutput(); err != nil {
+		recErr = err
+	}
+	if err := recorder.event(time.Since(startTime).Seconds(), "m", fmt.Sprintf("SESSION_END status=%s exit_code=%d", status, exitCode)); err != nil && recErr == nil {
 		recErr = err
 	}
 	if err := recorder.flush(); err != nil && recErr == nil {
@@ -319,16 +363,6 @@ func runRecord(cmd *cobra.Command, args []string) {
 	}
 	if err := f.Sync(); err != nil && recErr == nil {
 		recErr = fmt.Errorf("sync cast file: %w", err)
-	}
-	exitCode := 0
-	if processCmd.ProcessState != nil {
-		exitCode = processCmd.ProcessState.ExitCode()
-	}
-	status := "success"
-	message := ""
-	if processErr != nil {
-		status = "failed"
-		message = processErr.Error()
 	}
 	if recErr != nil {
 		status = "recording_error"

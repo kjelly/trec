@@ -371,8 +371,53 @@ func TestMCPRecordingResultTransitionsFromInProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := readResult()
-	if result.Status != "failed" || result.ExitCode == 0 || !result.Cast.Complete || !result.Scan.Complete {
+	if result.Status != "aborted" || result.ExitCode == 0 || !result.Cast.Complete || !result.Cast.SessionEnd || !result.Scan.Complete {
 		t.Fatalf("final result = %#v", result)
+	}
+}
+
+func TestMCPRunTimeoutIsExplicitAndGraceful(t *testing.T) {
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+	request, _ := json.Marshal(map[string]any{
+		"command":         []string{"sh", "-c", `trap 'printf terminated; exit 42' TERM; while :; do sleep 1; done`},
+		"timeout_seconds": 1,
+	})
+	value, err := s.tool(context.Background(), "run", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := value.(map[string]any)
+	if result["timed_out"] != true || result["forced_kill"] != false || result["exit_code"] != 42 {
+		t.Fatalf("timeout result = %#v", result)
+	}
+	if !strings.Contains(result["stdout"].(string), "terminated") {
+		t.Fatalf("timeout stdout = %#v", result)
+	}
+}
+
+func TestMCPCloseAllSessionsFinalizesAbortedRecording(t *testing.T) {
+	s := &mcpServer{sessions: map[string]*terminalSession{}}
+	cast := filepath.Join(t.TempDir(), "shutdown.cast")
+	request, _ := json.Marshal(map[string]any{
+		"command":     []string{"sleep", "10"},
+		"record_file": cast,
+	})
+	if _, err := s.tool(context.Background(), "terminal_start", request); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.closeAllSessions("test transport closed"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resultPath(cast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result sessionResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "aborted" || result.Error != "test transport closed" || !result.Cast.SessionEnd {
+		t.Fatalf("shutdown result = %#v", result)
 	}
 }
 
