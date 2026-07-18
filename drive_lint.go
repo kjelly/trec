@@ -25,7 +25,7 @@ type driveLintReport struct {
 }
 
 func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
-	var findings []driveLintFinding
+	findings := make([]driveLintFinding, 0)
 	add := func(level string, step *driveStep, message string) {
 		findings = append(findings, driveLintFinding{Level: level, Line: step.line, Message: message})
 	}
@@ -33,6 +33,7 @@ func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
 	screenGuarded := false
 	hasWaitChildExit := false
 	hasAssertExit := false
+	hasEndSession := false
 	for i, step := range steps {
 		switch step.kind {
 		case "expect", "expect_eventually", "expect_regex", "expect_screen_regex", "assert":
@@ -43,15 +44,21 @@ func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
 			for next < len(steps) && (steps[next].kind == "wait" || steps[next].kind == "snapshot") {
 				next++
 			}
-			if next >= len(steps) || steps[next].kind != "enter" {
-				add("error", step, "SELECT only moves the pointer; follow it with ENTER or use CHOOSE <label>")
+			if next >= len(steps) || (steps[next].kind != "enter" && steps[next].kind != "space") {
+				add("error", step, "SELECT only moves the pointer; follow it with ENTER/SPACE or use CHOOSE/TOGGLE <label>")
 			}
 		case "enter":
 			if !screenGuarded {
 				add("error", step, "ENTER is not guarded by EXPECT, ASSERT, or SELECT; use ENTER_IF <screen text> when possible")
 			}
 			screenGuarded = false
-		case "enter_if", "choose":
+		case "text_and_enter", "text_env_and_enter", "text_file_and_enter",
+			"replace_text_and_enter", "replace_text_env_and_enter", "replace_text_file_and_enter":
+			if !screenGuarded {
+				add("error", step, strings.ToUpper(step.kind)+" is not guarded by EXPECT or ASSERT")
+			}
+			screenGuarded = false
+		case "enter_if", "choose", "toggle":
 			screenGuarded = false
 		case "down", "up":
 			level := "warning"
@@ -66,6 +73,22 @@ func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
 			}
 		case "assert_exit":
 			hasAssertExit = true
+		case "quit", "end_session":
+			hasEndSession = true
+		}
+
+		if isUnsubmittedTextStep(step.kind) {
+			next := i + 1
+			for next < len(steps) && (steps[next].kind == "wait" || steps[next].kind == "snapshot" || steps[next].kind == "expect_quiet") {
+				next++
+			}
+			if next < len(steps) && expectsScreenTransition(steps[next].kind) {
+				level := "warning"
+				if strict {
+					level = "error"
+				}
+				add(level, step, strings.ToUpper(step.kind)+" is followed by a screen transition without ENTER; use "+strings.ToUpper(step.kind)+"_AND_ENTER or add ENTER_IF")
+			}
 		}
 	}
 
@@ -76,10 +99,38 @@ func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
 		}
 		add("error", lineStep, "WAIT_CHILD_EXIT and ASSERT_EXIT must be used as a pair")
 	}
+	if len(steps) > 0 && !hasWaitChildExit && !hasAssertExit && !hasEndSession {
+		level := "warning"
+		if strict {
+			level = "error"
+		}
+		add(level, steps[len(steps)-1], "script has no explicit terminal disposition; finish with WAIT_CHILD_EXIT/ASSERT_EXIT or END_SESSION")
+	}
 	return findings
 }
 
+func isUnsubmittedTextStep(kind string) bool {
+	switch kind {
+	case "text", "text_env", "text_file", "replace_text", "replace_text_env", "replace_text_file":
+		return true
+	default:
+		return false
+	}
+}
+
+func expectsScreenTransition(kind string) bool {
+	switch kind {
+	case "expect", "expect_eventually", "expect_regex", "expect_screen_regex", "select", "choose", "toggle":
+		return true
+	default:
+		return false
+	}
+}
+
 func makeDriveLintReport(path string, findings []driveLintFinding) driveLintReport {
+	if findings == nil {
+		findings = make([]driveLintFinding, 0)
+	}
 	report := driveLintReport{Path: path, Valid: true, Findings: findings}
 	for _, finding := range findings {
 		if finding.Level == "error" {

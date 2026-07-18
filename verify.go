@@ -130,6 +130,22 @@ func verifyCast(path string) castVerification {
 				if result.Cast.SchemaVersion >= 2 && !observed.SessionEnd {
 					verification.Issues = append(verification.Issues, "cast is missing the required SESSION_END marker")
 				}
+				if observed.SessionEnd {
+					if observed.SessionEndCount != 1 {
+						verification.Issues = append(verification.Issues, fmt.Sprintf("cast has %d SESSION_END markers; exactly one is required", observed.SessionEndCount))
+					}
+					if !observed.SessionEndFinal {
+						verification.Issues = append(verification.Issues, "SESSION_END is not the final cast event")
+					}
+					if observed.SessionEndStatus != result.Status {
+						verification.Issues = append(verification.Issues, fmt.Sprintf("SESSION_END status %q does not match result status %q", observed.SessionEndStatus, result.Status))
+					}
+					if observed.SessionEndExitCode == nil {
+						verification.Issues = append(verification.Issues, "SESSION_END exit_code is missing")
+					} else if *observed.SessionEndExitCode != result.ExitCode {
+						verification.Issues = append(verification.Issues, fmt.Sprintf("SESSION_END exit_code %d does not match result exit_code %d", *observed.SessionEndExitCode, result.ExitCode))
+					}
+				}
 			}
 		}
 	}

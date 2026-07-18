@@ -338,6 +338,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 				return nil, fmt.Errorf("write header: %w", err)
 			}
 			pending = newPendingSessionResult(time.Now())
+			pending.Mode = "mcp_terminal"
 			if err := writePendingSessionResult(mcpOpts.RecordFile, pending); err != nil {
 				for _, cl := range extraClosers {
 					cl.Close()
@@ -359,9 +360,14 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 				_ = writeSessionResult(mcpOpts.RecordFile, sessionResult{
 					SessionID: pending.SessionID,
 					StartedAt: pending.StartedAt,
+					Mode:      pending.Mode,
 					Status:    "failed",
 					ExitCode:  -1,
 					Error:     fmt.Sprintf("start command: %v", e),
+					Termination: &sessionTermination{
+						Kind:   "start_failure",
+						Reason: e.Error(),
+					},
 				})
 			}
 			return nil, e
@@ -374,6 +380,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 				exitCode, processErr := ts.getProcessResult()
 				status := "success"
 				message := ""
+				termination := &sessionTermination{Kind: "child_exit", Signal: processSignal(processErr)}
 				if processErr != nil || exitCode != 0 {
 					status = "failed"
 					if processErr != nil {
@@ -383,16 +390,23 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 				if reason := ts.getCloseReason(); reason != "" {
 					status = "aborted"
 					message = reason
+					termination.Kind = "operator_terminated"
+					if strings.Contains(reason, "transport closed") {
+						termination.Kind = "transport_close"
+					}
+					termination.Reason = reason
 				}
 				lines, _, _, _, _ := ts.redactedScreenSnapshot()
 				return writeSessionResult(recordPath, sessionResult{
 					SessionID:       pending.SessionID,
 					StartedAt:       pending.StartedAt,
+					Mode:            pending.Mode,
 					Status:          status,
 					ExitCode:        exitCode,
 					Error:           message,
 					DurationSeconds: time.Since(ts.start).Seconds(),
 					FinalScreen:     lines,
+					Termination:     termination,
 				})
 			}))
 		}

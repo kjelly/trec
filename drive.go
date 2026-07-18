@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,7 +26,8 @@ import (
 type driveStep struct {
 	kind string // text, enter, down, up, space, tab, ctrlc, backspace, wait,
 	// text_env, text_file, replace_text, replace_text_env, replace_text_file,
-	// expect, expect_quiet, assert, select, snapshot, wait_child_exit, assert_exit, quit
+	// *_and_enter, expect, expect_quiet, assert, select, toggle, snapshot,
+	// wait_child_exit, assert_exit, end_session, quit
 	text string
 	n    int
 	hasN bool
@@ -49,23 +51,23 @@ type jsonDriveStep struct {
 
 func validateStep(st *driveStep) error {
 	switch st.kind {
-	case "text", "replace_text":
+	case "text", "replace_text", "text_and_enter", "replace_text_and_enter":
 		// TEXT needs no validation
-	case "text_env", "replace_text_env":
+	case "text_env", "replace_text_env", "text_env_and_enter", "replace_text_env_and_enter":
 		if !validEnvName(st.text) {
 			return fmt.Errorf("line %d: %s needs an environment variable name", st.line, strings.ToUpper(st.kind))
 		}
-	case "text_file", "replace_text_file":
+	case "text_file", "replace_text_file", "text_file_and_enter", "replace_text_file_and_enter":
 		if strings.TrimSpace(st.text) == "" {
 			return fmt.Errorf("line %d: %s needs a path", st.line, strings.ToUpper(st.kind))
 		}
-	case "enter", "space", "tab", "escape", "ctrlc", "ctrlu", "ctrlw", "quit":
+	case "enter", "space", "tab", "escape", "ctrlc", "ctrlu", "ctrlw", "quit", "end_session":
 		if st.text != "" {
 			return fmt.Errorf("line %d: %s takes no arguments", st.line, strings.ToUpper(st.kind))
 		}
 	case "snapshot":
 		// An optional snapshot label is allowed.
-	case "enter_if", "choose":
+	case "enter_if", "choose", "toggle":
 		if st.text == "" {
 			return fmt.Errorf("line %d: %s needs screen text", st.line, strings.ToUpper(st.kind))
 		}
@@ -265,36 +267,64 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	switch op {
 	case "TEXT":
 		st.kind, st.text = "text", arg
+	case "TEXT_AND_ENTER":
+		st.kind, st.text = "text_and_enter", arg
 	case "TEXT_ENV":
 		name := strings.TrimSpace(arg)
 		if !validEnvName(name) {
 			return nil, fmt.Errorf("line %d: TEXT_ENV needs an environment variable name", lineNo)
 		}
 		st.kind, st.text = "text_env", name
+	case "TEXT_ENV_AND_ENTER":
+		name := strings.TrimSpace(arg)
+		if !validEnvName(name) {
+			return nil, fmt.Errorf("line %d: TEXT_ENV_AND_ENTER needs an environment variable name", lineNo)
+		}
+		st.kind, st.text = "text_env_and_enter", name
 	case "TEXT_FILE":
 		if strings.TrimSpace(arg) == "" {
 			return nil, fmt.Errorf("line %d: TEXT_FILE needs a path", lineNo)
 		}
 		st.kind, st.text = "text_file", arg
+	case "TEXT_FILE_AND_ENTER":
+		if strings.TrimSpace(arg) == "" {
+			return nil, fmt.Errorf("line %d: TEXT_FILE_AND_ENTER needs a path", lineNo)
+		}
+		st.kind, st.text = "text_file_and_enter", arg
 	case "REPLACE_TEXT":
 		st.kind, st.text = "replace_text", arg
+	case "REPLACE_TEXT_AND_ENTER":
+		st.kind, st.text = "replace_text_and_enter", arg
 	case "REPLACE_TEXT_ENV":
 		name := strings.TrimSpace(arg)
 		if !validEnvName(name) {
 			return nil, fmt.Errorf("line %d: REPLACE_TEXT_ENV needs an environment variable name", lineNo)
 		}
 		st.kind, st.text = "replace_text_env", name
+	case "REPLACE_TEXT_ENV_AND_ENTER":
+		name := strings.TrimSpace(arg)
+		if !validEnvName(name) {
+			return nil, fmt.Errorf("line %d: REPLACE_TEXT_ENV_AND_ENTER needs an environment variable name", lineNo)
+		}
+		st.kind, st.text = "replace_text_env_and_enter", name
 	case "REPLACE_TEXT_FILE":
 		if strings.TrimSpace(arg) == "" {
 			return nil, fmt.Errorf("line %d: REPLACE_TEXT_FILE needs a path", lineNo)
 		}
 		st.kind, st.text = "replace_text_file", arg
+	case "REPLACE_TEXT_FILE_AND_ENTER":
+		if strings.TrimSpace(arg) == "" {
+			return nil, fmt.Errorf("line %d: REPLACE_TEXT_FILE_AND_ENTER needs a path", lineNo)
+		}
+		st.kind, st.text = "replace_text_file_and_enter", arg
 	case "ENTER":
 		st.kind, st.text = "enter", arg
 	case "ENTER_IF":
 		st.kind, st.text = "enter_if", arg
 	case "CHOOSE":
 		st.kind, st.text = "choose", arg
+	case "TOGGLE":
+		st.kind, st.text = "toggle", arg
 	case "DOWN":
 		n, err := parsePositiveCount(arg, 1)
 		if err != nil {
@@ -393,6 +423,8 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		st.kind, st.n, st.hasN = "assert_exit", n, true
 	case "QUIT":
 		st.kind, st.text = "quit", arg
+	case "END_SESSION":
+		st.kind, st.text = "end_session", arg
 	default:
 		return nil, fmt.Errorf("line %d: unknown op %q", lineNo, op)
 	}
@@ -440,11 +472,11 @@ func loadDriveScript(path string, redactor *secretRedactor) ([]*driveStep, error
 			return nil, err
 		}
 		if st != nil {
-			if (st.kind == "text_env" || st.kind == "replace_text_env") && redactor != nil {
+			if (st.kind == "text_env" || st.kind == "replace_text_env" || st.kind == "text_env_and_enter" || st.kind == "replace_text_env_and_enter") && redactor != nil {
 				if err := redactor.addEnv(st.text); err != nil {
 					return nil, fmt.Errorf("line %d: %v", st.line, err)
 				}
-			} else if (st.kind == "text_file" || st.kind == "replace_text_file") && redactor != nil {
+			} else if (st.kind == "text_file" || st.kind == "replace_text_file" || st.kind == "text_file_and_enter" || st.kind == "replace_text_file_and_enter") && redactor != nil {
 				if _, err := redactor.addFile(st.text); err != nil {
 					return nil, fmt.Errorf("line %d: %v", st.line, err)
 				}
@@ -524,12 +556,20 @@ func safeStepDescription(st *driveStep) string {
 	switch st.kind {
 	case "text":
 		return fmt.Sprintf("TEXT <literal %d bytes>", len(st.text))
+	case "text_and_enter":
+		return fmt.Sprintf("TEXT_AND_ENTER <literal %d bytes>", len(st.text))
 	case "replace_text":
 		return fmt.Sprintf("REPLACE_TEXT <literal %d bytes>", len(st.text))
+	case "replace_text_and_enter":
+		return fmt.Sprintf("REPLACE_TEXT_AND_ENTER <literal %d bytes>", len(st.text))
 	case "text_file":
 		return "TEXT_FILE <file>"
+	case "text_file_and_enter":
+		return "TEXT_FILE_AND_ENTER <file>"
 	case "replace_text_file":
 		return "REPLACE_TEXT_FILE <file>"
+	case "replace_text_file_and_enter":
+		return "REPLACE_TEXT_FILE_AND_ENTER <file>"
 	default:
 		return st.raw
 	}
@@ -594,13 +634,72 @@ func (ds *driveSession) dumpScreen(w io.Writer) {
 	}
 }
 
+func (ds *driveSession) writeTextStep(st *driveStep) (int, error) {
+	kind, submit := strings.CutSuffix(st.kind, "_and_enter")
+	var (
+		written int
+		err     error
+	)
+	switch kind {
+	case "text":
+		if ds.strictAgent && ds.secretLikeScreen() {
+			return 0, fmt.Errorf("--strict-agent refuses literal TEXT on a secret-like screen; use TEXT_ENV or TEXT_FILE")
+		}
+		written, err = ds.ts.sendText(st.text, "", ds.keyDelay)
+	case "text_env":
+		if err = ds.redactor.addEnv(st.text); err != nil {
+			return 0, err
+		}
+		value, _ := os.LookupEnv(st.text)
+		written, err = ds.ts.sendText(value, st.text, ds.keyDelay)
+	case "text_file":
+		var value string
+		value, err = ds.redactor.addFile(st.text)
+		if err != nil {
+			return 0, err
+		}
+		written, err = ds.ts.sendText(value, "file", ds.keyDelay)
+	case "replace_text":
+		if ds.strictAgent && ds.secretLikeScreen() {
+			return 0, fmt.Errorf("--strict-agent refuses literal REPLACE_TEXT on a secret-like screen; use REPLACE_TEXT_ENV or REPLACE_TEXT_FILE")
+		}
+		written, err = ds.ts.replaceText(st.text, "", ds.keyDelay)
+	case "replace_text_env":
+		if err = ds.redactor.addEnv(st.text); err != nil {
+			return 0, err
+		}
+		value, _ := os.LookupEnv(st.text)
+		written, err = ds.ts.replaceText(value, st.text, ds.keyDelay)
+	case "replace_text_file":
+		var value string
+		value, err = ds.redactor.addFile(st.text)
+		if err != nil {
+			return 0, err
+		}
+		written, err = ds.ts.replaceText(value, "file", ds.keyDelay)
+	default:
+		return 0, fmt.Errorf("unsupported text operation %q", st.kind)
+	}
+	if err != nil || !submit {
+		return written, err
+	}
+	n, err := ds.ts.sendBytes([]byte("\r"), "")
+	written += n
+	time.Sleep(ds.settleDelay)
+	return written, err
+}
+
 func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("drive interrupted: %w", err)
 	}
 	isMutating := false
 	switch st.kind {
-	case "text", "text_env", "text_file", "replace_text", "replace_text_env", "replace_text_file", "enter", "enter_if", "choose", "down", "up", "left", "right", "space", "tab", "escape", "ctrlc", "ctrlu", "ctrlw", "backspace", "select":
+	case "text", "text_env", "text_file", "replace_text", "replace_text_env", "replace_text_file",
+		"text_and_enter", "text_env_and_enter", "text_file_and_enter",
+		"replace_text_and_enter", "replace_text_env_and_enter", "replace_text_file_and_enter",
+		"enter", "enter_if", "choose", "toggle", "down", "up", "left", "right",
+		"space", "tab", "escape", "ctrlc", "ctrlu", "ctrlw", "backspace", "select":
 		isMutating = true
 	}
 	if isMutating {
@@ -612,42 +711,10 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 	var err error
 
 	switch st.kind {
-	case "text":
-		if ds.strictAgent && ds.secretLikeScreen() {
-			return fmt.Errorf("--strict-agent refuses literal TEXT on a secret-like screen; use TEXT_ENV or TEXT_FILE")
-		}
-		bytesWritten, err = ds.ts.sendText(st.text, "", ds.keyDelay)
-	case "text_env":
-		if err = ds.redactor.addEnv(st.text); err != nil {
-			return err
-		}
-		value, _ := os.LookupEnv(st.text)
-		bytesWritten, err = ds.ts.sendText(value, st.text, ds.keyDelay)
-	case "text_file":
-		var value string
-		value, err = ds.redactor.addFile(st.text)
-		if err != nil {
-			return err
-		}
-		bytesWritten, err = ds.ts.sendText(value, "file", ds.keyDelay)
-	case "replace_text":
-		if ds.strictAgent && ds.secretLikeScreen() {
-			return fmt.Errorf("--strict-agent refuses literal REPLACE_TEXT on a secret-like screen; use REPLACE_TEXT_ENV or REPLACE_TEXT_FILE")
-		}
-		bytesWritten, err = ds.ts.replaceText(st.text, "", ds.keyDelay)
-	case "replace_text_env":
-		if err = ds.redactor.addEnv(st.text); err != nil {
-			return err
-		}
-		value, _ := os.LookupEnv(st.text)
-		bytesWritten, err = ds.ts.replaceText(value, st.text, ds.keyDelay)
-	case "replace_text_file":
-		var value string
-		value, err = ds.redactor.addFile(st.text)
-		if err != nil {
-			return err
-		}
-		bytesWritten, err = ds.ts.replaceText(value, "file", ds.keyDelay)
+	case "text", "text_env", "text_file", "replace_text", "replace_text_env", "replace_text_file",
+		"text_and_enter", "text_env_and_enter", "text_file_and_enter",
+		"replace_text_and_enter", "replace_text_env_and_enter", "replace_text_file_and_enter":
+		bytesWritten, err = ds.writeTextStep(st)
 	case "enter":
 		bytesWritten, err = ds.ts.sendBytes([]byte("\r"), "")
 		time.Sleep(ds.settleDelay)
@@ -667,6 +734,16 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 		n, err = ds.ts.sendBytes([]byte("\r"), "")
 		bytesWritten += n
 		time.Sleep(ds.settleDelay)
+	case "toggle":
+		n, selectErr := ds.ts.selectLabel(ctx, st.text, ds.pointerRe, ds.keyDelay)
+		bytesWritten += n
+		if selectErr != nil {
+			err = selectErr
+			break
+		}
+		n, err = ds.ts.sendBytes([]byte(" "), "")
+		bytesWritten += n
+		time.Sleep(ds.keyDelay)
 	case "down", "up", "left", "right":
 		seq := "\x1b[B"
 		if st.kind == "up" {
@@ -800,7 +877,7 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 		}
 		ds.exitAsserted = true
 		err = nil
-	case "quit":
+	case "quit", "end_session":
 		// handled by the caller
 	}
 
@@ -862,10 +939,12 @@ Use one of these modes:
 When both are supplied, trec runs the script first, then accepts interactive
 operations from stdin. Interactive operations include TEXT, TEXT_ENV, TEXT_FILE,
 REPLACE_TEXT, REPLACE_TEXT_ENV, REPLACE_TEXT_FILE,
-ENTER, ENTER_IF, CHOOSE, DOWN, UP, LEFT, RIGHT, SPACE, TAB, ESCAPE, CTRLC, CTRLU, CLEAR_LINE, CTRLW, BACKSPACE, WAIT,
+TEXT_AND_ENTER, TEXT_ENV_AND_ENTER, TEXT_FILE_AND_ENTER,
+REPLACE_TEXT_AND_ENTER, REPLACE_TEXT_ENV_AND_ENTER, REPLACE_TEXT_FILE_AND_ENTER,
+ENTER, ENTER_IF, CHOOSE, TOGGLE, DOWN, UP, LEFT, RIGHT, SPACE, TAB, ESCAPE, CTRLC, CTRLU, CLEAR_LINE, CTRLW, BACKSPACE, WAIT,
 EXPECT, EXPECT_EVENTUALLY, EXPECT_CHANGE, EXPECT_REGEX, EXPECT_SCREEN_REGEX,
 EXPECT_QUIET, EXPECT_QUIET@<timeout-ms> <quiet-ms>, WAIT_CHILD_EXIT@<timeout-ms>,
-ASSERT, SELECT, SNAPSHOT, and QUIT. Use TEXT_ENV/--secret-env or
+ASSERT, SELECT, SNAPSHOT, END_SESSION, and QUIT. Use TEXT_ENV/--secret-env or
 TEXT_FILE/--secret-file for credentials. Run "trec drive --help" for flags.`,
 		Args: cobra.ArbitraryArgs,
 		Run:  runDrive,
@@ -1009,9 +1088,28 @@ func runDrive(cmd *cobra.Command, rest []string) {
 		fmt.Fprintf(os.Stderr, "trec drive: write header: %v\n", err)
 		os.Exit(1)
 	}
+	childExitTimeout := 120 * time.Second
+	if timeoutSet {
+		childExitTimeout = time.Duration(*timeoutSec) * time.Second
+	} else if *interactive {
+		childExitTimeout = 0
+	}
+	mode := "script"
+	if *interactive {
+		mode = "interactive"
+		if *scriptPath != "" {
+			mode = "script_interactive"
+		}
+	}
 	started := time.Now()
 	pending := newPendingSessionResult(started)
+	pending.Mode = mode
+	pending.CommandLabel = commandLabel
 	pending.Script = scriptInfo
+	pending.Timeouts = &sessionTimeouts{
+		ExpectMS:    *expectTimeoutMs,
+		ChildExitMS: int(childExitTimeout.Milliseconds()),
+	}
 	if err := writePendingSessionResult(*outputFile, pending); err != nil {
 		fmt.Fprintf(os.Stderr, "trec drive: write pending summary: %v\n", err)
 		os.Exit(1)
@@ -1026,12 +1124,16 @@ func runDrive(cmd *cobra.Command, rest []string) {
 	if err != nil {
 		_ = f.Sync()
 		_ = writeSessionResult(*outputFile, sessionResult{
-			SessionID: pending.SessionID,
-			StartedAt: pending.StartedAt,
-			Status:    "failed",
-			ExitCode:  -1,
-			Error:     fmt.Sprintf("start command: %v", err),
-			Script:    pending.Script,
+			SessionID:    pending.SessionID,
+			StartedAt:    pending.StartedAt,
+			Mode:         pending.Mode,
+			CommandLabel: pending.CommandLabel,
+			Status:       "failed",
+			ExitCode:     -1,
+			Error:        fmt.Sprintf("start command: %v", err),
+			Script:       pending.Script,
+			Timeouts:     pending.Timeouts,
+			Termination:  &sessionTermination{Kind: "start_failure", Reason: err.Error()},
 		})
 		fmt.Fprintf(os.Stderr, "trec drive: pty start: %v\n", err)
 		os.Exit(1)
@@ -1044,12 +1146,6 @@ func runDrive(cmd *cobra.Command, rest []string) {
 
 	ts := newTerminalSession(ptmx, ptyOut, processCmd, *width, *height, recorder, redactor, false, nil, withSessionEndMarker(false))
 
-	childExitTimeout := 120 * time.Second
-	if timeoutSet {
-		childExitTimeout = time.Duration(*timeoutSec) * time.Second
-	} else if *interactive {
-		childExitTimeout = 0
-	}
 	ds := &driveSession{
 		ts:               ts,
 		castPath:         *outputFile,
@@ -1073,8 +1169,12 @@ func runDrive(cmd *cobra.Command, rest []string) {
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stopSignals()
 
+	scriptEndRequested := false
+	scriptEndReason := ""
 	for _, st := range steps {
-		if st.kind == "quit" {
+		if st.kind == "quit" || st.kind == "end_session" {
+			scriptEndRequested = true
+			scriptEndReason = "script requested " + strings.ToUpper(st.kind)
 			break
 		}
 		stepStarted := time.Now()
@@ -1101,12 +1201,17 @@ func runDrive(cmd *cobra.Command, rest []string) {
 			if errClose := ts.closeWithStatus(status, closeReason); errClose != nil {
 				fmt.Fprintf(os.Stderr, "trec drive: finalize error: %v\n", errClose)
 			}
-			_, exitCode, _ := ts.getExitState()
+			_, exitCode, childExitErr := ts.getExitState()
 			ds.marker(fmt.Sprintf("SESSION_END status=%s exit_code=%d", status, exitCode))
 			if err := f.Sync(); err != nil {
 				fmt.Fprintf(os.Stderr, "trec drive: sync cast: %v\n", err)
 			}
-			if resultErr := writeSessionResult(*outputFile, ds.result(status, -1, fmt.Sprintf("line %d: %v", st.line, err))); resultErr != nil {
+			termination := &sessionTermination{
+				Kind:   "step_failure",
+				Reason: fmt.Sprintf("line %d: %v", st.line, err),
+				Signal: processSignal(childExitErr),
+			}
+			if resultErr := writeSessionResult(*outputFile, ds.result(status, exitCode, fmt.Sprintf("line %d: %v", st.line, err), termination)); resultErr != nil {
 				fmt.Fprintf(os.Stderr, "trec drive: write summary: %v\n", resultErr)
 			}
 			fmt.Fprintf(os.Stderr, "trec drive: recorded to %s — replay with: trec play %s\n", *outputFile, *outputFile)
@@ -1121,6 +1226,7 @@ func runDrive(cmd *cobra.Command, rest []string) {
 	}
 
 	interactiveQuitRequested := false
+	interactiveInputClosed := false
 	if *interactive {
 		ds.respond(nil)
 
@@ -1148,6 +1254,7 @@ func runDrive(cmd *cobra.Command, rest []string) {
 				continue
 			case line, ok := <-inputCh:
 				if !ok {
+					interactiveInputClosed = true
 					fmt.Fprintln(os.Stderr, "trec drive: interactive stdin closed; no further operations can be sent")
 					fmt.Fprintln(os.Stderr, "trec drive: agents must keep this process's stdin session open (for example, a PTY with write_stdin)")
 					fmt.Fprintln(os.Stderr, "trec drive: for one-shot exec or heredoc input, use --script with EXPECT and SNAPSHOT instead")
@@ -1162,7 +1269,7 @@ func runDrive(cmd *cobra.Command, rest []string) {
 				if st == nil {
 					continue
 				}
-				if st.kind == "quit" {
+				if st.kind == "quit" || st.kind == "end_session" {
 					ds.respond(nil)
 					interactiveQuitRequested = true
 					continue
@@ -1200,15 +1307,25 @@ interactiveDone:
 	} else if !*interactive {
 		waitDur = 120 * time.Second
 	}
-	if *interactive && interactiveQuitRequested {
-		waitDur = 5 * time.Second
-	}
 
 	var finalizeErr error
 	failed := false
 	aborted := false
-	exited, _, processExitErr := ts.getExitState()
-	if !exited {
+	termination := &sessionTermination{Kind: "child_exit"}
+	exited, exitCode, processExitErr := ts.getExitState()
+	if scriptEndRequested || interactiveQuitRequested {
+		aborted = true
+		failed = true
+		termination.Kind = "operator_terminated"
+		if scriptEndRequested {
+			termination.Reason = scriptEndReason
+		} else {
+			termination.Reason = "interactive QUIT requested"
+		}
+		if errClose := ts.closeWithStatus("aborted", termination.Reason); errClose != nil {
+			finalizeErr = errClose
+		}
+	} else if !exited {
 		if waitDur == 0 {
 			_, fErr := ts.waitChildExit(ctx)
 			if fErr != nil {
@@ -1218,22 +1335,25 @@ interactiveDone:
 				failed = true
 				aborted = true
 				finalizeErr = ctx.Err()
-				_ = ts.closeWithStatus("aborted", "drive interrupted by signal")
+				termination.Kind = "signal"
+				termination.Reason = "drive interrupted by signal"
+				if errClose := ts.closeWithStatus("aborted", termination.Reason); errClose != nil && finalizeErr == nil {
+					finalizeErr = errClose
+				}
 			}
 		} else {
 			ctxWait, cancel := context.WithTimeout(ctx, waitDur)
-			defer cancel()
 			waitErr, fErr := ts.waitChildExit(ctxWait)
+			cancel()
 			if fErr != nil {
 				finalizeErr = fErr
 			}
 			if waitErr == context.DeadlineExceeded {
-				if *interactive && interactiveQuitRequested {
-					fmt.Fprintln(os.Stderr, "trec drive: ending interactive session — killing process")
-				} else {
-					fmt.Fprintln(os.Stderr, "trec drive: TIMEOUT — killing process")
-					failed = true
-				}
+				fmt.Fprintln(os.Stderr, "trec drive: TIMEOUT — killing process")
+				failed = true
+				termination.Kind = "timeout"
+				termination.Reason = "drive timeout"
+				termination.TimedOut = true
 				if errClose := ts.closeWithStatus("failed", "drive timeout"); errClose != nil {
 					if finalizeErr != nil {
 						finalizeErr = fmt.Errorf("%w; close error: %v", finalizeErr, errClose)
@@ -1245,7 +1365,9 @@ interactiveDone:
 				failed = true
 				aborted = true
 				finalizeErr = ctx.Err()
-				if errClose := ts.closeWithStatus("aborted", "drive interrupted by signal"); errClose != nil {
+				termination.Kind = "signal"
+				termination.Reason = "drive interrupted by signal"
+				if errClose := ts.closeWithStatus("aborted", termination.Reason); errClose != nil {
 					finalizeErr = fmt.Errorf("%w; close error: %v", finalizeErr, errClose)
 				}
 			}
@@ -1253,7 +1375,8 @@ interactiveDone:
 	}
 
 	exited, _, processExitErr = ts.getExitState()
-	if !*interactive && processExitErr != nil && !ds.exitAsserted {
+	processFailed := processExitErr != nil && !ds.exitAsserted
+	if processFailed && !aborted {
 		failed = true
 	}
 
@@ -1270,15 +1393,26 @@ interactiveDone:
 			finalizeErr = errClose
 		}
 	}
-	_, exitCode, _ := ts.getExitState()
-	sessionEndStatus := "success"
-	if aborted {
-		sessionEndStatus = "aborted"
-	} else if failed || finalizeErr != nil || processExitErr != nil {
-		sessionEndStatus = "failed"
+	_, exitCode, processExitErr = ts.getExitState()
+	termination.Signal = processSignal(processExitErr)
+	if termination.Kind == "child_exit" && interactiveInputClosed {
+		termination.Reason = "interactive stdin closed before child exit"
 	}
-	ds.marker(fmt.Sprintf("SESSION_END status=%s exit_code=%d", sessionEndStatus, exitCode))
+	if finalizeErr != nil {
+		failed = true
+	}
+	status := "success"
+	if aborted {
+		status = "aborted"
+	} else if failed {
+		status = "failed"
+	}
+	ds.marker(fmt.Sprintf("SESSION_END status=%s exit_code=%d", status, exitCode))
 	if err := f.Sync(); err != nil {
+		failed = true
+		if !aborted {
+			status = "failed"
+		}
 		if finalizeErr != nil {
 			finalizeErr = fmt.Errorf("%w; sync cast: %v", finalizeErr, err)
 		} else {
@@ -1291,20 +1425,17 @@ interactiveDone:
 	}
 
 	fmt.Fprintf(os.Stderr, "trec drive: recorded to %s — replay with: trec play %s\n", *outputFile, *outputFile)
-	status := "success"
 	message := ""
 	if aborted {
-		status = "aborted"
-		message = "drive interrupted by signal"
-	} else if failed || finalizeErr != nil {
-		status = "failed"
+		message = termination.Reason
+	} else if failed {
 		if finalizeErr != nil {
 			message = finalizeErr.Error()
 		} else if processExitErr != nil {
 			message = processExitErr.Error()
 		}
 	}
-	if err := writeSessionResult(*outputFile, ds.result(status, exitCode, message)); err != nil {
+	if err := writeSessionResult(*outputFile, ds.result(status, exitCode, message, termination)); err != nil {
 		fmt.Fprintf(os.Stderr, "trec drive: write summary: %v\n", err)
 		failed = true
 	}
@@ -1314,11 +1445,29 @@ interactiveDone:
 	}
 }
 
-func (ds *driveSession) result(status string, exitCode int, message string) sessionResult {
+func processSignal(err error) string {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return ""
+	}
+	waitStatus, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !waitStatus.Signaled() {
+		return ""
+	}
+	return waitStatus.Signal().String()
+}
+
+func (ds *driveSession) result(status string, exitCode int, message string, terminations ...*sessionTermination) sessionResult {
+	var termination *sessionTermination
+	if len(terminations) > 0 {
+		termination = terminations[0]
+	}
 	lines, _, _, _, _ := ds.ts.redactedScreenSnapshot()
 	return sessionResult{
 		SessionID:       ds.sessionID,
 		StartedAt:       ds.startedAt,
+		Mode:            ds.pending.Mode,
+		CommandLabel:    ds.pending.CommandLabel,
 		Status:          status,
 		ExitCode:        exitCode,
 		Error:           ds.redactor.RedactString(message),
@@ -1327,5 +1476,7 @@ func (ds *driveSession) result(status string, exitCode int, message string) sess
 		Snapshots:       append([]sessionSnapshot(nil), ds.snapshots...),
 		Script:          ds.pending.Script,
 		LastStep:        ds.pending.LastStep,
+		Timeouts:        ds.pending.Timeouts,
+		Termination:     termination,
 	}
 }

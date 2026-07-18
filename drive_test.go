@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +18,12 @@ import (
 
 	"github.com/hinshun/vt10x"
 )
+
+type bufferWriteCloser struct {
+	bytes.Buffer
+}
+
+func (b *bufferWriteCloser) Close() error { return nil }
 
 func TestRecordingWriterRedactsAllCastFieldsAndSplitOutput(t *testing.T) {
 	const secret = "split-secret-value"
@@ -76,6 +84,25 @@ func TestParseDriveLifecycleSteps(t *testing.T) {
 	if err != nil || replaceEnv.kind != "replace_text_env" || replaceEnv.text != "APP_PASSWORD" {
 		t.Fatalf("REPLACE_TEXT_ENV = %#v, %v", replaceEnv, err)
 	}
+	for _, tc := range []struct {
+		line string
+		kind string
+		text string
+	}{
+		{"TEXT_AND_ENTER hello", "text_and_enter", "hello"},
+		{"TEXT_ENV_AND_ENTER APP_PASSWORD", "text_env_and_enter", "APP_PASSWORD"},
+		{"TEXT_FILE_AND_ENTER /run/secrets/password", "text_file_and_enter", "/run/secrets/password"},
+		{"REPLACE_TEXT_AND_ENTER hello", "replace_text_and_enter", "hello"},
+		{"REPLACE_TEXT_ENV_AND_ENTER APP_PASSWORD", "replace_text_env_and_enter", "APP_PASSWORD"},
+		{"REPLACE_TEXT_FILE_AND_ENTER /run/secrets/password", "replace_text_file_and_enter", "/run/secrets/password"},
+		{"TOGGLE docker", "toggle", "docker"},
+		{"END_SESSION", "end_session", ""},
+	} {
+		step, err := parseDriveLine(tc.line, 1)
+		if err != nil || step.kind != tc.kind || step.text != tc.text {
+			t.Fatalf("%s = %#v, %v", tc.line, step, err)
+		}
+	}
 	wait, err := parseDriveLine("WAIT_CHILD_EXIT", 1)
 	if err != nil || wait.kind != "wait_child_exit" {
 		t.Fatalf("WAIT_CHILD_EXIT = %#v, %v", wait, err)
@@ -101,6 +128,51 @@ func TestParseDriveLifecycleSteps(t *testing.T) {
 		if _, err := parseDriveLine(line, 3); err == nil {
 			t.Errorf("%q unexpectedly parsed", line)
 		}
+	}
+}
+
+func TestDriveSemanticInputOperations(t *testing.T) {
+	redactor, err := newSecretRedactor(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := &bufferWriteCloser{}
+	ts := &terminalSession{
+		in:       input,
+		start:    time.Now(),
+		cols:     80,
+		rows:     24,
+		vt:       vt10x.New(vt10x.WithSize(80, 24)),
+		redactor: redactor,
+	}
+	ds := &driveSession{
+		ts:        ts,
+		redactor:  redactor,
+		pointerRe: regexp.MustCompile(`^\s*(?:❯|▸|›|→|»|>)\s`),
+	}
+
+	text, err := parseDriveLine("TEXT_AND_ENTER hello", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ds.applyStep(context.Background(), text); err != nil {
+		t.Fatal(err)
+	}
+	if got := input.String(); got != "hello\r" {
+		t.Fatalf("TEXT_AND_ENTER wrote %q", got)
+	}
+
+	input.Reset()
+	ts.vt.Write([]byte("> docker"))
+	toggle, err := parseDriveLine("TOGGLE docker", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ds.applyStep(context.Background(), toggle); err != nil {
+		t.Fatal(err)
+	}
+	if got := input.String(); got != " " {
+		t.Fatalf("TOGGLE wrote %q", got)
 	}
 }
 
@@ -174,6 +246,48 @@ func TestLintDriveStepsRejectsBlindTransitionsAndChecksExitPair(t *testing.T) {
 	), true)
 	if len(good) != 0 {
 		t.Fatalf("guarded script findings = %#v", good)
+	}
+}
+
+func TestLintDriveStepsRequiresSubmissionAndExplicitDisposition(t *testing.T) {
+	parse := func(lines ...string) []*driveStep {
+		t.Helper()
+		steps := make([]*driveStep, 0, len(lines))
+		for i, line := range lines {
+			step, err := parseDriveLine(line, i+1)
+			if err != nil {
+				t.Fatalf("parse %q: %v", line, err)
+			}
+			steps = append(steps, step)
+		}
+		return steps
+	}
+
+	findings := lintDriveSteps(parse(
+		"EXPECT host name",
+		"TEXT server-1",
+		"EXPECT ansible_host",
+	), true)
+	joined := fmt.Sprint(findings)
+	if !strings.Contains(joined, "TEXT is followed by a screen transition without ENTER") ||
+		!strings.Contains(joined, "no explicit terminal disposition") {
+		t.Fatalf("findings = %#v", findings)
+	}
+
+	good := lintDriveSteps(parse(
+		"EXPECT host name",
+		"TEXT_AND_ENTER server-1",
+		"EXPECT roles",
+		"TOGGLE docker",
+		"END_SESSION",
+	), true)
+	if len(good) != 0 {
+		t.Fatalf("semantic script findings = %#v", good)
+	}
+
+	report := makeDriveLintReport("good.drive", nil)
+	if report.Findings == nil {
+		t.Fatal("JSON findings must encode as [] rather than null")
 	}
 }
 
@@ -713,6 +827,9 @@ func TestDriveWaitChildExitAndAssertExit(t *testing.T) {
 		if strings.Contains(cast, "FAILED") {
 			t.Fatalf("successful assertion recorded failure:\n%s", cast)
 		}
+		if !strings.Contains(cast, "SESSION_END status=success exit_code=7") {
+			t.Fatalf("successful nonzero assertion has inconsistent session outcome:\n%s", cast)
+		}
 	})
 }
 
@@ -762,6 +879,91 @@ func TestDriveSignalFinalizesAbortedRecording(t *testing.T) {
 	if result.Status != "aborted" || result.Cast.Complete == false || !result.Cast.SessionEnd || result.LastStep == nil || result.LastStep.Phase != "failed" {
 		t.Fatalf("aborted result = %#v", result)
 	}
+}
+
+func TestDriveOutcomeConsistencyAndExplicitEndSession(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "trec")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build trec: %v\n%s", err, output)
+	}
+
+	readResult := func(t *testing.T, castPath string) sessionResult {
+		t.Helper()
+		data, err := os.ReadFile(resultPath(castPath))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result sessionResult
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	t.Run("interactive nonzero child is failed everywhere", func(t *testing.T) {
+		castPath := filepath.Join(t.TempDir(), "interactive.cast")
+		cmd := exec.Command(binary, "drive", "--interactive", "-o", castPath, "--", "sh", "-c", "exit 7")
+		cmd.Stdin = strings.NewReader("")
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatalf("interactive drive unexpectedly exited 0:\n%s", output)
+		}
+		result := readResult(t, castPath)
+		if result.Status != "failed" || result.ExitCode != 7 || result.Mode != "interactive" ||
+			result.Termination == nil || result.Termination.Kind != "child_exit" {
+			t.Fatalf("interactive result = %#v", result)
+		}
+		cast, err := os.ReadFile(castPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(cast), "SESSION_END status=failed exit_code=7") {
+			t.Fatalf("cast outcome disagrees with result:\n%s", cast)
+		}
+	})
+
+	t.Run("step failure preserves child exit code", func(t *testing.T) {
+		dir := t.TempDir()
+		scriptPath := filepath.Join(dir, "steps.drive")
+		castPath := filepath.Join(dir, "steps.cast")
+		if err := os.WriteFile(scriptPath, []byte("EXPECT never-appears\nEND_SESSION\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(binary, "drive", "--script", scriptPath, "-o", castPath, "--", "sh", "-c", "exit 7")
+		if output, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("failing step unexpectedly exited 0:\n%s", output)
+		}
+		result := readResult(t, castPath)
+		if result.Status != "failed" || result.ExitCode != 7 ||
+			result.Termination == nil || result.Termination.Kind != "step_failure" {
+			t.Fatalf("step failure result = %#v", result)
+		}
+	})
+
+	t.Run("END_SESSION terminates immediately with provenance", func(t *testing.T) {
+		dir := t.TempDir()
+		scriptPath := filepath.Join(dir, "end.drive")
+		castPath := filepath.Join(dir, "end.cast")
+		if err := os.WriteFile(scriptPath, []byte("END_SESSION\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, binary, "drive", "--script", scriptPath, "-o", castPath, "--", "sleep", "30")
+		started := time.Now()
+		if output, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("END_SESSION unexpectedly exited 0:\n%s", output)
+		}
+		if ctx.Err() != nil || time.Since(started) > 2*time.Second {
+			t.Fatalf("END_SESSION did not terminate promptly: %v", ctx.Err())
+		}
+		result := readResult(t, castPath)
+		if result.Status != "aborted" || result.Mode != "script" ||
+			result.Timeouts == nil || result.Timeouts.ChildExitMS != 120000 ||
+			result.Termination == nil || result.Termination.Kind != "operator_terminated" {
+			t.Fatalf("END_SESSION result = %#v", result)
+		}
+	})
 }
 
 func TestDriveSnapshotPersistsRedactedScreenAndLabel(t *testing.T) {

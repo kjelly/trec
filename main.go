@@ -167,6 +167,8 @@ func runRecord(cmd *cobra.Command, args []string) {
 	}
 	started := time.Now()
 	pending := newPendingSessionResult(started)
+	pending.Mode = "record"
+	pending.CommandLabel = commandLabel
 	if err := writePendingSessionResult(outputFile, pending); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write recording summary: %v\n", err)
 		os.Exit(1)
@@ -181,11 +183,14 @@ func runRecord(cmd *cobra.Command, args []string) {
 	if err != nil {
 		_ = f.Sync()
 		_ = writeSessionResult(outputFile, sessionResult{
-			SessionID: pending.SessionID,
-			StartedAt: pending.StartedAt,
-			Status:    "failed",
-			ExitCode:  -1,
-			Error:     fmt.Sprintf("start command: %v", err),
+			SessionID:    pending.SessionID,
+			StartedAt:    pending.StartedAt,
+			Mode:         pending.Mode,
+			CommandLabel: pending.CommandLabel,
+			Status:       "failed",
+			ExitCode:     -1,
+			Error:        fmt.Sprintf("start command: %v", err),
+			Termination:  &sessionTermination{Kind: "start_failure", Reason: err.Error()},
 		})
 		fmt.Fprintf(os.Stderr, "failed to start %q: %v\n", args[0], err)
 		os.Exit(1)
@@ -339,6 +344,7 @@ func runRecord(cmd *cobra.Command, args []string) {
 	}
 	status := "success"
 	message := ""
+	termination := &sessionTermination{Kind: "child_exit", Signal: processSignal(processErr)}
 	if processErr != nil {
 		status = "failed"
 		message = processErr.Error()
@@ -346,6 +352,9 @@ func runRecord(cmd *cobra.Command, args []string) {
 	if terminationSignal != nil {
 		status = "aborted"
 		message = "trec interrupted by " + terminationSignal.String()
+		termination.Kind = "signal"
+		termination.Reason = message
+		termination.Signal = terminationSignal.String()
 	}
 
 	var recErr error
@@ -367,6 +376,8 @@ func runRecord(cmd *cobra.Command, args []string) {
 	if recErr != nil {
 		status = "recording_error"
 		message = recErr.Error()
+		termination.Kind = "recording_error"
+		termination.Reason = message
 	}
 	finalVTMu.Lock()
 	finalScreen := redactor.redactScreen(normalizeScreen(finalVT.String()))
@@ -374,11 +385,14 @@ func runRecord(cmd *cobra.Command, args []string) {
 	if err := writeSessionResult(outputFile, sessionResult{
 		SessionID:       pending.SessionID,
 		StartedAt:       pending.StartedAt,
+		Mode:            pending.Mode,
+		CommandLabel:    pending.CommandLabel,
 		Status:          status,
 		ExitCode:        exitCode,
 		Error:           message,
 		DurationSeconds: time.Since(startTime).Seconds(),
 		FinalScreen:     finalScreen,
+		Termination:     termination,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing recording summary: %v\n", err)
 		if recErr == nil {

@@ -78,6 +78,47 @@ func TestVerifyCastRejectsMissingStaleAndUnsafeResults(t *testing.T) {
 	})
 }
 
+func TestVerifyCastRejectsSessionEndMismatchAndNonFinalMarker(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mismatch.cast")
+	if err := writeCastFile(path, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{
+		{sec: 0.1, typ: "m", data: "SESSION_END status=failed exit_code=7"},
+		{sec: 0.2, typ: "o", data: "late output"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSessionResult(path, sessionResult{Status: "success", ExitCode: 0}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := verifyCast(path)
+	issues := strings.Join(result.Issues, "\n")
+	for _, want := range []string{
+		`SESSION_END status "failed" does not match result status "success"`,
+		"SESSION_END exit_code 7 does not match result exit_code 0",
+		"SESSION_END is not the final cast event",
+	} {
+		if !strings.Contains(issues, want) {
+			t.Fatalf("issues missing %q:\n%s", want, issues)
+		}
+	}
+
+	duplicatePath := filepath.Join(dir, "duplicate.cast")
+	if err := writeCastFile(duplicatePath, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{
+		{sec: 0.1, typ: "m", data: "SESSION_END status=success exit_code=0"},
+		{sec: 0.2, typ: "m", data: "SESSION_END status=success exit_code=0"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSessionResult(duplicatePath, sessionResult{Status: "success", ExitCode: 0}); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := verifyCast(duplicatePath)
+	if issues := strings.Join(duplicate.Issues, "\n"); !strings.Contains(issues, "cast has 2 SESSION_END markers") {
+		t.Fatalf("duplicate marker issue missing:\n%s", issues)
+	}
+}
+
 func TestVerifyDiagnosesUnfinishedStepWithoutPendingHashNoise(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "unfinished.cast")

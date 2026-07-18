@@ -10,26 +10,43 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // sessionResult is a machine-readable completion record written next to a cast.
 type sessionResult struct {
-	SessionID       string            `json:"session_id,omitempty"`
-	StartedAt       string            `json:"started_at,omitempty"`
-	UpdatedAt       string            `json:"updated_at,omitempty"`
-	Status          string            `json:"status"`
-	ExitCode        int               `json:"exit_code"`
-	Error           string            `json:"error,omitempty"`
-	DurationSeconds float64           `json:"duration_seconds"`
-	FinalScreen     []string          `json:"final_screen,omitempty"`
-	Snapshots       []sessionSnapshot `json:"snapshots,omitempty"`
-	Script          *sessionScript    `json:"script,omitempty"`
-	LastStep        *sessionStep      `json:"last_step,omitempty"`
-	Build           buildMetadata     `json:"build"`
-	Scan            scanSummary       `json:"scan"`
-	Cast            castIntegrity     `json:"cast"`
+	SessionID       string              `json:"session_id,omitempty"`
+	StartedAt       string              `json:"started_at,omitempty"`
+	UpdatedAt       string              `json:"updated_at,omitempty"`
+	Mode            string              `json:"mode,omitempty"`
+	CommandLabel    string              `json:"command_label,omitempty"`
+	Status          string              `json:"status"`
+	ExitCode        int                 `json:"exit_code"`
+	Error           string              `json:"error,omitempty"`
+	DurationSeconds float64             `json:"duration_seconds"`
+	FinalScreen     []string            `json:"final_screen,omitempty"`
+	Snapshots       []sessionSnapshot   `json:"snapshots,omitempty"`
+	Script          *sessionScript      `json:"script,omitempty"`
+	LastStep        *sessionStep        `json:"last_step,omitempty"`
+	Timeouts        *sessionTimeouts    `json:"timeouts,omitempty"`
+	Termination     *sessionTermination `json:"termination,omitempty"`
+	Build           buildMetadata       `json:"build"`
+	Scan            scanSummary         `json:"scan"`
+	Cast            castIntegrity       `json:"cast"`
+}
+
+type sessionTimeouts struct {
+	ExpectMS    int `json:"expect_ms"`
+	ChildExitMS int `json:"child_exit_ms"`
+}
+
+type sessionTermination struct {
+	Kind     string `json:"kind"`
+	Reason   string `json:"reason,omitempty"`
+	Signal   string `json:"signal,omitempty"`
+	TimedOut bool   `json:"timed_out,omitempty"`
 }
 
 type sessionScript struct {
@@ -77,17 +94,21 @@ type sessionSnapshot struct {
 // The digest covers the exact on-disk bytes, including the header and every
 // event line.
 type castIntegrity struct {
-	SchemaVersion int           `json:"schema_version"`
-	Complete      bool          `json:"complete"`
-	Algorithm     string        `json:"algorithm"`
-	SHA256        string        `json:"sha256"`
-	ByteSize      int64         `json:"byte_size"`
-	EventCount    int           `json:"event_count"`
-	LastEventTime float64       `json:"last_event_time"`
-	SessionEnd    bool          `json:"session_end"`
-	Producer      string        `json:"producer"`
-	Version       string        `json:"version"`
-	Build         buildMetadata `json:"build"`
+	SchemaVersion      int           `json:"schema_version"`
+	Complete           bool          `json:"complete"`
+	Algorithm          string        `json:"algorithm"`
+	SHA256             string        `json:"sha256"`
+	ByteSize           int64         `json:"byte_size"`
+	EventCount         int           `json:"event_count"`
+	LastEventTime      float64       `json:"last_event_time"`
+	SessionEnd         bool          `json:"session_end"`
+	SessionEndCount    int           `json:"session_end_count,omitempty"`
+	SessionEndFinal    bool          `json:"session_end_final,omitempty"`
+	SessionEndStatus   string        `json:"session_end_status,omitempty"`
+	SessionEndExitCode *int          `json:"session_end_exit_code,omitempty"`
+	Producer           string        `json:"producer"`
+	Version            string        `json:"version"`
+	Build              buildMetadata `json:"build"`
 }
 
 func resultPath(castPath string) string { return castPath + ".result.json" }
@@ -211,7 +232,10 @@ func inspectCastIntegrity(path string) (castIntegrity, error) {
 
 	eventCount := 0
 	lastTime := 0.0
-	sessionEnd := false
+	sessionEndCount := 0
+	sessionEndEventIndex := -1
+	sessionEndStatus := ""
+	var sessionEndExitCode *int
 	lineNo := 1
 	for scanner.Scan() {
 		lineNo++
@@ -228,7 +252,15 @@ func inspectCastIntegrity(path string) (castIntegrity, error) {
 		}
 		lastTime = event.sec
 		if event.typ == "m" && strings.HasPrefix(event.data, "SESSION_END ") {
-			sessionEnd = true
+			status, exitCode, err := parseSessionEndMarker(event.data)
+			if err != nil {
+				return castIntegrity{}, fmt.Errorf("invalid event at line %d: %w", lineNo, err)
+			}
+			sessionEndCount++
+			sessionEndEventIndex = eventCount
+			sessionEndStatus = status
+			code := exitCode
+			sessionEndExitCode = &code
 		}
 		eventCount++
 	}
@@ -242,22 +274,46 @@ func inspectCastIntegrity(path string) (castIntegrity, error) {
 		version = build.DisplayVersion()
 	}
 	schemaVersion := 1
-	if sessionEnd {
+	if sessionEndCount > 0 {
 		schemaVersion = 2
 	}
 	return castIntegrity{
-		SchemaVersion: schemaVersion,
-		Complete:      true,
-		Algorithm:     "sha256",
-		SHA256:        hex.EncodeToString(hash.Sum(nil)),
-		ByteSize:      info.Size(),
-		EventCount:    eventCount,
-		LastEventTime: lastTime,
-		SessionEnd:    sessionEnd,
-		Producer:      "trec",
-		Version:       version,
-		Build:         build,
+		SchemaVersion:      schemaVersion,
+		Complete:           true,
+		Algorithm:          "sha256",
+		SHA256:             hex.EncodeToString(hash.Sum(nil)),
+		ByteSize:           info.Size(),
+		EventCount:         eventCount,
+		LastEventTime:      lastTime,
+		SessionEnd:         sessionEndCount > 0,
+		SessionEndCount:    sessionEndCount,
+		SessionEndFinal:    sessionEndEventIndex == eventCount-1,
+		SessionEndStatus:   sessionEndStatus,
+		SessionEndExitCode: sessionEndExitCode,
+		Producer:           "trec",
+		Version:            version,
+		Build:              build,
 	}, nil
+}
+
+func parseSessionEndMarker(data string) (string, int, error) {
+	fields := strings.Fields(data)
+	if len(fields) != 3 || fields[0] != "SESSION_END" {
+		return "", 0, fmt.Errorf("malformed SESSION_END marker")
+	}
+	status, ok := strings.CutPrefix(fields[1], "status=")
+	if !ok || status == "" {
+		return "", 0, fmt.Errorf("malformed SESSION_END status")
+	}
+	exitCodeText, ok := strings.CutPrefix(fields[2], "exit_code=")
+	if !ok {
+		return "", 0, fmt.Errorf("malformed SESSION_END exit_code")
+	}
+	exitCode, err := strconv.Atoi(exitCodeText)
+	if err != nil {
+		return "", 0, fmt.Errorf("malformed SESSION_END exit_code: %w", err)
+	}
+	return status, exitCode, nil
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {
