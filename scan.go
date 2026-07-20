@@ -21,17 +21,35 @@ var secretScanRules = []struct {
 }{
 	{"sshpass-password", regexp.MustCompile(`(?i)sshpass\s+-p\s+\S+`)},
 	{"private-key", regexp.MustCompile(`-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----`)},
-	{"inline-secret-assignment", regexp.MustCompile(`(?i)(?:password|token|secret|api[_-]?key)\s*[=:]\s*[^\s"']+`)},
+	// Capturing the value lets scanText distinguish a real assignment from a
+	// TUI's status suffix such as "secret = [未設定，使用內建預設]".
+	{"inline-secret-assignment", regexp.MustCompile(`(?i)(?:password|token|secret|api[_-]?key)\s*[=:]\s*([^\s"']+)`)},
 }
 
 func scanText(location string, at float64, text string) []scanFinding {
 	var findings []scanFinding
 	for _, rule := range secretScanRules {
-		if rule.re.MatchString(text) && !strings.Contains(text, "<redacted:") {
+		if rule.re.MatchString(text) && !strings.Contains(text, "<redacted:") && !isTUIUnsetSecretStatus(rule, text) {
 			findings = append(findings, scanFinding{Location: location, Time: at, Rule: rule.name})
 		}
 	}
 	return findings
+}
+
+// isTUIUnsetSecretStatus excludes only pilot-style display annotations. It
+// deliberately does not suppress bracketed secret values in general.
+func isTUIUnsetSecretStatus(rule struct {
+	name string
+	re   *regexp.Regexp
+}, text string) bool {
+	if rule.name != "inline-secret-assignment" {
+		return false
+	}
+	match := rule.re.FindStringSubmatch(text)
+	if len(match) < 2 {
+		return false
+	}
+	return strings.HasPrefix(match[1], "[未設定") || strings.HasPrefix(match[1], "[已設定")
 }
 
 func scanCast(path string) ([]scanFinding, error) {

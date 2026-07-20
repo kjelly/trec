@@ -16,6 +16,7 @@ type castVerification struct {
 	Path           string        `json:"path"`
 	Valid          bool          `json:"valid"`
 	Issues         []string      `json:"issues,omitempty"`
+	Warnings       []string      `json:"warnings,omitempty"`
 	Status         string        `json:"status,omitempty"`
 	ExitCode       int           `json:"exit_code"`
 	Integrity      castIntegrity `json:"integrity"`
@@ -48,20 +49,22 @@ func expandCastPaths(paths []string) ([]string, error) {
 			}
 			continue
 		}
-		entries, err := os.ReadDir(path)
-		if err != nil {
-			return nil, fmt.Errorf("read directory %s: %w", path, err)
-		}
-		for _, entry := range entries {
-			if !entry.Type().IsRegular() || !strings.EqualFold(filepath.Ext(entry.Name()), ".cast") {
-				continue
+		err = filepath.WalkDir(path, func(castPath string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return fmt.Errorf("walk %s: %w", castPath, walkErr)
 			}
-			castPath := filepath.Join(path, entry.Name())
+			if !entry.Type().IsRegular() || !strings.EqualFold(filepath.Ext(entry.Name()), ".cast") {
+				return nil
+			}
 			if _, ok := seen[castPath]; ok {
-				continue
+				return nil
 			}
 			seen[castPath] = struct{}{}
 			casts = append(casts, castPath)
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("walk directory %s: %w", path, err)
 		}
 	}
 	sort.Strings(casts)
@@ -102,6 +105,9 @@ func verifyCast(path string) castVerification {
 			verification.ExitCode = result.ExitCode
 			verification.ResultBuild = result.Build
 			verification.UpdatedAt = result.UpdatedAt
+			if result.Build.Modified {
+				verification.Warnings = append(verification.Warnings, "recording was produced by a dirty trec build")
+			}
 			if result.Status != "success" {
 				message := fmt.Sprintf("result status is %q", result.Status)
 				if result.Status == "in_progress" && result.UpdatedAt != "" {
@@ -218,7 +224,7 @@ var errVerificationFailed = errors.New("recording verification failed")
 func newVerifyCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "verify <file.cast|directory>...",
-		Short:        "Verify recording completion, integrity, and secret-scan safety",
+		Short:        "Verify recordings recursively for completion, integrity, and secret-scan safety",
 		Args:         cobra.MinimumNArgs(1),
 		SilenceUsage: true,
 		RunE:         runVerify,
@@ -238,11 +244,14 @@ func runVerify(cmd *cobra.Command, paths []string) error {
 		for _, result := range report.Results {
 			if result.Valid {
 				fmt.Printf("PASS %s\n", result.Path)
-				continue
+			} else {
+				fmt.Printf("FAIL %s\n", result.Path)
+				for _, issue := range result.Issues {
+					fmt.Printf("  - %s\n", issue)
+				}
 			}
-			fmt.Printf("FAIL %s\n", result.Path)
-			for _, issue := range result.Issues {
-				fmt.Printf("  - %s\n", issue)
+			for _, warning := range result.Warnings {
+				fmt.Printf("  ! %s\n", warning)
 			}
 		}
 		fmt.Printf("checked=%d passed=%d failed=%d\n", report.Checked, report.Passed, report.Failed)

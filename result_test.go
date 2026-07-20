@@ -274,3 +274,20 @@ func TestScanCastFindsSecretsButIgnoresRedactedValues(t *testing.T) {
 		t.Fatalf("findings = %#v, want one sshpass finding", findings)
 	}
 }
+
+func TestScanCastIgnoresTUIUnsetSecretStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scan-tui-status.cast")
+	if err := writeCastFile(path, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{
+		{sec: 1, typ: "o", data: "thanos_aws_secret_access_key =   [未設定，使用內建預設]"},
+		{sec: 2, typ: "o", data: "api_key: [已設定]"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := scanCast(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want no TUI-status findings", findings)
+	}
+}

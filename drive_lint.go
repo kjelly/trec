@@ -36,7 +36,7 @@ func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
 	hasEndSession := false
 	for i, step := range steps {
 		switch step.kind {
-		case "expect", "expect_eventually", "expect_regex", "expect_screen_regex", "assert":
+		case "expect", "expect_eventually", "expect_transition", "expect_regex", "expect_screen_regex", "assert":
 			screenGuarded = true
 		case "select":
 			screenGuarded = true
@@ -45,7 +45,7 @@ func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
 				next++
 			}
 			if next >= len(steps) || (steps[next].kind != "enter" && steps[next].kind != "space") {
-				add("error", step, "SELECT only moves the pointer; follow it with ENTER/SPACE or use CHOOSE/TOGGLE <label>")
+				add("error", step, "FOCUS only moves the pointer; follow it with a guarded key or use ACTIVATE <label> WITH ENTER|SPACE")
 			}
 		case "enter":
 			if !screenGuarded {
@@ -60,12 +60,20 @@ func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
 			screenGuarded = false
 		case "enter_if", "choose", "toggle":
 			screenGuarded = false
+		case "text_if":
+			// TEXT_IF has an inline screen guard and intentionally does not
+			// append Enter: some TUI confirmation prompts submit on "y" alone.
+			screenGuarded = false
 		case "down", "up":
 			level := "warning"
 			if strict {
 				level = "error"
 			}
-			add(level, step, strings.ToUpper(step.kind)+" is position-dependent; prefer SELECT/CHOOSE unless driving a scrolling checklist")
+			add(level, step, strings.ToUpper(step.kind)+" is position-dependent; prefer FOCUS/ACTIVATE unless driving a scrolling checklist")
+		case "checklist_down":
+			// A scrolling checklist cannot safely use SELECT because items can be
+			// outside the rendered viewport. This explicit opcode records intent
+			// without weakening strict checks for ordinary DOWN navigation.
 		case "wait_child_exit":
 			hasWaitChildExit = true
 			if step.hasTimeout && step.timeout > 30*60*1000 {
@@ -77,7 +85,7 @@ func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
 			hasEndSession = true
 		}
 
-		if isUnsubmittedTextStep(step.kind) {
+		if isUnsubmittedTextStep(step.kind) && !(step.kind == "text_env" && screenGuarded && strings.HasPrefix(step.text, "CONFIRM_")) {
 			next := i + 1
 			for next < len(steps) && (steps[next].kind == "wait" || steps[next].kind == "snapshot" || steps[next].kind == "expect_quiet") {
 				next++

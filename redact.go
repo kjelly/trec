@@ -477,9 +477,16 @@ func (r *secretRedactor) addEnv(name string) error {
 	return nil
 }
 
-// addFile reads an exact text value from path and registers it under a
-// generated, non-sensitive label. It deliberately does not trim a trailing
-// newline: callers must control exactly what is typed into the PTY.
+// normalizeSecretFileValue removes one conventional line ending. Secret files
+// are commonly written by command-line generators, while text TUI controls
+// treat that final newline as submission rather than credential content.
+func normalizeSecretFileValue(value string) string {
+	value = strings.TrimSuffix(value, "\n")
+	return strings.TrimSuffix(value, "\r")
+}
+
+// addFile reads the text value sent to the PTY and registers that same value
+// under a generated, non-sensitive label.
 func (r *secretRedactor) addFile(path string) (string, error) {
 	if strings.TrimSpace(path) == "" {
 		return "", fmt.Errorf("secret file path is empty")
@@ -511,9 +518,13 @@ func (r *secretRedactor) addFile(path string) (string, error) {
 		}
 		name = fmt.Sprintf("%s-%d", base, n)
 	}
-	r.entries = append(r.entries, secretEntry{name: name, value: string(data)})
+	value := normalizeSecretFileValue(string(data))
+	if value == "" {
+		return "", fmt.Errorf("secret file %q contains only a line ending", path)
+	}
+	r.entries = append(r.entries, secretEntry{name: name, value: value})
 	r.rebuildLocked()
-	return string(data), nil
+	return value, nil
 }
 
 func addSecretFileSpecs(r *secretRedactor, specs []string) error {
@@ -529,7 +540,11 @@ func addSecretFileSpecs(r *secretRedactor, specs []string) error {
 		if len(data) == 0 || !utf8.Valid(data) {
 			return fmt.Errorf("secret file %q must contain non-empty UTF-8 text", path)
 		}
-		r.add(name, string(data))
+		value := normalizeSecretFileValue(string(data))
+		if value == "" {
+			return fmt.Errorf("secret file %q contains only a line ending", path)
+		}
+		r.add(name, value)
 	}
 	return nil
 }

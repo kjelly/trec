@@ -96,12 +96,20 @@ func TestParseDriveLifecycleSteps(t *testing.T) {
 		{"REPLACE_TEXT_ENV_AND_ENTER APP_PASSWORD", "replace_text_env_and_enter", "APP_PASSWORD"},
 		{"REPLACE_TEXT_FILE_AND_ENTER /run/secrets/password", "replace_text_file_and_enter", "/run/secrets/password"},
 		{"TOGGLE docker", "toggle", "docker"},
+		{"CHECKLIST_DOWN 3", "checklist_down", ""},
 		{"END_SESSION", "end_session", ""},
 	} {
 		step, err := parseDriveLine(tc.line, 1)
 		if err != nil || step.kind != tc.kind || step.text != tc.text {
 			t.Fatalf("%s = %#v, %v", tc.line, step, err)
 		}
+	}
+	textIf, err := parseDriveLine("TEXT_IF Apply changes? => y", 1)
+	if err != nil || textIf.kind != "text_if" || textIf.guard != "Apply changes?" || textIf.text != "y" {
+		t.Fatalf("TEXT_IF = %#v, %v", textIf, err)
+	}
+	if _, err := parseDriveLine("TEXT_IF no separator", 1); err == nil {
+		t.Fatal("invalid TEXT_IF unexpectedly parsed")
 	}
 	wait, err := parseDriveLine("WAIT_CHILD_EXIT", 1)
 	if err != nil || wait.kind != "wait_child_exit" {
@@ -247,6 +255,19 @@ func TestLintDriveStepsRejectsBlindTransitionsAndChecksExitPair(t *testing.T) {
 	if len(good) != 0 {
 		t.Fatalf("guarded script findings = %#v", good)
 	}
+
+	intentional := lintDriveSteps(parse(
+		"EXPECT Confirm apply",
+		"TEXT_IF Confirm apply => y",
+		"EXPECT complete",
+		"EXPECT checklist",
+		"CHECKLIST_DOWN 3",
+		"SPACE",
+		"END_SESSION",
+	), true)
+	if len(intentional) != 0 {
+		t.Fatalf("intentional findings = %#v", intentional)
+	}
 }
 
 func TestLintDriveStepsRequiresSubmissionAndExplicitDisposition(t *testing.T) {
@@ -386,6 +407,47 @@ func TestParseDriveLineNormalizesArgumentWhitespaceAndRejectsZeroCounts(t *testi
 	}
 }
 
+func TestParseDriveLabelArgumentsAcceptJSONStyleQuotes(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		kind string
+		want string
+	}{
+		{`SELECT "hosts.yml"`, "select", "hosts.yml"},
+		{`FOCUS "hosts.yml"`, "select", "hosts.yml"},
+		{`CHOOSE "hosts.yml — 機器清單與角色"`, "choose", "hosts.yml — 機器清單與角色"},
+		{`TOGGLE "🧩 role name"`, "toggle", "🧩 role name"},
+		{`ACTIVATE "hosts.yml — 機器清單與角色" WITH ENTER`, "choose", "hosts.yml — 機器清單與角色"},
+		{`ACTIVATE "freeipa-server" WITH SPACE`, "toggle", "freeipa-server"},
+		{`EXPECT "hosts.yml 路徑"`, "expect", "hosts.yml 路徑"},
+		{`EXPECT_TRANSITION "hosts.yml 路徑"`, "expect_transition", "hosts.yml 路徑"},
+		{`ASSERT "✅ 已存檔"`, "assert", "✅ 已存檔"},
+		{`ENTER_IF "確認送出"`, "enter_if", "確認送出"},
+		{`EXPECT@2500 "下一頁"`, "expect", "下一頁"},
+	} {
+		step, err := parseDriveLine(tc.line, 1)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.line, err)
+		}
+		if step.kind != tc.kind || step.text != tc.want {
+			t.Errorf("parse %q = %#v, want kind=%q text=%q", tc.line, step, tc.kind, tc.want)
+		}
+	}
+
+	if _, err := parseDriveLine(`SELECT "hosts.yml`, 1); err == nil || !strings.Contains(err.Error(), "invalid quoted SELECT argument") {
+		t.Fatalf("unterminated quote error = %v", err)
+	}
+	for _, line := range []string{
+		"ACTIVATE freeipa-server",
+		"ACTIVATE freeipa-server WITH TAB",
+		`ACTIVATE "freeipa-server WITH SPACE`,
+	} {
+		if _, err := parseDriveLine(line, 1); err == nil {
+			t.Errorf("%q unexpectedly parsed", line)
+		}
+	}
+}
+
 func TestParseExpectQuietWithStepTimeout(t *testing.T) {
 	st, err := parseDriveLine("EXPECT_QUIET@12000 5000", 1)
 	if err != nil {
@@ -474,11 +536,12 @@ func TestReplaceTextClearsLineAndRedactsSecretInput(t *testing.T) {
 	}
 }
 
-func TestStrictAgentRejectsLiteralSecretScreenAndMarkersHideText(t *testing.T) {
+func TestLiteralTextAllowedOnPasswordPromptAndMarkersHideText(t *testing.T) {
 	in := &mockWriter{}
 	var cast bytes.Buffer
 	var mu sync.Mutex
 	redactor := &secretRedactor{}
+	redactor.add("TEST_PASSWORD", "literal-secret-value")
 	recorder := newRecordingWriter(bufio.NewWriter(&cast), &mu, redactor)
 	ts := &terminalSession{
 		in:       in,
@@ -490,17 +553,16 @@ func TestStrictAgentRejectsLiteralSecretScreenAndMarkersHideText(t *testing.T) {
 		redactor: redactor,
 	}
 	ts.feedOutput([]byte("Enter password:"))
-	ds := &driveSession{ts: ts, redactor: redactor, strictAgent: true, stepMarkers: true}
+	ds := &driveSession{ts: ts, redactor: redactor, stepMarkers: true}
 	step, err := parseDriveLine("TEXT literal-secret-value", 7)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ds.stepMarker("START", step, 0)
-	err = ds.applyStep(context.Background(), step)
-	if err == nil || !strings.Contains(err.Error(), "secret-like screen") {
-		t.Fatalf("apply error = %v", err)
+	if err = ds.applyStep(context.Background(), step); err != nil {
+		t.Fatalf("apply literal text on password prompt: %v", err)
 	}
-	ds.failureMarker(step, time.Millisecond, err)
+	ds.stepMarker("OK", step, time.Millisecond)
 	if err := recorder.flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -524,7 +586,7 @@ func TestDriveTextFileAndSecretFileDoNotLeakToCast(t *testing.T) {
 	scriptPath := filepath.Join(dir, "steps.txt")
 	castPath := filepath.Join(dir, "run.cast")
 	const secret = "file-backed-secret"
-	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+	if err := os.WriteFile(secretPath, []byte(secret+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(scriptPath, []byte("TEXT_FILE "+secretPath+"\nENTER\nWAIT_CHILD_EXIT\nASSERT_EXIT 0\n"), 0o600); err != nil {
@@ -596,6 +658,26 @@ func TestExpectAndBaselineSemantics(t *testing.T) {
 	stChg, _ := parseDriveLine("EXPECT_CHANGE", 7)
 	if err := ds.applyStep(context.Background(), stChg); err != nil {
 		t.Fatalf("EXPECT_CHANGE failed: %v", err)
+	}
+
+	// EXPECT_TRANSITION must not accept destination text that was already on
+	// the source screen; it requires a rendered change after the input.
+	ts.feedOutput([]byte(" source destination"))
+	time.Sleep(10 * time.Millisecond)
+	stEnter, _ := parseDriveLine("ENTER", 7)
+	if err := ds.applyStep(context.Background(), stEnter); err != nil {
+		t.Fatalf("ENTER: %v", err)
+	}
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		ts.feedOutput([]byte(" changed"))
+	}()
+	stTransition, _ := parseDriveLine("EXPECT_TRANSITION destination", 7)
+	if err := ds.applyStep(context.Background(), stTransition); err != nil {
+		t.Fatalf("EXPECT_TRANSITION failed: %v", err)
+	}
+	if err := ds.applyStep(context.Background(), stTransition); err == nil || !strings.Contains(err.Error(), "no previous mutating action") {
+		t.Fatalf("EXPECT_TRANSITION baseline was unexpectedly reusable: %v", err)
 	}
 
 	// 4. Cursor-only EXPECT_CHANGE
@@ -1095,7 +1177,7 @@ func TestParseJSONClearLine(t *testing.T) {
 	}
 }
 
-func TestDriveRespondResultRespectsTaint(t *testing.T) {
+func TestDriveRespondResultRedactsCurrentScreenNotHistoricalTaint(t *testing.T) {
 	os.Setenv("TEST_DRIVE_TAINT", "mysecret")
 	defer os.Unsetenv("TEST_DRIVE_TAINT")
 
@@ -1103,7 +1185,7 @@ func TestDriveRespondResultRespectsTaint(t *testing.T) {
 	dummyIn, _ := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	defer dummyIn.Close()
 	ts := newTerminalSession(dummyIn, strings.NewReader(""), nil, 80, 24, nil, redactor, false, nil)
-	ts.tainted = true
+	ts.tainted = true // A secret appeared earlier, but the current VT screen is empty.
 	ds := &driveSession{
 		ts:       ts,
 		redactor: redactor,
@@ -1111,8 +1193,8 @@ func TestDriveRespondResultRespectsTaint(t *testing.T) {
 
 	// Just check the result JSON
 	res := ds.result("success", 0, "ok")
-	if len(res.FinalScreen) != 1 || res.FinalScreen[0] != "<screen redacted>" {
-		t.Fatalf("expected result.FinalScreen to be redacted, got %v", res.FinalScreen)
+	if len(res.FinalScreen) != 0 {
+		t.Fatalf("expected empty current screen, got %v", res.FinalScreen)
 	}
 
 	// For respond, we'd need to capture stdout.
@@ -1127,7 +1209,7 @@ func TestDriveRespondResultRespectsTaint(t *testing.T) {
 	var buf bytes.Buffer
 	buf.ReadFrom(r)
 	out := buf.String()
-	if !strings.Contains(out, "<screen redacted>") {
-		t.Fatalf("expected respond output to be redacted, got %s", out)
+	if strings.Contains(out, "<screen redacted>") {
+		t.Fatalf("historical taint redacted an empty current screen: %s", out)
 	}
 }

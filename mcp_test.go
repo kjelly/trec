@@ -1069,15 +1069,15 @@ func TestMCPTerminalSelectBehavior(t *testing.T) {
 		t.Errorf("expected bad pointer regexp error, got: %v", err)
 	}
 
-	// 5. Multiple visible pointer rows are ambiguous. Selecting the first one
-	// can send navigation in the wrong direction when a TUI leaves old rows on
-	// the visible screen.
+	// 5. A redraw can leave a stale pointer above the latest one. The newest
+	// pointer is the active menu and must remain selectable.
+	sw.presses = 0
 	ts.vtMu.Lock()
 	ts.vt.Write([]byte("\x1b[H\x1b[2J❯ Old option\r\n❯ Option 1\r\n  Option 2"))
 	ts.vtMu.Unlock()
 	_, err = ts.selectLabel(context.Background(), "Option 2", pointerRe, time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "ambiguous pointer rows") {
-		t.Fatalf("expected ambiguous pointer error, got: %v", err)
+	if err != nil {
+		t.Fatalf("expected newest pointer to remain selectable, got: %v", err)
 	}
 }
 
@@ -1126,19 +1126,26 @@ func TestMCPTerminalSelectConcurrency(t *testing.T) {
 // pointer and every keypress re-renders a static header line plus the list,
 // mirroring a program that leaves stale/diagnostic text on the screen.
 type menuWriteCloser struct {
-	ts     *terminalSession
-	header string
-	opts   []string
-	sel    int
+	ts      *terminalSession
+	header  string
+	opts    []string
+	pointer string
+	sel     int
+	enters  int
+	spaces  int
 }
 
 func (mw *menuWriteCloser) render() {
 	var b strings.Builder
 	b.WriteString("\x1b[H\x1b[2J")
 	b.WriteString(mw.header + "\r\n")
+	pointer := mw.pointer
+	if pointer == "" {
+		pointer = "❯"
+	}
 	for i, o := range mw.opts {
 		if i == mw.sel {
-			b.WriteString("❯ " + o)
+			b.WriteString(pointer + " " + o)
 		} else {
 			b.WriteString("  " + o)
 		}
@@ -1161,6 +1168,10 @@ func (mw *menuWriteCloser) Write(p []byte) (int, error) {
 		if mw.sel < len(mw.opts)-1 {
 			mw.sel++
 		}
+	case "\r":
+		mw.enters++
+	case " ":
+		mw.spaces++
 	}
 	mw.render()
 	return len(p), nil
@@ -1168,11 +1179,9 @@ func (mw *menuWriteCloser) Write(p []byte) (int, error) {
 
 func (mw *menuWriteCloser) Close() error { return nil }
 
-// Regression test for github.com/kjelly/trec/issues/1: a stale/diagnostic
-// line above the list repeats the target label, sending the direction
-// heuristic UP from row 0 forever. selectLabel must notice the no-op press
-// and sweep the other way instead.
-func TestMCPTerminalSelectRecoversFromMisleadingStaleText(t *testing.T) {
+// A label repeated by stderr/debug output is not a selectable sibling row.
+// SELECT must ignore it and locate the real menu option.
+func TestMCPTerminalSelectIgnoresMisleadingStaleText(t *testing.T) {
 	br, bw, _ := os.Pipe()
 	defer br.Close()
 	defer bw.Close()
@@ -1189,8 +1198,119 @@ func TestMCPTerminalSelectRecoversFromMisleadingStaleText(t *testing.T) {
 	if _, err := ts.selectLabel(ctx, "Option 3", pointerRe, time.Millisecond); err != nil {
 		t.Fatalf("selectLabel failed despite the label being selectable: %v", err)
 	}
-	if mw.sel != 2 {
-		t.Fatalf("pointer ended on option index %d, want 2", mw.sel)
+	if mw.sel != 2 || mw.enters != 0 {
+		t.Fatalf("SELECT state: selection=%d enters=%d, want 2/0", mw.sel, mw.enters)
+	}
+}
+
+func TestMCPTerminalSelectRejectsDuplicateSelectableLabels(t *testing.T) {
+	br, bw, _ := os.Pipe()
+	defer br.Close()
+	defer bw.Close()
+
+	mw := &menuWriteCloser{opts: []string{"Duplicate", "Option 2", "Duplicate"}}
+	ts := newTerminalSession(mw, br, nil, 80, 24, nil, nil, false, nil)
+	mw.ts = ts
+	mw.render()
+
+	pointerRe := regexp.MustCompile(`^\s*(?:❯|▸|›|→|»|>)\s`)
+	_, err := ts.selectLabel(context.Background(), "Duplicate", pointerRe, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous selectable label rows") {
+		t.Fatalf("expected duplicate selectable label error, got: %v", err)
+	}
+}
+
+func TestMCPTerminalChooseSelectsAndSubmitsAtomically(t *testing.T) {
+	br, bw, _ := os.Pipe()
+	defer br.Close()
+	defer bw.Close()
+
+	mw := &menuWriteCloser{opts: []string{"Option 1", "Option 2", "Option 3"}}
+	ts := newTerminalSession(mw, br, nil, 80, 24, nil, nil, false, nil)
+	mw.ts = ts
+	mw.render()
+	s := &mcpServer{sessions: map[string]*terminalSession{"menu": ts}}
+
+	res, err := s.tool(context.Background(), "terminal_choose", []byte(`{"session_id":"menu","text":"Option 3"}`))
+	if err != nil {
+		t.Fatalf("terminal_choose failed: %v", err)
+	}
+	if got := res.(map[string]any)["chosen"]; got != true {
+		t.Fatalf("terminal_choose result = %#v", res)
+	}
+	if mw.sel != 2 || mw.enters != 1 {
+		t.Fatalf("terminal_choose state: selection=%d enters=%d, want 2/1", mw.sel, mw.enters)
+	}
+}
+
+func TestMCPTerminalToggleDoesNotSubmitChecklist(t *testing.T) {
+	br, bw, _ := os.Pipe()
+	defer br.Close()
+	defer bw.Close()
+
+	mw := &menuWriteCloser{opts: []string{"freeipa-server", "client"}}
+	ts := newTerminalSession(mw, br, nil, 80, 24, nil, nil, false, nil)
+	mw.ts = ts
+	mw.render()
+	s := &mcpServer{sessions: map[string]*terminalSession{"roles": ts}}
+
+	res, err := s.tool(context.Background(), "terminal_toggle", []byte(`{"session_id":"roles","text":"freeipa-server"}`))
+	if err != nil {
+		t.Fatalf("terminal_toggle failed: %v", err)
+	}
+	if got := res.(map[string]any)["toggled"]; got != true {
+		t.Fatalf("terminal_toggle result = %#v", res)
+	}
+	if mw.spaces != 1 || mw.enters != 0 {
+		t.Fatalf("terminal_toggle keys: spaces=%d enters=%d, want 1/0", mw.spaces, mw.enters)
+	}
+}
+
+func TestMCPTerminalActivateUsesExplicitKey(t *testing.T) {
+	br, bw, _ := os.Pipe()
+	defer br.Close()
+	defer bw.Close()
+	mw := &menuWriteCloser{opts: []string{"hosts.yml", "roles"}}
+	ts := newTerminalSession(mw, br, nil, 80, 24, nil, nil, false, nil)
+	mw.ts = ts
+	mw.render()
+	s := &mcpServer{sessions: map[string]*terminalSession{"menu": ts}}
+
+	res, err := s.tool(context.Background(), "terminal_activate", []byte(`{"session_id":"menu","text":"roles","key":"SPACE"}`))
+	if err != nil {
+		t.Fatalf("terminal_activate failed: %v", err)
+	}
+	if got := res.(map[string]any)["key"]; got != "SPACE" || mw.spaces != 1 || mw.enters != 0 {
+		t.Fatalf("terminal_activate result=%#v spaces=%d enters=%d", res, mw.spaces, mw.enters)
+	}
+}
+
+// Pilot's top-level editor menu uses a Unicode pointer and an em dash in its
+// hosts label. Keep the full rendered label as a regression case: SELECT is
+// allowed to match it, while CHOOSE is the operation that enters the screen.
+func TestMCPTerminalChooseUnicodeFullMenuLabel(t *testing.T) {
+	br, bw, _ := os.Pipe()
+	defer br.Close()
+	defer bw.Close()
+
+	mw := &menuWriteCloser{
+		pointer: "▸",
+		opts: []string{
+			"group_vars/ — 角色的設定值",
+			"hosts.yml — 機器清單與角色",
+			"離開",
+		},
+	}
+	ts := newTerminalSession(mw, br, nil, 80, 24, nil, nil, false, nil)
+	mw.ts = ts
+	mw.render()
+
+	pointerRe := regexp.MustCompile(`^\s*(?:❯|▸|›|→|»|>)\s`)
+	if _, err := ts.chooseLabel(context.Background(), "hosts.yml — 機器清單與角色", pointerRe, time.Millisecond); err != nil {
+		t.Fatalf("chooseLabel rejected a Unicode full menu label: %v", err)
+	}
+	if mw.sel != 1 || mw.enters != 1 {
+		t.Fatalf("CHOOSE state: selection=%d enters=%d, want 1/1", mw.sel, mw.enters)
 	}
 }
 
@@ -1258,6 +1378,15 @@ func TestMCPTerminalWriteEnterRawModeChild(t *testing.T) {
 		expect(t, id, "0d")
 	})
 
+	t.Run("structured enter", func(t *testing.T) {
+		id := startSession(t, "stty raw -echo; printf ready.; head -c 1 | od -An -tx1")
+		expect(t, id, "ready.")
+		if _, err := s.tool(context.Background(), "terminal_key", []byte(`{"session_id":"`+id+`","key":"ENTER"}`)); err != nil {
+			t.Fatalf("terminal_key ENTER failed: %v", err)
+		}
+		expect(t, id, "0d")
+	})
+
 	t.Run("paced text ending in enter", func(t *testing.T) {
 		id := startSession(t, "stty raw -echo; printf ready.; head -c 2 | od -An -tx1")
 		expect(t, id, "ready.")
@@ -1272,6 +1401,14 @@ func TestMCPTerminalWriteEnterRawModeChild(t *testing.T) {
 		_, err := s.tool(context.Background(), "terminal_write", []byte(`{"session_id":"`+id+`","data":"x","delay_ms":-1}`))
 		if err == nil || !strings.Contains(err.Error(), "delay_ms must not be negative") {
 			t.Fatalf("expected negative delay_ms error, got: %v", err)
+		}
+	})
+
+	t.Run("unknown structured key rejected", func(t *testing.T) {
+		id := startSession(t, "sleep 5")
+		_, err := s.tool(context.Background(), "terminal_key", []byte(`{"session_id":"`+id+`","key":"NOT_A_KEY"}`))
+		if err == nil || !strings.Contains(err.Error(), "unsupported terminal key") {
+			t.Fatalf("expected unknown key rejection, got: %v", err)
 		}
 	})
 }
@@ -1411,9 +1548,11 @@ func TestMCPHarmlessScreenAfterSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read_screen failed: %v", err)
 	}
-	// The response should be redacted because the session is permanently tainted
-	if !strings.Contains(fmt.Sprint(resScreen), "<screen redacted>") {
-		t.Fatalf("screen should be redacted for protocol responses: %v", resScreen)
+	// The secret has been cleared from the current terminal screen. Historical
+	// taint must not hide this harmless navigation state, or a wizard cannot be
+	// driven safely after a secret field.
+	if strings.Contains(fmt.Sprint(resScreen), "<screen redacted>") || !strings.Contains(fmt.Sprint(resScreen), "harmless-next-screen") {
+		t.Fatalf("expected harmless current screen after secret, got %v", resScreen)
 	}
 }
 

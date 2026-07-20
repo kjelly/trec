@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,12 +26,17 @@ func writeVerifiableCast(t *testing.T, dir, name, output string) string {
 func TestVerifyPathsAcceptsValidCastAndDirectory(t *testing.T) {
 	dir := t.TempDir()
 	path := writeVerifiableCast(t, dir, "valid.cast", "hello")
+	nestedDir := filepath.Join(dir, "nested", "recordings")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nestedPath := writeVerifiableCast(t, nestedDir, "nested.cast", "nested")
 
-	report, err := verifyPaths([]string{dir, path})
+	report, err := verifyPaths([]string{dir, path, nestedPath})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !report.Valid || report.Checked != 1 || report.Passed != 1 || report.Failed != 0 {
+	if !report.Valid || report.Checked != 2 || report.Passed != 2 || report.Failed != 0 {
 		t.Fatalf("report = %#v", report)
 	}
 }
@@ -76,6 +82,37 @@ func TestVerifyCastRejectsMissingStaleAndUnsafeResults(t *testing.T) {
 			t.Fatalf("verification = %#v", result)
 		}
 	})
+}
+
+func TestVerifyCastWarnsForDirtyProducerBuild(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dirty.cast")
+	if err := writeCastFile(path, castHeader{Version: 2, Width: 80, Height: 24}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSessionResult(path, sessionResult{Status: "success", ExitCode: 0}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(resultPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sidecar sessionResult
+	if err := json.Unmarshal(data, &sidecar); err != nil {
+		t.Fatal(err)
+	}
+	sidecar.Build = buildMetadata{Version: "dev", Revision: "abc", Modified: true}
+	data, err = json.Marshal(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(resultPath(path), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result := verifyCast(path)
+	if !result.Valid || !strings.Contains(strings.Join(result.Warnings, "\n"), "dirty trec build") {
+		t.Fatalf("verification = %#v", result)
+	}
 }
 
 func TestVerifyCastRejectsSessionEndMismatchAndNonFinalMarker(t *testing.T) {

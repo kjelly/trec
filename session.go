@@ -82,6 +82,59 @@ type screenSnapshot struct {
 	cols  int
 }
 
+// menuLabelRows returns label matches that look like selectable options in
+// the menu containing pIdx. Bubble Tea redraws and stderr diagnostics can
+// leave arbitrary text on the emulated screen, so a plain screen-wide
+// strings.Contains match is not sufficient evidence that a row is selectable.
+// A selected row has its cursor at the menu indentation; its siblings begin
+// with exactly two spaces at that same indentation. The selected row itself
+// is included so duplicate labels are rejected even when one is focused.
+func menuLabelRows(lines []string, pIdx int, label string) []int {
+	if pIdx < 0 || pIdx >= len(lines) {
+		return nil
+	}
+	line := lines[pIdx]
+	indentEnd := 0
+	for indentEnd < len(line) && (line[indentEnd] == ' ' || line[indentEnd] == '\t') {
+		indentEnd++
+	}
+	prefix := line[:indentEnd] + "  "
+	rows := make([]int, 0, 1)
+	if strings.Contains(line, label) {
+		rows = append(rows, pIdx)
+	}
+	// Only inspect adjacent siblings. A screen-wide indentation scan lets
+	// diagnostics or another Bubble Tea view masquerade as a menu option.
+	for _, idx := range append(contiguousMenuRows(lines, pIdx, prefix, -1), contiguousMenuRows(lines, pIdx, prefix, 1)...) {
+		candidate := lines[idx]
+		rest := candidate[len(prefix):]
+		// Reject deeper indentation. It is usually wrapped/debug output, not
+		// a sibling option row.
+		if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
+			continue
+		}
+		if strings.Contains(candidate, label) {
+			rows = append(rows, idx)
+		}
+	}
+	return rows
+}
+
+func contiguousMenuRows(lines []string, pIdx int, prefix string, direction int) []int {
+	rows := make([]int, 0, 1)
+	for idx := pIdx + direction; idx >= 0 && idx < len(lines); idx += direction {
+		if !strings.HasPrefix(lines[idx], prefix) {
+			break
+		}
+		rest := lines[idx][len(prefix):]
+		if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
+			break
+		}
+		rows = append(rows, idx)
+	}
+	return rows
+}
+
 func (s1 *screenSnapshot) equal(s2 *screenSnapshot) bool {
 	if s1.row != s2.row || s1.col != s2.col || s1.rows != s2.rows || s1.cols != s2.cols {
 		return false
@@ -238,7 +291,10 @@ func (ts *terminalSession) rawScreenSnapshot() (lines []string, row, col, rows, 
 func (ts *terminalSession) redactedScreenSnapshot() (lines []string, row, col, rows, cols int) {
 	ts.vtMu.Lock()
 	defer ts.vtMu.Unlock()
-	if ts.tainted || (ts.redactor != nil && ts.redactor.PendingSecretPrefix(ts.taintBuf)) {
+	// Taint protects output while a secret may be split across chunks. Do not
+	// make it a lifetime screen lock: after a TUI clears a secret field, the
+	// next rendered screen can safely expose its non-secret navigation chrome.
+	if ts.redactor != nil && ts.redactor.PendingSecretPrefix(ts.taintBuf) {
 		cursor := ts.vt.Cursor()
 		cols, rows = ts.vt.Size()
 		return []string{"<screen redacted>"}, cursor.Y, cursor.X, rows, cols
@@ -356,6 +412,31 @@ func (ts *terminalSession) waitForChange(ctx context.Context, startSnap *screenS
 		}
 		if ts.isProcessExited() {
 			return fmt.Errorf("EXPECT_CHANGE: process exited before screen changed")
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+}
+
+// waitForTransition proves both that the screen changed after the preceding
+// input and that the changed screen reached the requested destination text.
+// Plain EXPECT is insufficient when its text was already on the source view.
+func (ts *terminalSession) waitForTransition(ctx context.Context, startSnap *screenSnapshot, text string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	changed := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		currSnap := ts.getSnapshot()
+		changed = changed || !currSnap.equal(startSnap)
+		if changed && screenContains(currSnap.lines, text) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("EXPECT_TRANSITION %q: timeout after %v (screen changed=%t, last output %v ago)", text, timeout, changed, ts.quietFor())
+		}
+		if ts.isProcessExited() {
+			return fmt.Errorf("EXPECT_TRANSITION %q: process exited before transition", text)
 		}
 		time.Sleep(40 * time.Millisecond)
 	}
@@ -511,6 +592,53 @@ func (ts *terminalSession) selectLabel(ctx context.Context, label string, pointe
 
 	ts.writeMu.Lock()
 	defer ts.writeMu.Unlock()
+	return ts.selectLabelLocked(ctx, label, pointerRe, keyDelay)
+}
+
+// chooseLabel atomically selects a unique menu label and submits it with a
+// carriage return. Keeping the two writes under one lock prevents another
+// MCP request from moving the selection between SELECT and ENTER.
+func (ts *terminalSession) chooseLabel(ctx context.Context, label string, pointerRe *regexp.Regexp, keyDelay time.Duration) (int, error) {
+	written, _, err := ts.chooseLabelWithSnapshot(ctx, label, pointerRe, keyDelay)
+	return written, err
+}
+
+// chooseLabelWithSnapshot is the drive variant of chooseLabel. The returned
+// snapshot is captured after navigation but immediately before Enter, so a
+// following transition assertion cannot mistake cursor movement for submit.
+func (ts *terminalSession) chooseLabelWithSnapshot(ctx context.Context, label string, pointerRe *regexp.Regexp, keyDelay time.Duration) (int, *screenSnapshot, error) {
+	if label == "" {
+		return 0, nil, fmt.Errorf("CHOOSE needs a non-empty label")
+	}
+
+	ts.writeMu.Lock()
+	defer ts.writeMu.Unlock()
+	written, err := ts.selectLabelLocked(ctx, label, pointerRe, keyDelay)
+	if err != nil {
+		return written, nil, err
+	}
+	beforeSubmit := ts.getSnapshot()
+	n, err := ts.sendBytesLocked([]byte("\r"), "")
+	return written + n, beforeSubmit, err
+}
+
+// toggleLabel atomically moves to a checklist entry and presses Space. Unlike
+// chooseLabel it deliberately does not submit the checklist with Enter.
+func (ts *terminalSession) toggleLabel(ctx context.Context, label string, pointerRe *regexp.Regexp, keyDelay time.Duration) (int, error) {
+	if label == "" {
+		return 0, fmt.Errorf("TOGGLE needs a non-empty label")
+	}
+	ts.writeMu.Lock()
+	defer ts.writeMu.Unlock()
+	written, err := ts.selectLabelLocked(ctx, label, pointerRe, keyDelay)
+	if err != nil {
+		return written, err
+	}
+	n, err := ts.sendBytesLocked([]byte(" "), "")
+	return written + n, err
+}
+
+func (ts *terminalSession) selectLabelLocked(ctx context.Context, label string, pointerRe *regexp.Regexp, keyDelay time.Duration) (int, error) {
 
 	const (
 		keyDown = "\x1b[B"
@@ -534,12 +662,19 @@ func (ts *terminalSession) selectLabel(ctx context.Context, label string, pointe
 			}
 		}
 		pIdx := -1
-		if len(pointerRows) == 1 {
-			pIdx = pointerRows[0]
-		} else if len(pointerRows) > 1 {
-			return written, fmt.Errorf("SELECT %q: ambiguous pointer rows %v", label, pointerRows)
+		if len(pointerRows) > 0 {
+			// A redraw can leave the preceding frame on the VT screen. The
+			// latest frame is appended below it, so its pointer is the last one.
+			pIdx = pointerRows[len(pointerRows)-1]
 		}
-		if pIdx >= 0 && strings.Contains(lines[pIdx], label) {
+		labelRows := menuLabelRows(lines, pIdx, label)
+		// More than one sibling option with the same label is genuinely
+		// ambiguous. Do not guess a direction for a potentially destructive
+		// wizard action.
+		if len(labelRows) > 1 {
+			return written, fmt.Errorf("SELECT %q: ambiguous selectable label rows %v; use a unique label", label, labelRows)
+		}
+		if len(labelRows) == 1 && labelRows[0] == pIdx {
 			return written, nil
 		}
 		if press >= maxPress {
@@ -568,15 +703,8 @@ func (ts *terminalSession) selectLabel(ctx context.Context, label string, pointe
 			key = lastKey
 		default:
 			key = keyDown
-			if pIdx >= 0 {
-				for idx, l := range lines {
-					if idx != pIdx && strings.Contains(l, label) {
-						if idx < pIdx {
-							key = keyUp // label is above the pointer
-						}
-						break
-					}
-				}
+			if pIdx >= 0 && len(labelRows) == 1 && labelRows[0] < pIdx {
+				key = keyUp // label is above the pointer
 			}
 		}
 		n, err := ts.sendBytesLocked([]byte(key), "")
@@ -587,7 +715,9 @@ func (ts *terminalSession) selectLabel(ctx context.Context, label string, pointe
 		lastKey = key
 		prevSnap = snap
 		time.Sleep(keyDelay)
-		if err := ts.waitQuiet(ctx, 120*time.Millisecond, 2*time.Second); err != nil {
+		// Bubble Tea can render after the key write. Waiting for a rendered
+		// change prevents the next sweep from mistaking that gap for a boundary.
+		if err := ts.waitForChange(ctx, snap, 2*time.Second); err != nil && ctx.Err() != nil {
 			return written, err
 		}
 	}

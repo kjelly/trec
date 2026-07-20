@@ -30,7 +30,10 @@ Use **Go modules** (`go 1.25.5`):
 - `cast.go` — asciicast v2 load/save helpers.
 - `result.go` — atomic `.result.json` sidecar with final screen, snapshots, and cast integrity metadata.
 - `scan.go`, `html.go`, `serve.go` — secret scan and safe sharing/export paths.
-- `skills/` — project-specific operating instructions; read the matching `SKILL.md` when its task applies.
+- `skills/` — project-specific operating instructions; read the matching `SKILL.md` when its task applies:
+  - `trec-tui-drive` — scripted or agent-driven interactive TUI/wizard recording; use `TEXT_IF` for character-submits confirmations and `CHECKLIST_DOWN` only for verified scrolling checklists.
+  - `trec-mcp` — persistent MCP terminal sessions, especially when an agent cannot retain a normal stdin session; use `terminal_key` for raw-mode Enter/navigation and `terminal_write` for text or drive DSL lines.
+  - `trec-terminal-audit` — read-only review of terminal recording safety, integrity, and sharing readiness.
 
 ## Key Conventions
 - Subcommands are dispatched manually in `main()` by `os.Args[1]`; flags use `github.com/spf13/pflag` per subcommand.

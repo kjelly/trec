@@ -65,10 +65,15 @@ func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
 		mcp.WithArray("secret_file", mcp.Description("Files to redact (NAME=path).")),
 	))
 	add("terminal_write", mcp.NewTool("terminal_write",
-		mcp.WithDescription("Write raw bytes to a persistent terminal process. Send \"\\r\" (carriage return) for Enter; \"\\n\" is Ctrl+J and most TUIs do not treat it as Enter."),
+		mcp.WithDescription("Write ordinary text to a persistent terminal process, or one newline-terminated drive --interactive DSL instruction. For a raw TUI, use terminal_key for keys (especially ENTER) and terminal_activate for menus; \\n is Ctrl+J, not Enter."),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("data", mcp.Required()),
 		mcp.WithNumber("delay_ms", mcp.Description("Per-character delay in milliseconds, for TUIs that drop unpaced keystrokes. Leave unset for escape sequences, which must arrive as one unpaced burst.")),
+	))
+	add("terminal_key", mcp.NewTool("terminal_key",
+		mcp.WithDescription("Send a structured terminal key without relying on JSON escape handling. Supported keys: ENTER, TAB, SPACE, ESCAPE, UP, DOWN, LEFT, RIGHT, BACKSPACE, CTRLC, CTRLU, CTRLW."),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("key", mcp.Required()),
 	))
 	add("terminal_read", mcp.NewTool("terminal_read", mcp.WithDescription("Read a persistent terminal process incremental raw output."), mcp.WithString("session_id", mcp.Required())))
 	add("terminal_read_screen", mcp.NewTool("terminal_read_screen", mcp.WithDescription("Read the emulated screen from a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
@@ -76,10 +81,39 @@ func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
 	add("terminal_expect", mcp.NewTool("terminal_expect", mcp.WithDescription("Wait until text appears on the terminal screen."), mcp.WithString("session_id", mcp.Required()), mcp.WithString("text", mcp.Required()), mcp.WithNumber("timeout_seconds", mcp.Required())))
 	add("terminal_wait_quiet", mcp.NewTool("terminal_wait_quiet", mcp.WithDescription("Wait until terminal output is quiet."), mcp.WithString("session_id", mcp.Required()), mcp.WithNumber("quiet_duration_seconds", mcp.Required()), mcp.WithNumber("timeout_seconds", mcp.Required())))
 	add("terminal_close", mcp.NewTool("terminal_close", mcp.WithDescription("Close a persistent terminal process."), mcp.WithString("session_id", mcp.Required())))
-	add("terminal_select", mcp.NewTool("terminal_select",
+	add("terminal_focus", mcp.NewTool("terminal_focus",
 		mcp.WithDescription("Move the menu selection pointer to match the label."),
 		mcp.WithString("session_id", mcp.Required()),
 		mcp.WithString("text", mcp.Required(), mcp.Description("The label text to select.")),
+		mcp.WithString("pointer", mcp.Description("Regex pattern matching a menu selection pointer.")),
+		mcp.WithNumber("timeout_seconds"),
+	))
+	add("terminal_select", mcp.NewTool("terminal_select",
+		mcp.WithDescription("Compatibility alias for terminal_focus."),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("text", mcp.Required(), mcp.Description("The label text to focus.")),
+		mcp.WithString("pointer", mcp.Description("Regex pattern matching a menu selection pointer.")),
+		mcp.WithNumber("timeout_seconds"),
+	))
+	add("terminal_choose", mcp.NewTool("terminal_choose",
+		mcp.WithDescription("Atomically select a unique menu label and submit it with Enter. Use for menus that commit on Enter."),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("text", mcp.Required(), mcp.Description("The unique visible menu label to choose.")),
+		mcp.WithString("pointer", mcp.Description("Regex pattern matching a menu selection pointer.")),
+		mcp.WithNumber("timeout_seconds"),
+	))
+	add("terminal_activate", mcp.NewTool("terminal_activate",
+		mcp.WithDescription("Atomically select a unique menu/checklist label and send ENTER or SPACE. Specify key explicitly: ENTER commits a menu; SPACE toggles a checklist item without submitting it."),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("text", mcp.Required(), mcp.Description("The unique visible label to activate.")),
+		mcp.WithString("key", mcp.Required(), mcp.Description("ENTER for a menu, SPACE for a checklist.")),
+		mcp.WithString("pointer", mcp.Description("Regex pattern matching a menu selection pointer.")),
+		mcp.WithNumber("timeout_seconds"),
+	))
+	add("terminal_toggle", mcp.NewTool("terminal_toggle",
+		mcp.WithDescription("Atomically select a unique checklist label and press Space. It does not submit the checklist; use terminal_key ENTER only after verifying the checked state."),
+		mcp.WithString("session_id", mcp.Required()),
+		mcp.WithString("text", mcp.Required(), mcp.Description("The unique visible checklist label to toggle.")),
 		mcp.WithString("pointer", mcp.Description("Regex pattern matching a menu selection pointer.")),
 		mcp.WithNumber("timeout_seconds"),
 	))
@@ -440,6 +474,29 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 			n, e = ss.sendBytes([]byte(a.Data), "")
 		}
 		return map[string]any{"written": n}, e
+	case "terminal_key":
+		var a struct {
+			SessionID string `json:"session_id"`
+			Key       string `json:"key"`
+		}
+		if e := json.Unmarshal(raw, &a); e != nil {
+			return nil, e
+		}
+		keys := map[string]string{
+			"ENTER": "\r", "TAB": "\t", "SPACE": " ", "ESCAPE": "\x1b",
+			"UP": "\x1b[A", "DOWN": "\x1b[B", "LEFT": "\x1b[D", "RIGHT": "\x1b[C",
+			"BACKSPACE": "\x7f", "CTRLC": "\x03", "CTRLU": "\x15", "CTRLW": "\x17",
+		}
+		data, ok := keys[strings.ToUpper(strings.TrimSpace(a.Key))]
+		if !ok {
+			return nil, fmt.Errorf("unsupported terminal key %q", a.Key)
+		}
+		ss, e := s.session(a.SessionID)
+		if e != nil {
+			return nil, e
+		}
+		n, e := ss.sendBytes([]byte(data), "")
+		return map[string]any{"written": n}, e
 	case "terminal_read":
 		// Note: terminal_read returns unredacted raw output by design, so clients can process raw bytes.
 		// Use terminal_read_screen for redacted rendered output.
@@ -541,10 +598,11 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 			return nil, mcpErrorWithScreen(e, ss)
 		}
 		return map[string]bool{"quiet": true}, nil
-	case "terminal_select":
+	case "terminal_focus", "terminal_select", "terminal_choose", "terminal_toggle", "terminal_activate":
 		var a struct {
 			SessionID string   `json:"session_id"`
 			Text      string   `json:"text"`
+			Key       string   `json:"key"`
 			Pointer   string   `json:"pointer"`
 			Timeout   *float64 `json:"timeout_seconds"`
 		}
@@ -577,9 +635,34 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 		ctxSelect, cancel := context.WithTimeout(ctx, time.Duration(timeoutVal*float64(time.Second)))
 		defer cancel()
 
-		_, e = ss.selectLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+		var written int
+		if name == "terminal_choose" {
+			written, e = ss.chooseLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+		} else if name == "terminal_toggle" {
+			written, e = ss.toggleLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+		} else if name == "terminal_activate" {
+			switch strings.ToUpper(a.Key) {
+			case "ENTER":
+				written, e = ss.chooseLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+			case "SPACE":
+				written, e = ss.toggleLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+			default:
+				return nil, fmt.Errorf("key must be ENTER or SPACE")
+			}
+		} else {
+			written, e = ss.selectLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+		}
 		if e != nil {
 			return nil, mcpErrorWithScreen(e, ss)
+		}
+		if name == "terminal_choose" {
+			return map[string]any{"chosen": true, "written": written}, nil
+		}
+		if name == "terminal_toggle" {
+			return map[string]any{"toggled": true, "written": written}, nil
+		}
+		if name == "terminal_activate" {
+			return map[string]any{"activated": true, "key": strings.ToUpper(a.Key), "written": written}, nil
 		}
 		return map[string]bool{"selected": true}, nil
 	case "terminal_close":

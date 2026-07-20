@@ -27,10 +27,12 @@ type driveStep struct {
 	kind string // text, enter, down, up, space, tab, ctrlc, backspace, wait,
 	// text_env, text_file, replace_text, replace_text_env, replace_text_file,
 	// *_and_enter, expect, expect_quiet, assert, select, toggle, snapshot,
-	// wait_child_exit, assert_exit, end_session, quit
-	text string
-	n    int
-	hasN bool
+	// checklist_down, text_if, expect_transition, wait_child_exit, assert_exit,
+	// end_session, quit
+	text  string
+	guard string // screen text required by TEXT_IF before it writes text
+	n     int
+	hasN  bool
 	// timeout is an optional per-step timeout, currently used by
 	// EXPECT_QUIET@<ms>. A zero value means to use the session default.
 	timeout    int
@@ -45,6 +47,7 @@ type jsonDriveStep struct {
 	Op      string `json:"op"`
 	Text    string `json:"text"`
 	Arg     string `json:"arg"`
+	Key     string `json:"key"`
 	N       *int   `json:"n"`
 	Timeout *int   `json:"timeout_ms"`
 }
@@ -53,6 +56,10 @@ func validateStep(st *driveStep) error {
 	switch st.kind {
 	case "text", "replace_text", "text_and_enter", "replace_text_and_enter":
 		// TEXT needs no validation
+	case "text_if":
+		if st.text == "" || st.guard == "" {
+			return fmt.Errorf("line %d: TEXT_IF needs '<screen text> => <text>'", st.line)
+		}
 	case "text_env", "replace_text_env", "text_env_and_enter", "replace_text_env_and_enter":
 		if !validEnvName(st.text) {
 			return fmt.Errorf("line %d: %s needs an environment variable name", st.line, strings.ToUpper(st.kind))
@@ -78,7 +85,14 @@ func validateStep(st *driveStep) error {
 		if st.hasN && st.n <= 0 {
 			return fmt.Errorf("line %d: EXPECT_CHANGE needs a positive timeout duration", st.line)
 		}
-	case "down", "up", "left", "right", "backspace", "wait":
+	case "expect_transition":
+		if st.text == "" {
+			return fmt.Errorf("line %d: EXPECT_TRANSITION needs text", st.line)
+		}
+		if st.hasN && st.n <= 0 {
+			return fmt.Errorf("line %d: EXPECT_TRANSITION needs a positive timeout duration", st.line)
+		}
+	case "down", "checklist_down", "up", "left", "right", "backspace", "wait":
 		if st.hasN && st.n <= 0 {
 			return fmt.Errorf("line %d: %s needs a positive count", st.line, strings.ToUpper(st.kind))
 		}
@@ -166,6 +180,16 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 			text = jS.Arg
 		}
 		kind = strings.ToLower(kind)
+		if kind == "activate" {
+			switch strings.ToUpper(jS.Key) {
+			case "ENTER":
+				kind = "choose"
+			case "SPACE":
+				kind = "toggle"
+			default:
+				return nil, fmt.Errorf("line %d: ACTIVATE needs key ENTER or SPACE", lineNo)
+			}
+		}
 		if kind == "clear_line" {
 			kind = "ctrlu"
 		}
@@ -199,7 +223,7 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	st := &driveStep{raw: trimmed, line: lineNo}
 
 	// EXPECT@<ms> overrides the default --expect-timeout for one step.
-	for _, prefix := range []string{"EXPECT", "EXPECT_EVENTUALLY", "EXPECT_REGEX", "EXPECT_SCREEN_REGEX"} {
+	for _, prefix := range []string{"EXPECT", "EXPECT_EVENTUALLY", "EXPECT_TRANSITION", "EXPECT_REGEX", "EXPECT_SCREEN_REGEX"} {
 		if ms, ok := strings.CutPrefix(op, prefix+"@"); ok {
 			n, err := strconv.Atoi(ms)
 			if err != nil || n <= 0 {
@@ -208,7 +232,11 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 			if arg == "" {
 				return nil, fmt.Errorf("line %d: %s needs text", lineNo, prefix)
 			}
-			st.kind, st.text, st.n, st.hasN = strings.ToLower(prefix), arg, n, true
+			text, err := parseDriveQuotedArgument(arg, lineNo, prefix)
+			if err != nil {
+				return nil, err
+			}
+			st.kind, st.text, st.n, st.hasN = strings.ToLower(prefix), text, n, true
 			if err := validateStep(st); err != nil {
 				return nil, err
 			}
@@ -267,6 +295,12 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	switch op {
 	case "TEXT":
 		st.kind, st.text = "text", arg
+	case "TEXT_IF":
+		guard, text, ok := strings.Cut(arg, " => ")
+		if !ok || strings.TrimSpace(guard) == "" || text == "" {
+			return nil, fmt.Errorf("line %d: TEXT_IF needs '<screen text> => <text>'", lineNo)
+		}
+		st.kind, st.guard, st.text = "text_if", strings.TrimSpace(guard), text
 	case "TEXT_AND_ENTER":
 		st.kind, st.text = "text_and_enter", arg
 	case "TEXT_ENV":
@@ -320,17 +354,56 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	case "ENTER":
 		st.kind, st.text = "enter", arg
 	case "ENTER_IF":
-		st.kind, st.text = "enter_if", arg
+		text, err := parseDriveQuotedArgument(arg, lineNo, op)
+		if err != nil {
+			return nil, err
+		}
+		st.kind, st.text = "enter_if", text
 	case "CHOOSE":
-		st.kind, st.text = "choose", arg
+		label, err := parseDriveQuotedArgument(arg, lineNo, op)
+		if err != nil {
+			return nil, err
+		}
+		st.kind, st.text = "choose", label
+	case "ACTIVATE":
+		const separator = " WITH "
+		idx := strings.LastIndex(arg, separator)
+		if idx <= 0 {
+			return nil, fmt.Errorf("line %d: ACTIVATE needs '<label> WITH ENTER|SPACE'", lineNo)
+		}
+		label, err := parseDriveQuotedArgument(strings.TrimSpace(arg[:idx]), lineNo, op)
+		if err != nil {
+			return nil, err
+		}
+		if label == "" {
+			return nil, fmt.Errorf("line %d: ACTIVATE needs a label", lineNo)
+		}
+		switch strings.ToUpper(strings.TrimSpace(arg[idx+len(separator):])) {
+		case "ENTER":
+			st.kind, st.text = "choose", label
+		case "SPACE":
+			st.kind, st.text = "toggle", label
+		default:
+			return nil, fmt.Errorf("line %d: ACTIVATE key must be ENTER or SPACE", lineNo)
+		}
 	case "TOGGLE":
-		st.kind, st.text = "toggle", arg
+		label, err := parseDriveQuotedArgument(arg, lineNo, op)
+		if err != nil {
+			return nil, err
+		}
+		st.kind, st.text = "toggle", label
 	case "DOWN":
 		n, err := parsePositiveCount(arg, 1)
 		if err != nil {
 			return nil, fmt.Errorf("line %d: DOWN needs a positive count", lineNo)
 		}
 		st.kind, st.n, st.hasN = "down", n, arg != ""
+	case "CHECKLIST_DOWN":
+		n, err := parsePositiveCount(arg, 1)
+		if err != nil {
+			return nil, fmt.Errorf("line %d: CHECKLIST_DOWN needs a positive count", lineNo)
+		}
+		st.kind, st.n, st.hasN = "checklist_down", n, arg != ""
 	case "UP":
 		n, err := parsePositiveCount(arg, 1)
 		if err != nil {
@@ -374,15 +447,32 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		}
 		st.kind, st.n, st.hasN = "wait", n, arg != ""
 	case "EXPECT":
-		if arg == "" {
+		text, err := parseDriveQuotedArgument(arg, lineNo, op)
+		if err != nil {
+			return nil, err
+		}
+		if text == "" {
 			return nil, fmt.Errorf("line %d: EXPECT needs text", lineNo)
 		}
-		st.kind, st.text = "expect", arg
+		st.kind, st.text = "expect", text
 	case "EXPECT_EVENTUALLY":
-		if arg == "" {
+		text, err := parseDriveQuotedArgument(arg, lineNo, op)
+		if err != nil {
+			return nil, err
+		}
+		if text == "" {
 			return nil, fmt.Errorf("line %d: EXPECT_EVENTUALLY needs text", lineNo)
 		}
-		st.kind, st.text = "expect_eventually", arg
+		st.kind, st.text = "expect_eventually", text
+	case "EXPECT_TRANSITION":
+		text, err := parseDriveQuotedArgument(arg, lineNo, op)
+		if err != nil {
+			return nil, err
+		}
+		if text == "" {
+			return nil, fmt.Errorf("line %d: EXPECT_TRANSITION needs text", lineNo)
+		}
+		st.kind, st.text = "expect_transition", text
 	case "EXPECT_CHANGE":
 		if arg != "" {
 			return nil, fmt.Errorf("line %d: EXPECT_CHANGE takes no arguments", lineNo)
@@ -399,15 +489,23 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		}
 		st.kind, st.n, st.hasN = "expect_quiet", n, arg != ""
 	case "ASSERT":
-		if arg == "" {
+		text, err := parseDriveQuotedArgument(arg, lineNo, op)
+		if err != nil {
+			return nil, err
+		}
+		if text == "" {
 			return nil, fmt.Errorf("line %d: ASSERT needs text", lineNo)
 		}
-		st.kind, st.text = "assert", arg
-	case "SELECT":
-		if arg == "" {
-			return nil, fmt.Errorf("line %d: SELECT needs a label", lineNo)
+		st.kind, st.text = "assert", text
+	case "FOCUS", "SELECT":
+		label, err := parseDriveQuotedArgument(arg, lineNo, op)
+		if err != nil {
+			return nil, err
 		}
-		st.kind, st.text = "select", arg
+		if label == "" {
+			return nil, fmt.Errorf("line %d: FOCUS needs a label", lineNo)
+		}
+		st.kind, st.text = "select", label
 	case "SNAPSHOT":
 		st.kind, st.text = "snapshot", arg
 	case "WAIT_CHILD_EXIT":
@@ -432,6 +530,21 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		return nil, err
 	}
 	return st, nil
+}
+
+// parseDriveQuotedArgument accepts the normal unquoted DSL form and the
+// JSON-style quoted form agents commonly produce. Without this decoding,
+// SELECT "hosts.yml" searches for literal quote characters, while EXPECT and
+// ASSERT fail to see their otherwise visible screen text.
+func parseDriveQuotedArgument(arg string, lineNo int, op string) (string, error) {
+	if !strings.HasPrefix(arg, `"`) {
+		return arg, nil
+	}
+	label, err := strconv.Unquote(arg)
+	if err != nil {
+		return "", fmt.Errorf("line %d: invalid quoted %s argument: %w", lineNo, op, err)
+	}
+	return label, nil
 }
 
 // stripDriveInlineComment removes a comment beginning with a hash that is
@@ -531,7 +644,6 @@ type driveSession struct {
 	baselineSnapshot *screenSnapshot
 	baselineValid    bool
 	redactor         *secretRedactor
-	strictAgent      bool
 	snapshots        []sessionSnapshot
 }
 
@@ -546,18 +658,14 @@ func (ds *driveSession) updateProgress(phase string, st *driveStep) error {
 	return writePendingSessionResult(ds.castPath, ds.pending)
 }
 
-var secretPromptRE = regexp.MustCompile(`(?i)(password|passwd|passphrase|secret|token|api[-_ ]?key|private[ _-]?key|credential|vault|密碼|密码|秘密|權杖|令牌|金鑰|金钥)`)
-
-func (ds *driveSession) secretLikeScreen() bool {
-	return secretPromptRE.MatchString(strings.Join(ds.screenLines(), "\n"))
-}
-
 func safeStepDescription(st *driveStep) string {
 	switch st.kind {
 	case "text":
 		return fmt.Sprintf("TEXT <literal %d bytes>", len(st.text))
 	case "text_and_enter":
 		return fmt.Sprintf("TEXT_AND_ENTER <literal %d bytes>", len(st.text))
+	case "text_if":
+		return fmt.Sprintf("TEXT_IF %q => <literal %d bytes>", st.guard, len(st.text))
 	case "replace_text":
 		return fmt.Sprintf("REPLACE_TEXT <literal %d bytes>", len(st.text))
 	case "replace_text_and_enter":
@@ -642,8 +750,10 @@ func (ds *driveSession) writeTextStep(st *driveStep) (int, error) {
 	)
 	switch kind {
 	case "text":
-		if ds.strictAgent && ds.secretLikeScreen() {
-			return 0, fmt.Errorf("--strict-agent refuses literal TEXT on a secret-like screen; use TEXT_ENV or TEXT_FILE")
+		written, err = ds.ts.sendText(st.text, "", ds.keyDelay)
+	case "text_if":
+		if !screenContains(ds.screenLines(), st.guard) {
+			return 0, fmt.Errorf("TEXT_IF %q: not on screen", st.guard)
 		}
 		written, err = ds.ts.sendText(st.text, "", ds.keyDelay)
 	case "text_env":
@@ -660,9 +770,6 @@ func (ds *driveSession) writeTextStep(st *driveStep) (int, error) {
 		}
 		written, err = ds.ts.sendText(value, "file", ds.keyDelay)
 	case "replace_text":
-		if ds.strictAgent && ds.secretLikeScreen() {
-			return 0, fmt.Errorf("--strict-agent refuses literal REPLACE_TEXT on a secret-like screen; use REPLACE_TEXT_ENV or REPLACE_TEXT_FILE")
-		}
 		written, err = ds.ts.replaceText(st.text, "", ds.keyDelay)
 	case "replace_text_env":
 		if err = ds.redactor.addEnv(st.text); err != nil {
@@ -695,7 +802,7 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 	}
 	isMutating := false
 	switch st.kind {
-	case "text", "text_env", "text_file", "replace_text", "replace_text_env", "replace_text_file",
+	case "text", "text_if", "text_env", "text_file", "replace_text", "replace_text_env", "replace_text_file",
 		"text_and_enter", "text_env_and_enter", "text_file_and_enter",
 		"replace_text_and_enter", "replace_text_env_and_enter", "replace_text_file_and_enter",
 		"enter", "enter_if", "choose", "toggle", "down", "up", "left", "right",
@@ -711,7 +818,7 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 	var err error
 
 	switch st.kind {
-	case "text", "text_env", "text_file", "replace_text", "replace_text_env", "replace_text_file",
+	case "text", "text_if", "text_env", "text_file", "replace_text", "replace_text_env", "replace_text_file",
 		"text_and_enter", "text_env_and_enter", "text_file_and_enter",
 		"replace_text_and_enter", "replace_text_env_and_enter", "replace_text_file_and_enter":
 		bytesWritten, err = ds.writeTextStep(st)
@@ -725,26 +832,16 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 		bytesWritten, err = ds.ts.sendBytes([]byte("\r"), "")
 		time.Sleep(ds.settleDelay)
 	case "choose":
-		n, selectErr := ds.ts.selectLabel(ctx, st.text, ds.pointerRe, ds.keyDelay)
-		bytesWritten += n
-		if selectErr != nil {
-			err = selectErr
-			break
+		var beforeSubmit *screenSnapshot
+		bytesWritten, beforeSubmit, err = ds.ts.chooseLabelWithSnapshot(ctx, st.text, ds.pointerRe, ds.keyDelay)
+		if beforeSubmit != nil {
+			ds.baselineSnapshot = beforeSubmit
 		}
-		n, err = ds.ts.sendBytes([]byte("\r"), "")
-		bytesWritten += n
 		time.Sleep(ds.settleDelay)
 	case "toggle":
-		n, selectErr := ds.ts.selectLabel(ctx, st.text, ds.pointerRe, ds.keyDelay)
-		bytesWritten += n
-		if selectErr != nil {
-			err = selectErr
-			break
-		}
-		n, err = ds.ts.sendBytes([]byte(" "), "")
-		bytesWritten += n
+		bytesWritten, err = ds.ts.toggleLabel(ctx, st.text, ds.pointerRe, ds.keyDelay)
 		time.Sleep(ds.keyDelay)
-	case "down", "up", "left", "right":
+	case "down", "checklist_down", "up", "left", "right":
 		seq := "\x1b[B"
 		if st.kind == "up" {
 			seq = "\x1b[A"
@@ -813,6 +910,17 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 			timeout = time.Duration(st.n) * time.Millisecond
 		}
 		err = ds.ts.waitForChange(ctx, ds.baselineSnapshot, timeout)
+		ds.baselineValid = false
+	case "expect_transition":
+		if !ds.baselineValid {
+			return fmt.Errorf("EXPECT_TRANSITION %q: no previous mutating action to compare against", st.text)
+		}
+		timeout := ds.expectTimeout
+		if st.n > 0 {
+			timeout = time.Duration(st.n) * time.Millisecond
+		}
+		err = ds.ts.waitForTransition(ctx, ds.baselineSnapshot, st.text, timeout)
+		ds.baselineValid = false
 	case "expect_regex":
 		timeout := ds.expectTimeout
 		if st.n > 0 {
@@ -938,13 +1046,15 @@ Use one of these modes:
 
 When both are supplied, trec runs the script first, then accepts interactive
 operations from stdin. Interactive operations include TEXT, TEXT_ENV, TEXT_FILE,
+TEXT_IF <screen text> => <text>,
 REPLACE_TEXT, REPLACE_TEXT_ENV, REPLACE_TEXT_FILE,
 TEXT_AND_ENTER, TEXT_ENV_AND_ENTER, TEXT_FILE_AND_ENTER,
 REPLACE_TEXT_AND_ENTER, REPLACE_TEXT_ENV_AND_ENTER, REPLACE_TEXT_FILE_AND_ENTER,
-ENTER, ENTER_IF, CHOOSE, TOGGLE, DOWN, UP, LEFT, RIGHT, SPACE, TAB, ESCAPE, CTRLC, CTRLU, CLEAR_LINE, CTRLW, BACKSPACE, WAIT,
+ENTER, ENTER_IF, ACTIVATE <label> WITH ENTER|SPACE (CHOOSE/TOGGLE aliases), FOCUS <label> (SELECT alias), DOWN, CHECKLIST_DOWN, UP, LEFT, RIGHT, SPACE, TAB, ESCAPE, CTRLC, CTRLU (CLEAR_LINE alias), CTRLW, BACKSPACE, WAIT,
 EXPECT, EXPECT_EVENTUALLY, EXPECT_CHANGE, EXPECT_REGEX, EXPECT_SCREEN_REGEX,
+	EXPECT_TRANSITION,
 EXPECT_QUIET, EXPECT_QUIET@<timeout-ms> <quiet-ms>, WAIT_CHILD_EXIT@<timeout-ms>,
-ASSERT, SELECT, SNAPSHOT, END_SESSION, and QUIT. Use TEXT_ENV/--secret-env or
+ASSERT, FOCUS, SNAPSHOT, and END_SESSION (QUIT alias). Use TEXT_ENV/--secret-env or
 TEXT_FILE/--secret-file for credentials. Run "trec drive --help" for flags.`,
 		Args: cobra.ArbitraryArgs,
 		Run:  runDrive,
@@ -963,7 +1073,6 @@ TEXT_FILE/--secret-file for credentials. Run "trec drive --help" for flags.`,
 	cmd.Flags().Int("expect-timeout", 10000, "default milliseconds EXPECT waits before failing")
 	cmd.Flags().String("pointer", `^\s*(?:❯|▸|›|→|»|>)\s`, "regexp matching a menu selection-pointer row, used by SELECT")
 	cmd.Flags().Bool("step-markers", true, "record a marker event per script step")
-	cmd.Flags().Bool("strict-agent", false, "lint agent scripts and reject unsafe navigation or literal text on secret-like screens")
 	cmd.AddCommand(newDriveLintCommand())
 	return cmd
 }
@@ -989,7 +1098,6 @@ func runDrive(cmd *cobra.Command, rest []string) {
 	expectTimeoutMsValue, _ := cmd.Flags().GetInt("expect-timeout")
 	pointerValue, _ := cmd.Flags().GetString("pointer")
 	stepMarkersValue, _ := cmd.Flags().GetBool("step-markers")
-	strictAgentValue, _ := cmd.Flags().GetBool("strict-agent")
 	secretEnv, _ := cmd.Flags().GetStringArray("secret-env")
 	secretFiles, _ := cmd.Flags().GetStringArray("secret-file")
 	recordCommand, _ := cmd.Flags().GetBool("record-command")
@@ -1040,14 +1148,6 @@ func runDrive(cmd *cobra.Command, rest []string) {
 			os.Exit(2)
 		}
 	}
-	if strictAgentValue {
-		findings := lintDriveSteps(steps, true)
-		if len(findings) > 0 && printDriveLintFindings(os.Stderr, *scriptPath, findings) {
-			printRedactedError("trec drive: --strict-agent rejected script; run 'trec drive lint --strict %s' for details", *scriptPath)
-			os.Exit(2)
-		}
-	}
-
 	if *outputFile == "" {
 		*outputFile = fmt.Sprintf("record_%s.cast", time.Now().Format("20060102_150405"))
 	}
@@ -1161,7 +1261,6 @@ func runDrive(cmd *cobra.Command, rest []string) {
 		stepMarkers:      *stepMarkers,
 		outputFormat:     outputFormat,
 		redactor:         redactor,
-		strictAgent:      strictAgentValue,
 	}
 
 	time.Sleep(500 * time.Millisecond)
