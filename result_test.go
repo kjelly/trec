@@ -94,6 +94,63 @@ func TestSessionScriptProvenanceIsHashedNormalizedAndRedacted(t *testing.T) {
 	}
 }
 
+func TestRecordResultIntegrityMatchesOverwrittenCast(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "trec")
+	if out, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build trec: %v\n%s", err, out)
+	}
+	cast := filepath.Join(t.TempDir(), "session.cast")
+	if err := os.WriteFile(cast, []byte("{\"version\":2,\"width\":80,\"height\":24}\n[0,\"o\",\"old\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(binary, "-o", cast, "--force", "--", "sh", "-c", "printf new").CombinedOutput(); err != nil {
+		t.Fatalf("run record: %v\n%s", err, output)
+	}
+
+	resultData, err := os.ReadFile(resultPath(cast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary sessionResult
+	if err := json.Unmarshal(resultData, &summary); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	castData, err := os.ReadFile(cast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(castData)
+	if summary.Cast.SHA256 != hex.EncodeToString(digest[:]) || summary.Cast.ByteSize != int64(len(castData)) {
+		t.Fatalf("result integrity does not match replacement cast: %#v", summary.Cast)
+	}
+}
+
+func TestRecordRedactsExecutableMetadata(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "trec")
+	if out, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build trec: %v\n%s", err, out)
+	}
+	const secret = "executable-secret-value"
+	const secretEnv = "TREC_EXECUTABLE_SECRET"
+	executable := filepath.Join(t.TempDir(), "tool-"+secret)
+	if err := os.Symlink("/bin/true", executable); err != nil {
+		t.Fatal(err)
+	}
+	cast := filepath.Join(t.TempDir(), "session.cast")
+	cmd := exec.Command(binary, "--secret-env", secretEnv, "-o", cast, "--", executable)
+	cmd.Env = append(os.Environ(), secretEnv+"="+secret)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run record: %v\n%s", err, output)
+	}
+	castData, err := os.ReadFile(cast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(castData), secret) {
+		t.Fatalf("cast leaked executable secret:\n%s", castData)
+	}
+}
+
 func TestWriteSessionResultRecordsCastIntegrityAtomically(t *testing.T) {
 	dir := t.TempDir()
 	cast := filepath.Join(dir, "session.cast")

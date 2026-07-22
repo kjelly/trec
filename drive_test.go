@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -763,6 +765,42 @@ func TestDriveTimeoutErrorDoesNotLeakSecret(t *testing.T) {
 		if !strings.Contains(string(castData), `<screen redacted>`) && !strings.Contains(string(castData), `\u003cscreen redacted\u003e`) {
 			t.Fatalf("cast marker does not contain <screen redacted> placeholder:\n%s", castData)
 		}
+	}
+}
+
+func TestDriveResultIntegrityMatchesOverwrittenCast(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "trec")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build trec: %v\n%s", err, output)
+	}
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "steps.txt")
+	if err := os.WriteFile(scriptPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	castPath := filepath.Join(dir, "run.cast")
+	if err := os.WriteFile(castPath, []byte("{\"version\":2,\"width\":80,\"height\":24}\n[0,\"o\",\"old\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(binary, "drive", "--script", scriptPath, "-o", castPath, "--force", "--", "sh", "-c", "printf new").CombinedOutput(); err != nil {
+		t.Fatalf("run drive: %v\n%s", err, output)
+	}
+
+	resultData, err := os.ReadFile(resultPath(castPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary sessionResult
+	if err := json.Unmarshal(resultData, &summary); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	castData, err := os.ReadFile(castPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(castData)
+	if summary.Cast.SHA256 != hex.EncodeToString(digest[:]) || summary.Cast.ByteSize != int64(len(castData)) {
+		t.Fatalf("result integrity does not match replacement cast: %#v", summary.Cast)
 	}
 }
 

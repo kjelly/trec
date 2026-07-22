@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -855,6 +856,7 @@ func (ds *driveSession) snapshot(st *driveStep) {
 		Label:  ds.redactor.RedactString(label),
 		Screen: append([]string(nil), lines...),
 	})
+	ds.marker(fmt.Sprintf("SNAPSHOT %s", ds.redactor.RedactString(label)))
 	if !ds.interactive {
 		ds.dumpScreen(os.Stderr)
 	}
@@ -1330,6 +1332,15 @@ func runDrive(cmd *cobra.Command, rest []string) {
 			"CI":   "1",
 		},
 	}
+	if len(rest) > 0 {
+		hdr.Executable = redactor.RedactString(filepath.Base(rest[0]))
+	}
+	if *scriptPath != "" {
+		if scriptData, readErr := os.ReadFile(*scriptPath); readErr == nil {
+			h := sha256.Sum256(scriptData)
+			hdr.DriveScriptSHA256 = hex.EncodeToString(h[:])
+		}
+	}
 	if recordCommand {
 		hdr.Command = strings.Join(rest, " ")
 	}
@@ -1475,7 +1486,6 @@ func runDrive(cmd *cobra.Command, rest []string) {
 			if resultErr := writeSessionResult(*outputFile, ds.result(status, exitCode, fmt.Sprintf("line %d: %v", st.line, err), termination)); resultErr != nil {
 				fmt.Fprintf(os.Stderr, "trec drive: write summary: %v\n", resultErr)
 			}
-			fmt.Fprintf(os.Stderr, "trec drive: recorded to %s — replay with: trec play %s\n", *outputFile, *outputFile)
 			os.Exit(1)
 		}
 		if ds.stepMarkers {
@@ -1697,6 +1707,7 @@ interactiveDone:
 
 	if finalizeErr != nil {
 		fmt.Fprintf(os.Stderr, "trec drive: finalize error: %v\n", finalizeErr)
+		failed = true
 	}
 
 	fmt.Fprintf(os.Stderr, "trec drive: recorded to %s — replay with: trec play %s\n", *outputFile, *outputFile)
