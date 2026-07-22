@@ -180,3 +180,101 @@ func TestVerifyDiagnosesUnfinishedStepWithoutPendingHashNoise(t *testing.T) {
 		}
 	}
 }
+
+// TestSessionEndMarkerRoundTripWithDisposition verifies the new format
+// `SESSION_END status=ended disposition=script_ended exit_code=N` parses
+// correctly and the legacy 3-field form is still accepted.
+func TestSessionEndMarkerRoundTripWithDisposition(t *testing.T) {
+	status, code, disp, err := parseSessionEndMarker("SESSION_END status=ended disposition=script_ended exit_code=0")
+	if err != nil {
+		t.Fatalf("parse new format: %v", err)
+	}
+	if status != "ended" || code != 0 || disp != "script_ended" {
+		t.Fatalf("got status=%q code=%d disp=%q", status, code, disp)
+	}
+	// Legacy form must still parse.
+	status, code, disp, err = parseSessionEndMarker("SESSION_END status=aborted exit_code=-1")
+	if err != nil {
+		t.Fatalf("parse legacy: %v", err)
+	}
+	if status != "aborted" || code != -1 || disp != "" {
+		t.Fatalf("got status=%q code=%d disp=%q", status, code, disp)
+	}
+	// FormatSessionEndMarker produces parseable output.
+	marker := formatSessionEndMarker("ended", 0, "script_ended")
+	status, code, disp, err = parseSessionEndMarker(marker)
+	if err != nil || status != "ended" || code != 0 || disp != "script_ended" {
+		t.Fatalf("round-trip: status=%q code=%d disp=%q err=%v", status, code, disp, err)
+	}
+	// Empty disposition produces the legacy form (no disposition= field).
+	marker = formatSessionEndMarker("success", 0, "")
+	if !strings.Contains(marker, "exit_code=") || strings.Contains(marker, "disposition=") {
+		t.Fatalf("empty disposition should produce legacy form, got: %q", marker)
+	}
+}
+
+// TestClassifyProgressThreeStates verifies the three-state classification
+// applied by verify (pending / heartbeat_stale / completed).
+func TestClassifyProgressThreeStates(t *testing.T) {
+	now := time.Now()
+	// Completed: success status with a heartbeat_at anywhere.
+	cp := classifyProgress(sessionResult{
+		Status: "success",
+		LastStep: &sessionStep{
+			UpdatedAt:   now.UTC().Format(time.RFC3339Nano),
+			HeartbeatAt: now.UTC().Format(time.RFC3339Nano),
+		},
+	})
+	if cp == nil || cp.Phase != "completed" {
+		t.Fatalf("success -> completed, got %#v", cp)
+	}
+	// Pending: in_progress with a recent heartbeat.
+	cp = classifyProgress(sessionResult{
+		Status:    "in_progress",
+		UpdatedAt: now.UTC().Format(time.RFC3339Nano),
+		LastStep: &sessionStep{
+			UpdatedAt:   now.UTC().Format(time.RFC3339Nano),
+			HeartbeatAt: now.UTC().Format(time.RFC3339Nano),
+		},
+	})
+	if cp == nil || cp.Phase != "pending" || cp.Stale {
+		t.Fatalf("recent in_progress -> pending, got %#v", cp)
+	}
+	// Heartbeat_stale: in_progress with no heartbeat or a stale one.
+	oldHeartbeat := now.Add(-10 * time.Minute).UTC().Format(time.RFC3339Nano)
+	cp = classifyProgress(sessionResult{
+		Status:    "in_progress",
+		UpdatedAt: now.UTC().Format(time.RFC3339Nano),
+		LastStep: &sessionStep{
+			UpdatedAt:   now.UTC().Format(time.RFC3339Nano),
+			HeartbeatAt: oldHeartbeat,
+		},
+	})
+	if cp == nil || cp.Phase != "heartbeat_stale" || !cp.Stale {
+		t.Fatalf("stale in_progress -> heartbeat_stale, got %#v", cp)
+	}
+}
+
+// TestDetectInputDriftFlagsModifiedFile verifies the drift detector catches
+// inventory / vault files whose mtime is newer than the recorded one.
+func TestDetectInputDriftFlagsModifiedFile(t *testing.T) {
+	dir := t.TempDir()
+	inv := filepath.Join(dir, "inventory.yml")
+	if err := os.WriteFile(inv, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Sleep then bump mtime so current is strictly newer.
+	time.Sleep(20 * time.Millisecond)
+	now := time.Now()
+	if err := os.Chtimes(inv, now, now); err != nil {
+		t.Fatal(err)
+	}
+	oldMTime := now.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	drift := detectInputDrift(&sessionInputFingerprint{
+		InventoryPath:  inv,
+		InventoryMTime: oldMTime,
+	})
+	if len(drift) == 0 || !strings.Contains(drift[0], "modified since the cast") {
+		t.Fatalf("expected drift warning, got %v", drift)
+	}
+}

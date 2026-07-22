@@ -49,7 +49,10 @@ func isTUIUnsetSecretStatus(rule struct {
 	if len(match) < 2 {
 		return false
 	}
-	return strings.HasPrefix(match[1], "[未設定") || strings.HasPrefix(match[1], "[已設定")
+	value := match[1]
+	return strings.HasPrefix(value, "[未設定") ||
+		strings.HasPrefix(value, "[已設定") ||
+		strings.HasPrefix(strings.ToUpper(value), "CHANGE-ME")
 }
 
 func scanCast(path string) ([]scanFinding, error) {
@@ -65,6 +68,14 @@ func scanCast(path string) ([]scanFinding, error) {
 		findings = append(findings, scanText("header.env."+key, 0, value)...)
 	}
 	for _, event := range events {
+		// Drive step markers contain structural operation descriptions, not
+		// terminal output. In particular, an EXPECT label such as
+		// "ipa_admin_password =" is followed by a timing suffix and can look
+		// like an assignment to the heuristic scanner even though it carries no
+		// value. Inputs are separately redacted before marker creation.
+		if event.typ == "m" && strings.HasPrefix(event.data, "STEP_") {
+			continue
+		}
 		findings = append(findings, scanText("event."+event.typ, event.sec, event.data)...)
 	}
 	return findings, nil

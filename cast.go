@@ -129,27 +129,36 @@ func writeCastFile(path string, hdr castHeader, events []castEvent) error {
 	defer f.Close()
 
 	bw := bufio.NewWriter(f)
-	hdrJSON, err := json.Marshal(hdr)
+	data, err := marshalCast(hdr, events)
 	if err != nil {
 		return err
 	}
-	if _, err := bw.Write(hdrJSON); err != nil {
+	_, err = bw.Write(data)
+	if err != nil {
 		return err
 	}
-	bw.WriteByte('\n')
-	for _, e := range events {
-		data := any(e.data)
-		if e.rawData != nil {
-			data = e.rawData
-		}
-		b, err := json.Marshal([]any{e.sec, e.typ, data})
-		if err != nil {
-			return err
-		}
-		if _, err := bw.Write(b); err != nil {
-			return err
-		}
-		bw.WriteByte('\n')
-	}
 	return bw.Flush()
+}
+
+func marshalCast(hdr castHeader, events []castEvent) ([]byte, error) {
+	hdrJSON, err := json.Marshal(hdr)
+	if err != nil {
+		return nil, err
+	}
+	data := make([]byte, 0, len(hdrJSON)+len(events)*32)
+	data = append(data, hdrJSON...)
+	data = append(data, '\n')
+	for _, e := range events {
+		payload := any(e.data)
+		if e.rawData != nil {
+			payload = e.rawData
+		}
+		b, err := json.Marshal([]any{e.sec, e.typ, payload})
+		if err != nil {
+			return nil, err
+		}
+		data = append(data, b...)
+		data = append(data, '\n')
+	}
+	return data, nil
 }

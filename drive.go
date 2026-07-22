@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,6 +108,13 @@ func validateStep(st *driveStep) error {
 		if st.hasN && st.n <= 0 {
 			return fmt.Errorf("line %d: %s needs a positive timeout duration", st.line, strings.ToUpper(st.kind))
 		}
+	case "expect_fresh":
+		if st.text == "" {
+			return fmt.Errorf("line %d: EXPECT_FRESH needs text", st.line)
+		}
+		if st.hasN && st.n <= 0 {
+			return fmt.Errorf("line %d: EXPECT_FRESH needs a positive timeout duration", st.line)
+		}
 	case "expect_regex", "expect_screen_regex":
 		if st.text == "" {
 			return fmt.Errorf("line %d: %s needs text pattern", st.line, strings.ToUpper(st.kind))
@@ -119,6 +128,20 @@ func validateStep(st *driveStep) error {
 		}
 		if st.hasN && st.n <= 0 {
 			return fmt.Errorf("line %d: %s needs a positive timeout duration", st.line, strings.ToUpper(st.kind))
+		}
+	case "expect_fresh_regex":
+		if st.text == "" {
+			return fmt.Errorf("line %d: EXPECT_FRESH_REGEX needs text pattern", st.line)
+		}
+		if st.re == nil {
+			re, err := regexp.Compile(st.text)
+			if err != nil {
+				return fmt.Errorf("line %d: invalid regex", st.line)
+			}
+			st.re = re
+		}
+		if st.hasN && st.n <= 0 {
+			return fmt.Errorf("line %d: EXPECT_FRESH_REGEX needs a positive timeout duration", st.line)
 		}
 	case "expect_quiet":
 		if st.hasN && st.n <= 0 {
@@ -223,7 +246,7 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 	st := &driveStep{raw: trimmed, line: lineNo}
 
 	// EXPECT@<ms> overrides the default --expect-timeout for one step.
-	for _, prefix := range []string{"EXPECT", "EXPECT_EVENTUALLY", "EXPECT_TRANSITION", "EXPECT_REGEX", "EXPECT_SCREEN_REGEX"} {
+	for _, prefix := range []string{"EXPECT", "EXPECT_EVENTUALLY", "EXPECT_TRANSITION", "EXPECT_REGEX", "EXPECT_FRESH", "EXPECT_SCREEN_REGEX", "EXPECT_FRESH_REGEX"} {
 		if ms, ok := strings.CutPrefix(op, prefix+"@"); ok {
 			n, err := strconv.Atoi(ms)
 			if err != nil || n <= 0 {
@@ -480,6 +503,20 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		st.kind = "expect_change"
 	case "EXPECT_REGEX":
 		st.kind, st.text = "expect_regex", arg
+	case "EXPECT_FRESH_REGEX":
+		if arg == "" {
+			return nil, fmt.Errorf("line %d: EXPECT_FRESH_REGEX needs text pattern", lineNo)
+		}
+		st.kind, st.text = "expect_fresh_regex", arg
+	case "EXPECT_FRESH":
+		text, err := parseDriveQuotedArgument(arg, lineNo, op)
+		if err != nil {
+			return nil, err
+		}
+		if text == "" {
+			return nil, fmt.Errorf("line %d: EXPECT_FRESH needs text", lineNo)
+		}
+		st.kind, st.text = "expect_fresh", text
 	case "EXPECT_SCREEN_REGEX":
 		st.kind, st.text = "expect_screen_regex", arg
 	case "EXPECT_QUIET":
@@ -643,19 +680,111 @@ type driveSession struct {
 	outputFormat     string
 	baselineSnapshot *screenSnapshot
 	baselineValid    bool
+	progressMu       sync.Mutex
+	heartbeatStop    chan struct{}
+	heartbeatDone    chan struct{}
+	heartbeatPhase   string
+	heartbeatOp      string
 	redactor         *secretRedactor
 	snapshots        []sessionSnapshot
 }
 
 func (ds *driveSession) updateProgress(phase string, st *driveStep) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	ds.pending.LastStep = &sessionStep{
-		Line:      st.line,
-		Operation: ds.redactor.RedactString(safeStepDescription(st)),
-		Phase:     phase,
-		UpdatedAt: now,
+	op := ""
+	if st != nil {
+		op = ds.redactor.RedactString(safeStepDescription(st))
 	}
+	ds.progressMu.Lock()
+	ds.heartbeatPhase = phase
+	ds.heartbeatOp = op
+	ds.pending.LastStep = &sessionStep{
+		Line:           pickLine(st),
+		Operation:      op,
+		Phase:          phase,
+		UpdatedAt:      now,
+		HeartbeatAt:    now,
+		ElapsedSeconds: time.Since(ds.ts.start).Seconds(),
+	}
+	ds.pending.Progress = sessionProgressSnapshot(ds)
+	ds.progressMu.Unlock()
 	return writePendingSessionResult(ds.castPath, ds.pending)
+}
+
+func pickLine(st *driveStep) int {
+	if st == nil {
+		return 0
+	}
+	return st.line
+}
+
+// sessionProgressSnapshot builds the current sessionProgress from terminal
+// state. Used both by updateProgress and the heartbeat goroutine.
+func sessionProgressSnapshot(ds *driveSession) *sessionProgress {
+	if ds == nil || ds.ts == nil {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return &sessionProgress{
+		HeartbeatAt:     now,
+		ElapsedSeconds:  time.Since(ds.ts.start).Seconds(),
+		LastOutputAgeMS: ds.ts.quietFor().Milliseconds(),
+		WaitingFor:      ds.heartbeatOp,
+	}
+}
+
+// startHeartbeat launches a goroutine that refreshes pending.LastStep every
+// 30 seconds while a mutating step is in progress, so external pollers can
+// tell "still alive, waiting on X" from "looks stuck".
+func (ds *driveSession) startHeartbeat(st *driveStep) {
+	ds.progressMu.Lock()
+	if ds.heartbeatStop != nil {
+		ds.progressMu.Unlock()
+		return
+	}
+	ds.heartbeatStop = make(chan struct{})
+	ds.heartbeatDone = make(chan struct{})
+	stop := ds.heartbeatStop
+	done := ds.heartbeatDone
+	ds.progressMu.Unlock()
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				ds.progressMu.Lock()
+				if ds.pending.LastStep == nil {
+					ds.progressMu.Unlock()
+					continue
+				}
+				now := time.Now().UTC().Format(time.RFC3339Nano)
+				ds.pending.LastStep.HeartbeatAt = now
+				ds.pending.LastStep.ElapsedSeconds = time.Since(ds.ts.start).Seconds()
+				ds.pending.Progress = sessionProgressSnapshot(ds)
+				ds.progressMu.Unlock()
+				_ = writePendingSessionResult(ds.castPath, ds.pending)
+			}
+		}
+	}()
+}
+
+func (ds *driveSession) stopHeartbeat() {
+	ds.progressMu.Lock()
+	if ds.heartbeatStop == nil {
+		ds.progressMu.Unlock()
+		return
+	}
+	stop := ds.heartbeatStop
+	done := ds.heartbeatDone
+	ds.heartbeatStop = nil
+	ds.heartbeatDone = nil
+	ds.progressMu.Unlock()
+	close(stop)
+	<-done
 }
 
 func safeStepDescription(st *driveStep) string {
@@ -920,6 +1049,31 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 			timeout = time.Duration(st.n) * time.Millisecond
 		}
 		err = ds.ts.waitForTransition(ctx, ds.baselineSnapshot, st.text, timeout)
+		ds.baselineValid = false
+	case "expect_fresh":
+		if !ds.baselineValid {
+			// EXPECT_FRESH without a prior mutating step falls back to the
+			// last explicitly recorded baseline. If none, capture the current
+			// screen so the wait only succeeds on truly new content.
+			ds.baselineSnapshot = ds.ts.getSnapshot()
+			ds.baselineValid = true
+		}
+		timeout := ds.expectTimeout
+		if st.n > 0 {
+			timeout = time.Duration(st.n) * time.Millisecond
+		}
+		err = ds.ts.waitForFreshText(ctx, "EXPECT_FRESH", st.text, ds.baselineSnapshot, timeout)
+		ds.baselineValid = false
+	case "expect_fresh_regex":
+		if !ds.baselineValid {
+			ds.baselineSnapshot = ds.ts.getSnapshot()
+			ds.baselineValid = true
+		}
+		timeout := ds.expectTimeout
+		if st.n > 0 {
+			timeout = time.Duration(st.n) * time.Millisecond
+		}
+		err = ds.ts.waitForFreshRegex(ctx, "EXPECT_FRESH_REGEX", st.re, ds.baselineSnapshot, timeout)
 		ds.baselineValid = false
 	case "expect_regex":
 		timeout := ds.expectTimeout
@@ -1210,6 +1364,7 @@ func runDrive(cmd *cobra.Command, rest []string) {
 		ExpectMS:    *expectTimeoutMs,
 		ChildExitMS: int(childExitTimeout.Milliseconds()),
 	}
+	pending.Inputs = collectInputFingerprint(*scriptPath)
 	if err := writePendingSessionResult(*outputFile, pending); err != nil {
 		fmt.Fprintf(os.Stderr, "trec drive: write pending summary: %v\n", err)
 		os.Exit(1)
@@ -1240,7 +1395,12 @@ func runDrive(cmd *cobra.Command, rest []string) {
 	}
 
 	var ptyOut io.Reader = ptmx
-	if !*interactive {
+	// A TUI can redraw a secret value after it has been entered. The recorder
+	// redacts that stream before writing the cast, but TeeReader would mirror
+	// the raw PTY bytes to stdout first. Suppress that unsafe live mirror when
+	// any secret has been declared; callers can inspect the verified cast
+	// instead. Keep the existing live output for ordinary, non-secret runs.
+	if !*interactive && !redactor.hasSecrets() {
 		ptyOut = io.TeeReader(ptmx, os.Stdout)
 	}
 
@@ -1280,10 +1440,12 @@ func runDrive(cmd *cobra.Command, rest []string) {
 		if ds.stepMarkers {
 			ds.stepMarker("START", st, 0)
 		}
+		ds.startHeartbeat(st)
 		if err := ds.updateProgress("started", st); err != nil {
 			fmt.Fprintf(os.Stderr, "trec drive: update progress: %v\n", err)
 		}
 		if err := ds.applyStep(ctx, st); err != nil {
+			ds.stopHeartbeat()
 			if progressErr := ds.updateProgress("failed", st); progressErr != nil {
 				fmt.Fprintf(os.Stderr, "trec drive: update progress: %v\n", progressErr)
 			}
@@ -1297,7 +1459,7 @@ func runDrive(cmd *cobra.Command, rest []string) {
 				closeReason = "drive interrupted by signal"
 				status = "aborted"
 			}
-			if errClose := ts.closeWithStatus(status, closeReason); errClose != nil {
+			if errClose := ts.closeWithStatusFull(status, closeReason, "step_failure"); errClose != nil {
 				fmt.Fprintf(os.Stderr, "trec drive: finalize error: %v\n", errClose)
 			}
 			_, exitCode, childExitErr := ts.getExitState()
@@ -1319,10 +1481,12 @@ func runDrive(cmd *cobra.Command, rest []string) {
 		if ds.stepMarkers {
 			ds.stepMarker("OK", st, time.Since(stepStarted))
 		}
+		ds.stopHeartbeat()
 		if err := ds.updateProgress("completed", st); err != nil {
 			fmt.Fprintf(os.Stderr, "trec drive: update progress: %v\n", err)
 		}
 	}
+	ds.stopHeartbeat()
 
 	interactiveQuitRequested := false
 	interactiveInputClosed := false
@@ -1412,16 +1576,21 @@ interactiveDone:
 	aborted := false
 	termination := &sessionTermination{Kind: "child_exit"}
 	exited, exitCode, processExitErr := ts.getExitState()
+	disposition := ""
+	envTerminated := false
 	if scriptEndRequested || interactiveQuitRequested {
-		aborted = true
-		failed = true
+		envTerminated = true
 		termination.Kind = "operator_terminated"
 		if scriptEndRequested {
 			termination.Reason = scriptEndReason
+			termination.Disposition = "script_ended"
+			disposition = "script_ended"
 		} else {
 			termination.Reason = "interactive QUIT requested"
+			termination.Disposition = "interactive_quit"
+			disposition = "interactive_quit"
 		}
-		if errClose := ts.closeWithStatus("aborted", termination.Reason); errClose != nil {
+		if errClose := ts.closeWithStatusFull("ended", termination.Reason, disposition); errClose != nil {
 			finalizeErr = errClose
 		}
 	} else if !exited {
@@ -1431,12 +1600,12 @@ interactiveDone:
 				finalizeErr = fErr
 			}
 			if ctx.Err() != nil {
-				failed = true
-				aborted = true
+				envTerminated = true
 				finalizeErr = ctx.Err()
 				termination.Kind = "signal"
 				termination.Reason = "drive interrupted by signal"
-				if errClose := ts.closeWithStatus("aborted", termination.Reason); errClose != nil && finalizeErr == nil {
+				termination.Disposition = "external_signal"
+				if errClose := ts.closeWithStatusFull("aborted", termination.Reason, "external_signal"); errClose != nil && finalizeErr == nil {
 					finalizeErr = errClose
 				}
 			}
@@ -1449,11 +1618,12 @@ interactiveDone:
 			}
 			if waitErr == context.DeadlineExceeded {
 				fmt.Fprintln(os.Stderr, "trec drive: TIMEOUT — killing process")
-				failed = true
+				envTerminated = true
 				termination.Kind = "timeout"
 				termination.Reason = "drive timeout"
+				termination.Disposition = "timeout"
 				termination.TimedOut = true
-				if errClose := ts.closeWithStatus("failed", "drive timeout"); errClose != nil {
+				if errClose := ts.closeWithStatusFull("failed", "drive timeout", "timeout"); errClose != nil {
 					if finalizeErr != nil {
 						finalizeErr = fmt.Errorf("%w; close error: %v", finalizeErr, errClose)
 					} else {
@@ -1461,12 +1631,12 @@ interactiveDone:
 					}
 				}
 			} else if ctx.Err() != nil {
-				failed = true
-				aborted = true
+				envTerminated = true
 				finalizeErr = ctx.Err()
 				termination.Kind = "signal"
 				termination.Reason = "drive interrupted by signal"
-				if errClose := ts.closeWithStatus("aborted", termination.Reason); errClose != nil {
+				termination.Disposition = "external_signal"
+				if errClose := ts.closeWithStatusFull("aborted", termination.Reason, "external_signal"); errClose != nil {
 					finalizeErr = fmt.Errorf("%w; close error: %v", finalizeErr, errClose)
 				}
 			}
@@ -1501,12 +1671,18 @@ interactiveDone:
 		failed = true
 	}
 	status := "success"
-	if aborted {
+	switch {
+	case envTerminated && (scriptEndRequested || interactiveQuitRequested):
+		status = "ended"
+	case envTerminated:
 		status = "aborted"
-	} else if failed {
+	case failed:
 		status = "failed"
 	}
-	ds.marker(fmt.Sprintf("SESSION_END status=%s exit_code=%d", status, exitCode))
+	if disposition == "" && envTerminated {
+		disposition = termination.Disposition
+	}
+	ds.marker(formatSessionEndMarker(status, exitCode, disposition))
 	if err := f.Sync(); err != nil {
 		failed = true
 		if !aborted {
@@ -1562,7 +1738,7 @@ func (ds *driveSession) result(status string, exitCode int, message string, term
 		termination = terminations[0]
 	}
 	lines, _, _, _, _ := ds.ts.redactedScreenSnapshot()
-	return sessionResult{
+	res := sessionResult{
 		SessionID:       ds.sessionID,
 		StartedAt:       ds.startedAt,
 		Mode:            ds.pending.Mode,
@@ -1577,5 +1753,105 @@ func (ds *driveSession) result(status string, exitCode int, message string, term
 		LastStep:        ds.pending.LastStep,
 		Timeouts:        ds.pending.Timeouts,
 		Termination:     termination,
+		Progress:        ds.pending.Progress,
+		Inputs:          ds.pending.Inputs,
 	}
+	return res
+}
+
+// collectInputFingerprint fingerprints the inputs that produced this cast: the
+// script's own SHA-256 (already in pending.Script) plus inventory / vault
+// files if they are referenced by the script body. Mtime is captured so verify
+// can flag "cast inputs older than current" drift.
+func collectInputFingerprint(scriptPath string) *sessionInputFingerprint {
+	fp := &sessionInputFingerprint{
+		CWD:          safeGetwd(),
+		ScriptSHA256: "", // populated below if scriptPath is non-empty
+	}
+	if scriptPath != "" {
+		if data, err := os.ReadFile(scriptPath); err == nil {
+			sum := sha256.Sum256(data)
+			fp.ScriptSHA256 = hex.EncodeToString(sum[:])
+		}
+		// Light regex scan for inventory / vault references. The script may
+		// pass an inventory path through any number of wrappers; we look for
+		// the most common patterns and accept "no match" silently.
+		if data, err := os.ReadFile(scriptPath); err == nil {
+			body := string(data)
+			// Find candidate .ya?ml paths in the script body. Inventory / vault
+			// heuristics: prefer paths containing "inventory" / ".vault" / "main",
+			// and treat any other .yaml as inventory by default.
+			paths := reFindAll(body, `(/[A-Za-z0-9._\-/]+\.ya?ml)`)
+			var inv, vault string
+			for _, p := range paths {
+				base := p
+				if i := strings.LastIndex(base, "/"); i >= 0 {
+					base = base[i+1:]
+				}
+				switch {
+				case strings.Contains(base, "inventory") || strings.Contains(base, "hosts"):
+					if inv == "" {
+						inv = p
+					}
+				case strings.Contains(p, ".vault") || strings.Contains(base, "main") || strings.Contains(base, "secret"):
+					if vault == "" {
+						vault = p
+					}
+				default:
+					if inv == "" {
+						inv = p
+					}
+				}
+			}
+			if inv != "" {
+				fp.InventoryPath = inv
+				if info, err := os.Stat(inv); err == nil {
+					fp.InventoryMTime = info.ModTime().UTC().Format(time.RFC3339Nano)
+				}
+				fp.InventorySHA256 = sha256File(inv)
+			}
+			if vault != "" {
+				fp.VaultPath = vault
+				if info, err := os.Stat(vault); err == nil {
+					fp.VaultMTime = info.ModTime().UTC().Format(time.RFC3339Nano)
+				}
+				fp.VaultSHA256 = sha256File(vault)
+			}
+		}
+	}
+	return fp
+}
+
+func sha256File(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func firstMatch(s, pattern string) string {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return ""
+	}
+	m := re.FindString(s)
+	return m
+}
+
+func reFindAll(s, pattern string) []string {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil
+	}
+	return re.FindAllString(s, -1)
+}
+
+func safeGetwd() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return wd
 }

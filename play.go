@@ -93,6 +93,7 @@ type player struct {
 	forceSize     bool
 	tui           bool
 	smartSpeed    bool
+	minInputGap   float64
 
 	cmdCh  chan playCmd
 	quitCh chan struct{}
@@ -213,6 +214,34 @@ func adjustTiming(events []castEvent, idleLimit float64, smart bool) {
 		adjusted += gap
 		previousSec = events[i].sec
 		events[i].sec = adjusted
+	}
+}
+
+func adjustPlaybackTiming(events []castEvent, idleLimit float64, smart bool, minInputGap float64) {
+	adjustTiming(events, idleLimit, smart)
+	enforceInputGap(events, minInputGap)
+}
+
+// enforceInputGap shifts the timeline after input events so consecutive
+// inputs are separated by at least minGap seconds. Output ordering and the
+// recorded content remain unchanged; only too-short gaps become readable.
+func enforceInputGap(events []castEvent, minGap float64) {
+	if minGap <= 0 {
+		return
+	}
+	lastInput := -1.0
+	shift := 0.0
+	for i := range events {
+		events[i].sec += shift
+		if events[i].typ != "i" {
+			continue
+		}
+		if lastInput >= 0 && events[i].sec-lastInput < minGap {
+			delta := minGap - (events[i].sec - lastInput)
+			shift += delta
+			events[i].sec += delta
+		}
+		lastInput = events[i].sec
 	}
 }
 
@@ -412,6 +441,7 @@ func newPlayCommand() *cobra.Command {
 	cmd.Flags().BoolP("loop", "l", false, "loop playback continuously")
 	cmd.Flags().Bool("tui", false, "enable interactive playback controls")
 	cmd.Flags().Bool("smart-speed", false, "adapt pauses to output size and cap long waits")
+	cmd.Flags().Float64("min-input-gap", 0, "ensure at least N seconds between recorded input events (0 = disabled)")
 	cmd.Flags().Bool("pause-on-marker", false, "automatically pause playback when a marker is reached")
 	cmd.Flags().Bool("force-size", false, "play even when the terminal is smaller than the recording (may corrupt TUI layout)")
 	return cmd
@@ -423,6 +453,7 @@ func runPlay(cmd *cobra.Command, files []string) {
 	loop, _ := cmd.Flags().GetBool("loop")
 	tui, _ := cmd.Flags().GetBool("tui")
 	smartSpeed, _ := cmd.Flags().GetBool("smart-speed")
+	minInputGap, _ := cmd.Flags().GetFloat64("min-input-gap")
 	pauseOnMarker, _ := cmd.Flags().GetBool("pause-on-marker")
 	forceSize, _ := cmd.Flags().GetBool("force-size")
 	if len(files) == 0 {
@@ -462,6 +493,7 @@ func runPlay(cmd *cobra.Command, files []string) {
 	p.forceSize = forceSize
 	p.tui = tui
 	p.smartSpeed = smartSpeed
+	p.minInputGap = minInputGap
 
 	if p.tui {
 		go p.readKeys()
@@ -640,7 +672,7 @@ func playFile(p *player, path string) error {
 		return nil
 	}
 
-	adjustTiming(events, p.idleLimit, p.smartSpeed)
+	adjustPlaybackTiming(events, p.idleLimit, p.smartSpeed, p.minInputGap)
 
 	p.totalSec = events[len(events)-1].sec
 	p.atEnd = false

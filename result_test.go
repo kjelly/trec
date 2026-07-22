@@ -291,3 +291,35 @@ func TestScanCastIgnoresTUIUnsetSecretStatus(t *testing.T) {
 		t.Fatalf("findings = %#v, want no TUI-status findings", findings)
 	}
 }
+
+func TestScanCastIgnoresTUISecretPlaceholder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scan-tui-placeholder.cast")
+	if err := writeCastFile(path, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{
+		{sec: 1, typ: "o", data: "ipa_admin_password = CHANGE-ME-min-8-chars"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := scanCast(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want no placeholder findings", findings)
+	}
+}
+
+func TestScanCastIgnoresDriveMarkerWithoutSecretValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scan-drive-marker.cast")
+	if err := writeCastFile(path, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{
+		{sec: 1, typ: "m", data: "STEP_OK line 1: EXPECT ipa_admin_password = (0.123s)"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := scanCast(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings = %#v, want no drive-marker findings", findings)
+	}
+}

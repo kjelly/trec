@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -36,9 +37,10 @@ func newMCPCommand() *cobra.Command {
 }
 
 const (
-	defaultMCPCols  = 120
-	defaultMCPRows  = 40
-	maxMCPDimension = 1000
+	defaultMCPCols     = 120
+	defaultMCPRows     = 40
+	defaultMCPKeyDelay = 300 * time.Millisecond
+	maxMCPDimension    = 1000
 )
 
 func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
@@ -59,6 +61,7 @@ func newMCPProtocolServer(s *mcpServer) *mcpserver.MCPServer {
 		mcp.WithString("working_directory"),
 		mcp.WithInteger("cols", mcp.Description("PTY columns."), mcp.DefaultNumber(defaultMCPCols), mcp.Min(1), mcp.Max(maxMCPDimension)),
 		mcp.WithInteger("rows", mcp.Description("PTY rows."), mcp.DefaultNumber(defaultMCPRows), mcp.Min(1), mcp.Max(maxMCPDimension)),
+		mcp.WithNumber("key_delay_ms", mcp.Description("Delay between navigation keystrokes used by terminal_focus/choose/toggle/activate. Defaults to 300ms for readable recordings."), mcp.DefaultNumber(300), mcp.Min(0)),
 		mcp.WithString("record_file", mcp.Description("Path to record the session (.cast file). Must not exist.")),
 		mcp.WithString("record_title", mcp.Description("Title of the recording.")),
 		mcp.WithArray("secret_env", mcp.Description("Environment variables to redact from the recording.")),
@@ -315,11 +318,19 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 		var mcpOpts struct {
 			RecordFile  string   `json:"record_file"`
 			RecordTitle string   `json:"record_title"`
+			KeyDelayMS  *float64 `json:"key_delay_ms"`
 			SecretEnv   []string `json:"secret_env"`
 			SecretFile  []string `json:"secret_file"`
 		}
 		if err := json.Unmarshal(raw, &mcpOpts); err != nil {
 			return nil, err
+		}
+		keyDelay := defaultMCPKeyDelay
+		if mcpOpts.KeyDelayMS != nil {
+			if *mcpOpts.KeyDelayMS < 0 {
+				return nil, fmt.Errorf("key_delay_ms must not be negative")
+			}
+			keyDelay = time.Duration(*mcpOpts.KeyDelayMS * float64(time.Millisecond))
 		}
 
 		redactor, err := newSecretRedactor(mcpOpts.SecretEnv)
@@ -373,6 +384,10 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 			}
 			pending = newPendingSessionResult(time.Now())
 			pending.Mode = "mcp_terminal"
+			pending.Inputs = &sessionInputFingerprint{
+				CWD:       dir,
+				VaultPath: pickVaultFile(dir),
+			}
 			if err := writePendingSessionResult(mcpOpts.RecordFile, pending); err != nil {
 				for _, cl := range extraClosers {
 					cl.Close()
@@ -445,6 +460,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 			}))
 		}
 		ts := newTerminalSession(ptmx, ptmx, c, int(size.Cols), int(size.Rows), recorder, redactor, true, extraClosers, options...)
+		ts.keyDelay = keyDelay
 		s.mu.Lock()
 		s.next++
 		id := "session-" + strconv.Itoa(s.next)
@@ -637,15 +653,15 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 
 		var written int
 		if name == "terminal_choose" {
-			written, e = ss.chooseLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+			written, e = ss.chooseLabel(ctxSelect, a.Text, pointerRe, ss.keyDelay)
 		} else if name == "terminal_toggle" {
-			written, e = ss.toggleLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+			written, e = ss.toggleLabel(ctxSelect, a.Text, pointerRe, ss.keyDelay)
 		} else if name == "terminal_activate" {
 			switch strings.ToUpper(a.Key) {
 			case "ENTER":
-				written, e = ss.chooseLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+				written, e = ss.chooseLabel(ctxSelect, a.Text, pointerRe, ss.keyDelay)
 			case "SPACE":
-				written, e = ss.toggleLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
+				written, e = ss.toggleLabel(ctxSelect, a.Text, pointerRe, ss.keyDelay)
 			default:
 				return nil, fmt.Errorf("key must be ENTER or SPACE")
 			}
@@ -725,4 +741,21 @@ func (s *mcpServer) session(id string) (*terminalSession, error) {
 		return nil, fmt.Errorf("unknown session %q", id)
 	}
 	return ss, nil
+}
+
+// pickVaultFile looks for a .vault directory or a main.yaml under the
+// provided working directory and returns the most likely vault path, or
+// "" if none. Used by terminal_start to seed the input fingerprint.
+func pickVaultFile(dir string) string {
+	candidates := []string{
+		filepath.Join(dir, ".vault", "main.yaml"),
+		filepath.Join(dir, ".vault", "ipa-identity.yaml"),
+		filepath.Join(dir, "main.yaml"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
 }

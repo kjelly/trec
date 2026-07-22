@@ -602,6 +602,9 @@ func TestDriveTextFileAndSecretFileDoNotLeakToCast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("drive: %v\n%s", err, output)
 	}
+	if strings.Contains(string(output), secret) {
+		t.Fatalf("file secret leaked into drive stdout:\n%s", output)
+	}
 	cast, err := os.ReadFile(castPath)
 	if err != nil {
 		t.Fatal(err)
@@ -1040,10 +1043,14 @@ func TestDriveOutcomeConsistencyAndExplicitEndSession(t *testing.T) {
 			t.Fatalf("END_SESSION did not terminate promptly: %v", ctx.Err())
 		}
 		result := readResult(t, castPath)
-		if result.Status != "aborted" || result.Mode != "script" ||
+		if result.Status != "ended" || result.Mode != "script" ||
 			result.Timeouts == nil || result.Timeouts.ChildExitMS != 120000 ||
-			result.Termination == nil || result.Termination.Kind != "operator_terminated" {
+			result.Termination == nil || result.Termination.Kind != "operator_terminated" ||
+			result.Termination.Disposition != "script_ended" {
 			t.Fatalf("END_SESSION result = %#v", result)
+		}
+		if result.Cast.SessionEndStatus != "ended" {
+			t.Fatalf("cast SESSION_END status = %q, want ended", result.Cast.SessionEndStatus)
 		}
 	})
 }
@@ -1211,5 +1218,84 @@ func TestDriveRespondResultRedactsCurrentScreenNotHistoricalTaint(t *testing.T) 
 	out := buf.String()
 	if strings.Contains(out, "<screen redacted>") {
 		t.Fatalf("historical taint redacted an empty current screen: %s", out)
+	}
+}
+
+// TestParseExpectFreshVariants checks that EXPECT_FRESH and EXPECT_FRESH_REGEX
+// parse with the correct kind and timeout.
+func TestParseExpectFreshVariants(t *testing.T) {
+	cases := []struct {
+		line     string
+		wantKind string
+		wantN    int
+		wantHasN bool
+	}{
+		{`EXPECT_FRESH "PLAY RECAP"`, "expect_fresh", 0, false},
+		{`EXPECT_FRESH@30000 PLAY RECAP`, "expect_fresh", 30000, true},
+		{`EXPECT_FRESH_REGEX "ok=\d+"`, "expect_fresh_regex", 0, false},
+		{`EXPECT_FRESH_REGEX@5000 ok=`, "expect_fresh_regex", 5000, true},
+	}
+	for _, c := range cases {
+		step, err := parseDriveLine(c.line, 1)
+		if err != nil {
+			t.Errorf("parse %q: %v", c.line, err)
+			continue
+		}
+		if step.kind != c.wantKind {
+			t.Errorf("parse %q: kind = %q, want %q", c.line, step.kind, c.wantKind)
+		}
+		if step.n != c.wantN {
+			t.Errorf("parse %q: n = %d, want %d", c.line, step.n, c.wantN)
+		}
+		if step.hasN != c.wantHasN {
+			t.Errorf("parse %q: hasN = %t, want %t", c.line, step.hasN, c.wantHasN)
+		}
+	}
+}
+
+// TestLintCatchesWaitExpectStaleViewport verifies the lint rule that
+// flags a `WAIT <ms>` followed by an EXPECT that re-uses a substring
+// already seen earlier in the script — the r11 anti-pattern.
+func TestLintCatchesWaitExpectStaleViewport(t *testing.T) {
+	parse := func(lines ...string) []*driveStep {
+		t.Helper()
+		var steps []*driveStep
+		for i, l := range lines {
+			s, err := parseDriveLine(l, i+1)
+			if err != nil {
+				t.Fatalf("parse %q: %v", l, err)
+			}
+			steps = append(steps, s)
+		}
+		return steps
+	}
+	// Plain `WAIT 5000` + `EXPECT PLAY RECAP` repeats the same text that
+	// appeared at step 1 after a WAIT — lint must flag it.
+	bad := lintDriveSteps(parse(
+		"EXPECT PLAY RECAP",
+		"TEXT_AND_ENTER y",
+		"WAIT 5000",
+		"EXPECT PLAY RECAP",
+	), true)
+	found := false
+	for _, f := range bad {
+		if f.Level == "error" && strings.Contains(f.Message, "repeats a substring") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected repeat-substring-after-WAIT warning, got %#v", bad)
+	}
+	// EXPECT_FRESH variant should NOT trip the same rule.
+	good := lintDriveSteps(parse(
+		"EXPECT PLAY RECAP",
+		"TEXT_AND_ENTER y",
+		"WAIT 5000",
+		"EXPECT_FRESH PLAY RECAP",
+	), true)
+	for _, f := range good {
+		if f.Level == "error" && strings.Contains(f.Message, "repeats a substring") {
+			t.Errorf("EXPECT_FRESH should not trip the rule, got: %#v", good)
+		}
 	}
 }

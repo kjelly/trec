@@ -8,22 +8,38 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
 
 type castVerification struct {
-	Path           string        `json:"path"`
-	Valid          bool          `json:"valid"`
-	Issues         []string      `json:"issues,omitempty"`
-	Warnings       []string      `json:"warnings,omitempty"`
-	Status         string        `json:"status,omitempty"`
-	ExitCode       int           `json:"exit_code"`
-	Integrity      castIntegrity `json:"integrity"`
-	Scan           scanSummary   `json:"scan"`
-	ResultBuild    buildMetadata `json:"result_build,omitempty"`
-	UpdatedAt      string        `json:"updated_at,omitempty"`
-	UnfinishedStep string        `json:"unfinished_step,omitempty"`
+	Path           string                   `json:"path"`
+	Valid          bool                     `json:"valid"`
+	Issues         []string                 `json:"issues,omitempty"`
+	Warnings       []string                 `json:"warnings,omitempty"`
+	Status         string                   `json:"status,omitempty"`
+	ExitCode       int                      `json:"exit_code"`
+	Integrity      castIntegrity            `json:"integrity"`
+	Scan           scanSummary              `json:"scan"`
+	ResultBuild    buildMetadata            `json:"result_build,omitempty"`
+	UpdatedAt      string                   `json:"updated_at,omitempty"`
+	UnfinishedStep string                   `json:"unfinished_step,omitempty"`
+	Progress       *castProgress            `json:"progress,omitempty"`
+	Inputs         *sessionInputFingerprint `json:"inputs,omitempty"`
+	InputsDrift    []string                 `json:"inputs_drift,omitempty"`
+}
+
+// castProgress is the verify-side three-state classification. Phase "pending"
+// is informational (script is still running, last step has a recent heartbeat);
+// "heartbeat_stale" is a warning (no heartbeat in N seconds despite status
+// pending); "completed" / "failed" mirror the result status.
+type castProgress struct {
+	Phase           string  `json:"phase"`
+	HeartbeatAt     string  `json:"heartbeat_at,omitempty"`
+	LastOutputAgeMS int64   `json:"last_output_age_ms,omitempty"`
+	ElapsedSeconds  float64 `json:"elapsed_seconds,omitempty"`
+	Stale           bool    `json:"stale,omitempty"`
 }
 
 type verificationReport struct {
@@ -105,17 +121,22 @@ func verifyCast(path string) castVerification {
 			verification.ExitCode = result.ExitCode
 			verification.ResultBuild = result.Build
 			verification.UpdatedAt = result.UpdatedAt
+			if result.Inputs != nil {
+				verification.Inputs = result.Inputs
+				verification.InputsDrift = detectInputDrift(result.Inputs)
+			}
+			verification.Progress = classifyProgress(result)
 			if result.Build.Modified {
 				verification.Warnings = append(verification.Warnings, "recording was produced by a dirty trec build")
 			}
-			if result.Status != "success" {
+			if !isAcceptedCompletionStatus(result.Status) {
 				message := fmt.Sprintf("result status is %q", result.Status)
 				if result.Status == "in_progress" && result.UpdatedAt != "" {
 					message += " (last updated " + result.UpdatedAt + ")"
 				}
 				verification.Issues = append(verification.Issues, message)
 			}
-			if result.ExitCode != 0 {
+			if result.ExitCode != 0 && !isAcceptedCompletionStatus(result.Status) {
 				verification.Issues = append(verification.Issues, fmt.Sprintf("result exit_code is %d", result.ExitCode))
 			}
 			if !result.Cast.Complete {
@@ -143,7 +164,8 @@ func verifyCast(path string) castVerification {
 					if !observed.SessionEndFinal {
 						verification.Issues = append(verification.Issues, "SESSION_END is not the final cast event")
 					}
-					if observed.SessionEndStatus != result.Status {
+					if observed.SessionEndStatus != result.Status &&
+						!(result.Status == "ended" && observed.SessionEndStatus == "ended") {
 						verification.Issues = append(verification.Issues, fmt.Sprintf("SESSION_END status %q does not match result status %q", observed.SessionEndStatus, result.Status))
 					}
 					if observed.SessionEndExitCode == nil {
@@ -275,4 +297,87 @@ func runVerify(cmd *cobra.Command, paths []string) error {
 		return fmt.Errorf("trec verify: %w: %d of %d cast(s) failed", errVerificationFailed, report.Failed, report.Checked)
 	}
 	return nil
+}
+
+// isAcceptedCompletionStatus reports whether a result.Status is a legitimate
+// terminal state (not failure). "success" means the child exited 0 and the
+// recording completed; "ended" means the script invoked END_SESSION / QUIT
+// (intentional early termination, not a failure). All other values
+// (in_progress, failed, aborted) are not accepted.
+func isAcceptedCompletionStatus(status string) bool {
+	return status == "success" || status == "ended"
+}
+
+// classifyProgress turns the sessionStep.HeartbeatAt and sessionProgress fields
+// into a three-state phase for verify. The "pending" phase is informational
+// (not an issue); "heartbeat_stale" is a warning (no progress in 5 minutes
+// despite the result still being in_progress); "completed" mirrors success/ended.
+func classifyProgress(result sessionResult) *castProgress {
+	if result.LastStep == nil {
+		return nil
+	}
+	cp := &castProgress{
+		ElapsedSeconds: result.LastStep.ElapsedSeconds,
+	}
+	if result.Progress != nil {
+		cp.HeartbeatAt = result.Progress.HeartbeatAt
+		cp.LastOutputAgeMS = result.Progress.LastOutputAgeMS
+	}
+	// Fall back to LastStep.HeartbeatAt when Progress is absent (older pending
+	// results, or steps that don't have a heartbeat yet).
+	if cp.HeartbeatAt == "" && result.LastStep != nil {
+		cp.HeartbeatAt = result.LastStep.HeartbeatAt
+	}
+	switch result.Status {
+	case "in_progress":
+		cp.Phase = "pending"
+		// Heartbeat stale if no heartbeat_at, or if heartbeat_at is more than
+		// 5 minutes older than result.UpdatedAt.
+		if cp.HeartbeatAt == "" {
+			cp.Phase = "heartbeat_stale"
+			cp.Stale = true
+		} else {
+			t1, err1 := time.Parse(time.RFC3339Nano, cp.HeartbeatAt)
+			t2, err2 := time.Parse(time.RFC3339Nano, result.UpdatedAt)
+			if err1 == nil && err2 == nil && t2.Sub(t1) > 5*time.Minute {
+				cp.Phase = "heartbeat_stale"
+				cp.Stale = true
+			}
+		}
+	case "success", "ended":
+		cp.Phase = "completed"
+	case "failed", "aborted":
+		cp.Phase = "failed"
+	default:
+		cp.Phase = result.Status
+	}
+	return cp
+}
+
+// detectInputDrift re-checks inventory / vault / cwd on disk to flag when
+// the cast was recorded against a different environment than the current
+// one. Returns a list of human-readable warnings; empty if no drift.
+func detectInputDrift(fp *sessionInputFingerprint) []string {
+	var drift []string
+	if fp == nil {
+		return nil
+	}
+	check := func(label, path, recordedMTime, recordedSHA string) {
+		if path == "" {
+			return
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			drift = append(drift, fmt.Sprintf("%s (%s) is missing on disk now; cast inputs are stale", label, path))
+			return
+		}
+		currentMTime := info.ModTime().UTC().Format(time.RFC3339Nano)
+		if recordedMTime != "" && recordedMTime < currentMTime {
+			drift = append(drift, fmt.Sprintf("%s (%s) has been modified since the cast (mtime %s > recorded %s); do not treat this cast as evidence for the current environment", label, path, currentMTime, recordedMTime))
+		}
+		_ = recordedSHA
+	}
+	check("inventory", fp.InventoryPath, fp.InventoryMTime, fp.InventorySHA256)
+	check("vault", fp.VaultPath, fp.VaultMTime, fp.VaultSHA256)
+	return drift
 }

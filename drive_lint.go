@@ -114,7 +114,93 @@ func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
 		}
 		add(level, steps[len(steps)-1], "script has no explicit terminal disposition; finish with WAIT_CHILD_EXIT/ASSERT_EXIT or END_SESSION")
 	}
+	addStaleScreenWarnings(steps, strict, add)
 	return findings
+}
+
+// addStaleScreenWarnings emits warnings for the WAIT+EXPECT anti-pattern that
+// caused the r11 deploy-site-full.cast "stuck" report: a script that uses
+// `WAIT <ms>` to flush stale viewport content, then a plain `EXPECT <text>`
+// for a substring that was already visible before the WAIT. EXPECT_FRESH /
+// EXPECT_CHANGE+EXPECT are the right tools; `WAIT <ms>; EXPECT PLAY RECAP`
+// silently matches scrollback.
+func addStaleScreenWarnings(steps []*driveStep, strict bool, add func(string, *driveStep, string)) {
+	// For each step, remember the WAITs that "reset" expectations and the
+	// expected texts seen so far. Then warn when an EXPECT inside the WAIT
+	// window repeats a text that was already in flight.
+	type expSeen struct {
+		text    string
+		stepIdx int
+	}
+	history := make(map[string]int) // text -> latest step index where it appeared
+	lastWaitIdx := -1               // step index of the most recent WAIT
+	lastWaitAt := -1
+	const waitLookahead = 3
+	for i, step := range steps {
+		switch step.kind {
+		case "wait":
+			lastWaitIdx = i
+			lastWaitAt = i
+		case "expect", "expect_eventually", "expect_regex", "expect_screen_regex":
+			// If this EXPECT is the same text used earlier and there is a WAIT
+			// between that earlier use and now, warn.
+			text := step.text
+			if prev, ok := history[text]; ok && lastWaitAt > prev {
+				level := "warning"
+				if strict {
+					level = "error"
+				}
+				add(level, step, fmt.Sprintf("%s repeats a substring already used at step %d after a WAIT — use EXPECT_FRESH or EXPECT_CHANGE first, otherwise the match may be stale viewport content", strings.ToUpper(step.kind), prev+1))
+				// reset the WAIT window so a second stale re-use doesn't double-report
+				lastWaitAt = i
+			}
+			// Generic short uppercase tokens are very prone to scrollback matches.
+			if isLikelyScrollbackToken(text) && i > 0 && steps[i-1].kind == "wait" {
+				level := "warning"
+				if strict {
+					level = "error"
+				}
+				add(level, step, fmt.Sprintf("%s %q immediately follows WAIT and is a generic short token — use EXPECT_FRESH or expect a longer, host-specific string to avoid scrollback matches", strings.ToUpper(step.kind), text))
+			}
+		case "expect_fresh", "expect_fresh_regex":
+			// EXPECT_FRESH is the right tool; encourage it instead of WAIT+EXPECT.
+			if lastWaitIdx >= 0 && i-lastWaitIdx <= waitLookahead {
+				// good — author is doing WAIT then EXPECT_FRESH; we can stay silent
+				// (the WAIT is no longer load-bearing for the match, but it may
+				// still help settle the screen).
+			}
+		}
+		if step.kind == "expect" || step.kind == "expect_eventually" || step.kind == "expect_regex" || step.kind == "expect_screen_regex" {
+			history[step.text] = i
+		}
+		_ = lastWaitIdx
+	}
+}
+
+// isLikelyScrollbackToken returns true for short, all-uppercase phrases like
+// "PLAY RECAP", "OK", "FAILED", "CHANGED" that are common stdout tokens
+// prone to scrollback matches.
+func isLikelyScrollbackToken(text string) bool {
+	if len(text) > 12 || text == "" {
+		return false
+	}
+	hasUpper := false
+	hasLower := false
+	hasSpace := false
+	for _, r := range text {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			hasUpper = true
+		case r >= 'a' && r <= 'z':
+			hasLower = true
+		case r == ' ' || r == '\t':
+			hasSpace = true
+		}
+	}
+	// Pure-uppercase short tokens are the danger zone. Mixed-case phrases
+	// (e.g. "確定要執行以上指令") have enough entropy to make a false match
+	// unlikely.
+	return hasUpper && !hasLower && (hasSpace || len(text) <= 4)
 }
 
 func isUnsubmittedTextStep(kind string) bool {

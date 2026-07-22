@@ -37,3 +37,18 @@ func TestAdjustTimingPreservesShortBursts(t *testing.T) {
 		t.Fatalf("long idle timestamp = %v, want 0.79", events[2].sec)
 	}
 }
+
+func TestEnforceInputGap(t *testing.T) {
+	events := []castEvent{
+		{sec: 1, typ: "i", data: "a"},
+		{sec: 1.1, typ: "o", data: "frame"},
+		{sec: 1.2, typ: "i", data: "b"},
+	}
+	enforceInputGap(events, 0.5)
+	if math.Abs(events[2].sec-events[0].sec-0.5) > 1e-9 {
+		t.Fatalf("input gap = %v, want 0.5", events[2].sec-events[0].sec)
+	}
+	if math.Abs(events[1].sec-1.1) > 1e-9 {
+		t.Fatalf("preceding output event moved: %v", events[1].sec)
+	}
+}

@@ -32,6 +32,7 @@ type terminalSession struct {
 	lastOut time.Time
 
 	recorder       *recordingWriter
+	keyDelay       time.Duration
 	redactor       *secretRedactor
 	extraClosers   []io.Closer
 	finalizeHook   func(*terminalSession) error
@@ -40,12 +41,13 @@ type terminalSession struct {
 	writeMu sync.Mutex
 	closed  bool
 
-	processMu   sync.Mutex
-	exited      bool
-	exitCode    int
-	exitErr     error
-	closeStatus string
-	closeReason string
+	processMu        sync.Mutex
+	exited           bool
+	exitCode         int
+	exitErr          error
+	closeStatus      string
+	closeReason      string
+	closeDisposition string
 
 	done         chan struct{} // Closed when the read loop completes
 	processDone  chan struct{} // Closed after process status is captured
@@ -335,7 +337,11 @@ func (ts *terminalSession) isProcessExited() bool {
 	return ts.exited
 }
 
-// waitForText waits until the text appears.
+// waitForText waits until the text appears anywhere on the emulated screen.
+// It does not distinguish "newly appeared" from "already on screen" — use
+// waitForFreshText when the script needs to wait for content that the previous
+// step did not already produce (e.g. the second PLAY RECAP after a long
+// apply, where the first PLAY RECAP is still visible in the scrollback).
 func (ts *terminalSession) waitForText(ctx context.Context, opName, text string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -354,6 +360,68 @@ func (ts *terminalSession) waitForText(ctx context.Context, opName, text string,
 		}
 		time.Sleep(40 * time.Millisecond)
 	}
+}
+
+// waitForFreshText succeeds only when the requested text appears on the
+// current screen AND was not present in startSnap. This is the "must be new"
+// variant used by EXPECT_FRESH / EXPECT_FRESH_REGEX to defeat viewport
+// scrollback matches: e.g. waiting for the second PLAY RECAP after a long
+// apply, where the preview's PLAY RECAP is still visible.
+func (ts *terminalSession) waitForFreshText(ctx context.Context, opName, text string, startSnap *screenSnapshot, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	baselineHasText := startSnap != nil && screenContains(startSnap.lines, text)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lines := ts.screenLines()
+		if !baselineHasText && screenContains(lines, text) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			lastOut := ts.quietFor()
+			return fmt.Errorf("%s %q: timeout after %v (baseline already had it: %t, last output %v ago)", opName, text, timeout, baselineHasText, lastOut)
+		}
+		if ts.isProcessExited() {
+			return fmt.Errorf("%s %q: process exited before fresh match", opName, text)
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+}
+
+// waitForFreshRegex is the regexp counterpart of waitForFreshText.
+func (ts *terminalSession) waitForFreshRegex(ctx context.Context, opName string, re *regexp.Regexp, startSnap *screenSnapshot, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	baselineHasMatch := startSnap != nil && regexMatchesAny(startSnap.lines, re, false)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lines := ts.screenLines()
+		if !baselineHasMatch && regexMatchesAny(lines, re, false) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			lastOut := ts.quietFor()
+			return fmt.Errorf("%s %q: timeout after %v (baseline already matched: %t, last output %v ago)", opName, re.String(), timeout, baselineHasMatch, lastOut)
+		}
+		if ts.isProcessExited() {
+			return fmt.Errorf("%s %q: process exited before fresh match", opName, re.String())
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+}
+
+func regexMatchesAny(lines []string, re *regexp.Regexp, screenRegex bool) bool {
+	if screenRegex {
+		return re.MatchString(strings.Join(lines, "\n"))
+	}
+	for _, line := range lines {
+		if re.MatchString(line) {
+			return true
+		}
+	}
+	return false
 }
 
 func (ts *terminalSession) waitForRegex(ctx context.Context, opName string, re *regexp.Regexp, timeout time.Duration, screenRegex bool) error {
@@ -743,10 +811,12 @@ func (ts *terminalSession) finalize() error {
 				if processErr != nil || exitCode != 0 {
 					status = "failed"
 				}
-				if closeStatus, _ := ts.getCloseDisposition(); closeStatus != "" {
+				closeStatus, _, closeDisposition := ts.getCloseDispositionFull()
+				if closeStatus != "" {
 					status = closeStatus
 				}
-				if err := ts.recorder.event(time.Since(ts.start).Seconds(), "m", fmt.Sprintf("SESSION_END status=%s exit_code=%d", status, exitCode)); err != nil {
+				marker := formatSessionEndMarker(status, exitCode, closeDisposition)
+				if err := ts.recorder.event(time.Since(ts.start).Seconds(), "m", marker); err != nil {
 					errs = append(errs, fmt.Sprintf("record session end: %v", err))
 				}
 			}
@@ -794,11 +864,16 @@ func (ts *terminalSession) closeWithReason(reason string) error {
 }
 
 func (ts *terminalSession) closeWithStatus(status, reason string) error {
+	return ts.closeWithStatusFull(status, reason, "")
+}
+
+func (ts *terminalSession) closeWithStatusFull(status, reason, disposition string) error {
 	if reason != "" {
 		ts.processMu.Lock()
 		if ts.closeReason == "" {
 			ts.closeStatus = status
 			ts.closeReason = reason
+			ts.closeDisposition = disposition
 		}
 		ts.processMu.Unlock()
 	}
@@ -829,6 +904,17 @@ func (ts *terminalSession) getCloseDisposition() (status, reason string) {
 	ts.processMu.Lock()
 	defer ts.processMu.Unlock()
 	return ts.closeStatus, ts.closeReason
+}
+
+// getCloseDispositionFull exposes the structured disposition recorded by
+// closeWithStatusFull. Disposition is one of "script_ended",
+// "external_signal", "timeout", "internal_error", "step_failure" — used by
+// the recorder / SESSION_END marker so the result can be distinguished from
+// a hard abort.
+func (ts *terminalSession) getCloseDispositionFull() (status, reason, disposition string) {
+	ts.processMu.Lock()
+	defer ts.processMu.Unlock()
+	return ts.closeStatus, ts.closeReason, ts.closeDisposition
 }
 
 func (ts *terminalSession) getProcessResult() (code int, err error) {

@@ -169,6 +169,7 @@ func runRecord(cmd *cobra.Command, args []string) {
 	pending := newPendingSessionResult(started)
 	pending.Mode = "record"
 	pending.CommandLabel = commandLabel
+	pending.Inputs = &sessionInputFingerprint{CWD: safeGetwd()}
 	if err := writePendingSessionResult(outputFile, pending); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to write recording summary: %v\n", err)
 		os.Exit(1)
@@ -393,6 +394,7 @@ func runRecord(cmd *cobra.Command, args []string) {
 		DurationSeconds: time.Since(startTime).Seconds(),
 		FinalScreen:     finalScreen,
 		Termination:     termination,
+		Inputs:          pending.Inputs,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing recording summary: %v\n", err)
 		if recErr == nil {

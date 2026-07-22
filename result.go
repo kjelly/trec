@@ -17,24 +17,26 @@ import (
 
 // sessionResult is a machine-readable completion record written next to a cast.
 type sessionResult struct {
-	SessionID       string              `json:"session_id,omitempty"`
-	StartedAt       string              `json:"started_at,omitempty"`
-	UpdatedAt       string              `json:"updated_at,omitempty"`
-	Mode            string              `json:"mode,omitempty"`
-	CommandLabel    string              `json:"command_label,omitempty"`
-	Status          string              `json:"status"`
-	ExitCode        int                 `json:"exit_code"`
-	Error           string              `json:"error,omitempty"`
-	DurationSeconds float64             `json:"duration_seconds"`
-	FinalScreen     []string            `json:"final_screen,omitempty"`
-	Snapshots       []sessionSnapshot   `json:"snapshots,omitempty"`
-	Script          *sessionScript      `json:"script,omitempty"`
-	LastStep        *sessionStep        `json:"last_step,omitempty"`
-	Timeouts        *sessionTimeouts    `json:"timeouts,omitempty"`
-	Termination     *sessionTermination `json:"termination,omitempty"`
-	Build           buildMetadata       `json:"build"`
-	Scan            scanSummary         `json:"scan"`
-	Cast            castIntegrity       `json:"cast"`
+	SessionID       string                   `json:"session_id,omitempty"`
+	StartedAt       string                   `json:"started_at,omitempty"`
+	UpdatedAt       string                   `json:"updated_at,omitempty"`
+	Mode            string                   `json:"mode,omitempty"`
+	CommandLabel    string                   `json:"command_label,omitempty"`
+	Status          string                   `json:"status"`
+	ExitCode        int                      `json:"exit_code"`
+	Error           string                   `json:"error,omitempty"`
+	DurationSeconds float64                  `json:"duration_seconds"`
+	FinalScreen     []string                 `json:"final_screen,omitempty"`
+	Snapshots       []sessionSnapshot        `json:"snapshots,omitempty"`
+	Script          *sessionScript           `json:"script,omitempty"`
+	LastStep        *sessionStep             `json:"last_step,omitempty"`
+	Timeouts        *sessionTimeouts         `json:"timeouts,omitempty"`
+	Termination     *sessionTermination      `json:"termination,omitempty"`
+	Build           buildMetadata            `json:"build"`
+	Scan            scanSummary              `json:"scan"`
+	Cast            castIntegrity            `json:"cast"`
+	Progress        *sessionProgress         `json:"progress,omitempty"`
+	Inputs          *sessionInputFingerprint `json:"inputs,omitempty"`
 }
 
 type sessionTimeouts struct {
@@ -43,10 +45,11 @@ type sessionTimeouts struct {
 }
 
 type sessionTermination struct {
-	Kind     string `json:"kind"`
-	Reason   string `json:"reason,omitempty"`
-	Signal   string `json:"signal,omitempty"`
-	TimedOut bool   `json:"timed_out,omitempty"`
+	Kind        string `json:"kind"`
+	Disposition string `json:"disposition,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	Signal      string `json:"signal,omitempty"`
+	TimedOut    bool   `json:"timed_out,omitempty"`
 }
 
 type sessionScript struct {
@@ -56,10 +59,42 @@ type sessionScript struct {
 }
 
 type sessionStep struct {
-	Line      int    `json:"line"`
-	Operation string `json:"operation"`
-	Phase     string `json:"phase"`
-	UpdatedAt string `json:"updated_at"`
+	Line           int     `json:"line"`
+	Operation      string  `json:"operation"`
+	Phase          string  `json:"phase"`
+	UpdatedAt      string  `json:"updated_at"`
+	HeartbeatAt    string  `json:"heartbeat_at,omitempty"`
+	ElapsedSeconds float64 `json:"elapsed_seconds,omitempty"`
+}
+
+// sessionProgress exposes long-running apply visibility: heartbeat timestamp
+// and the age of the most recent child output. A live script refreshes
+// HeartbeatAt and ElapsedSeconds without writing a new cast event; consumers
+// can read this sidecar to distinguish "still waiting on apply" from
+// "looks stuck". LastOutputAgeMS is derived from terminalSession.quietFor at
+// the time of the heartbeat flush.
+type sessionProgress struct {
+	HeartbeatAt         string  `json:"heartbeat_at,omitempty"`
+	ElapsedSeconds      float64 `json:"elapsed_seconds,omitempty"`
+	LastOutputAgeMS     int64   `json:"last_output_age_ms,omitempty"`
+	WaitingFor          string  `json:"waiting_for,omitempty"`
+	WaitingForElapsedMS int64   `json:"waiting_for_elapsed_ms,omitempty"`
+}
+
+// sessionInputFingerprint lets a reader tell whether a cast was recorded
+// against the same inventory / vault / working directory that is currently on
+// disk. Without this, an agent can mistake a cast from a previous environment
+// for evidence of the current one (the failure mode that left the r11
+// deploy-site-full.cast's apply unverified against the live VMs).
+type sessionInputFingerprint struct {
+	InventoryPath   string `json:"inventory_path,omitempty"`
+	InventoryMTime  string `json:"inventory_mtime,omitempty"`
+	InventorySHA256 string `json:"inventory_sha256,omitempty"`
+	VaultPath       string `json:"vault_path,omitempty"`
+	VaultMTime      string `json:"vault_mtime,omitempty"`
+	VaultSHA256     string `json:"vault_sha256,omitempty"`
+	CWD             string `json:"cwd,omitempty"`
+	ScriptSHA256    string `json:"script_sha256,omitempty"`
 }
 
 func buildSessionScript(path string, steps []*driveStep, redactor *secretRedactor) (*sessionScript, error) {
@@ -252,7 +287,7 @@ func inspectCastIntegrity(path string) (castIntegrity, error) {
 		}
 		lastTime = event.sec
 		if event.typ == "m" && strings.HasPrefix(event.data, "SESSION_END ") {
-			status, exitCode, err := parseSessionEndMarker(event.data)
+			status, exitCode, _, err := parseSessionEndMarker(event.data)
 			if err != nil {
 				return castIntegrity{}, fmt.Errorf("invalid event at line %d: %w", lineNo, err)
 			}
@@ -296,24 +331,49 @@ func inspectCastIntegrity(path string) (castIntegrity, error) {
 	}, nil
 }
 
-func parseSessionEndMarker(data string) (string, int, error) {
+// parseSessionEndMarker accepts both the legacy form
+//
+//	wire:   SESSION_END status=aborted exit_code=-1
+//	new:    SESSION_END status=ended disposition=script_ended exit_code=0
+//
+// The disposition field is optional and parsed as the second return value.
+func parseSessionEndMarker(data string) (status string, exitCode int, disposition string, err error) {
 	fields := strings.Fields(data)
-	if len(fields) != 3 || fields[0] != "SESSION_END" {
-		return "", 0, fmt.Errorf("malformed SESSION_END marker")
+	if len(fields) < 3 || fields[0] != "SESSION_END" {
+		return "", 0, "", fmt.Errorf("malformed SESSION_END marker")
 	}
-	status, ok := strings.CutPrefix(fields[1], "status=")
-	if !ok || status == "" {
-		return "", 0, fmt.Errorf("malformed SESSION_END status")
+	statusField, ok := strings.CutPrefix(fields[1], "status=")
+	if !ok || statusField == "" {
+		return "", 0, "", fmt.Errorf("malformed SESSION_END status")
 	}
-	exitCodeText, ok := strings.CutPrefix(fields[2], "exit_code=")
+	status = statusField
+	// Walk key=value pairs from the end. The last pair is always exit_code=.
+	exitCodeField := fields[len(fields)-1]
+	exitCodeText, ok := strings.CutPrefix(exitCodeField, "exit_code=")
 	if !ok {
-		return "", 0, fmt.Errorf("malformed SESSION_END exit_code")
+		return "", 0, "", fmt.Errorf("malformed SESSION_END exit_code")
 	}
-	exitCode, err := strconv.Atoi(exitCodeText)
+	exitCode, err = strconv.Atoi(exitCodeText)
 	if err != nil {
-		return "", 0, fmt.Errorf("malformed SESSION_END exit_code: %w", err)
+		return "", 0, "", fmt.Errorf("malformed SESSION_END exit_code: %w", err)
 	}
-	return status, exitCode, nil
+	// Optional disposition= field sits between status and exit_code.
+	for _, f := range fields[2 : len(fields)-1] {
+		if v, ok := strings.CutPrefix(f, "disposition="); ok {
+			disposition = v
+		}
+	}
+	return status, exitCode, disposition, nil
+}
+
+// formatSessionEndMarker produces a marker line that parseSessionEndMarker
+// can round-trip. Disposition is omitted when empty so the legacy
+// "status=… exit_code=…" format is preserved.
+func formatSessionEndMarker(status string, exitCode int, disposition string) string {
+	if disposition == "" {
+		return fmt.Sprintf("SESSION_END status=%s exit_code=%d", status, exitCode)
+	}
+	return fmt.Sprintf("SESSION_END status=%s disposition=%s exit_code=%d", status, disposition, exitCode)
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) (err error) {

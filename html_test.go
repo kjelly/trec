@@ -16,10 +16,10 @@ func TestSharingBlocksScanFindingsUnlessExplicitlyAllowed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := shareableHTMLPageData(path, "", true, false); err == nil || !strings.Contains(err.Error(), "refusing to share") {
+	if _, err := shareableHTMLPageData(path, "", true, false, 0, 0); err == nil || !strings.Contains(err.Error(), "refusing to share") {
 		t.Fatalf("unreviewed cast error = %v, want scan gate", err)
 	}
-	data, err := shareableHTMLPageData(path, "", false, true)
+	data, err := shareableHTMLPageData(path, "", false, true, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestSharingBlocksScanFindingsUnlessExplicitlyAllowed(t *testing.T) {
 		t.Fatal("keystroke overlay override was ignored")
 	}
 
-	server := newCastServerWithOptions(filepath.Dir(path), false, true)
+	server := newCastServerWithOptions(filepath.Dir(path), false, true, 0, 0)
 	req := httptest.NewRequest(http.MethodGet, "/play/unsafe.cast", nil)
 	res := httptest.NewRecorder()
 	server.ServeHTTP(res, req)
