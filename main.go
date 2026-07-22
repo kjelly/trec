@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,16 +20,18 @@ import (
 
 // castHeader is the first line of an asciicast v2 file.
 type castHeader struct {
-	Version      int               `json:"version"`
-	Width        int               `json:"width"`
-	Height       int               `json:"height"`
-	Timestamp    int64             `json:"timestamp"`
-	TrecVersion  string            `json:"trec_version,omitempty"`
-	TrecBuild    buildMetadata     `json:"trec_build,omitempty"`
-	Command      string            `json:"command,omitempty"`
-	CommandLabel string            `json:"command_label,omitempty"`
-	Title        string            `json:"title,omitempty"`
-	Env          map[string]string `json:"env,omitempty"`
+	Version           int               `json:"version"`
+	Width             int               `json:"width"`
+	Height            int               `json:"height"`
+	Timestamp         int64             `json:"timestamp"`
+	TrecVersion       string            `json:"trec_version,omitempty"`
+	TrecBuild         buildMetadata     `json:"trec_build,omitempty"`
+	Executable        string            `json:"executable,omitempty"`
+	Command           string            `json:"command,omitempty"`
+	CommandLabel      string            `json:"command_label,omitempty"`
+	DriveScriptSHA256 string            `json:"drive_script_sha256,omitempty"`
+	Title             string            `json:"title,omitempty"`
+	Env               map[string]string `json:"env,omitempty"`
 }
 
 func getenv(key, fallback string) string {
@@ -152,6 +155,9 @@ func runRecord(cmd *cobra.Command, args []string) {
 			"TERM":  getenv("TERM", "xterm-256color"),
 			"SHELL": getenv("SHELL", "/bin/sh"),
 		},
+	}
+	if len(args) > 0 {
+		hdr.Executable = redactor.RedactString(filepath.Base(args[0]))
 	}
 	if recordCommand {
 		hdr.Command = strings.Join(args, " ")
