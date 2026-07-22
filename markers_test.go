@@ -22,8 +22,8 @@ func TestFindMarkersFiltersAndKeepsSelectedEventIdentity(t *testing.T) {
 	if len(markers) != 1 {
 		t.Fatalf("markers = %#v, want one", markers)
 	}
-	if markers[0].Index != 0 || markers[0].eventIndex != 2 || markers[0].Label != "STEP_FAILED line 1" {
-		t.Fatalf("marker = %#v, want filtered marker identity", markers[0])
+	if markers[0].Index != 0 || markers[0].eventIndex != 2 || markers[0].Label != "STEP_FAILED line 1" || markers[0].Kind != "failure" {
+		t.Fatalf("marker = %#v, want filtered marker identity with failure kind", markers[0])
 	}
 
 	if _, err := findMarkers(events, "[", 0, -1); err == nil {
@@ -64,5 +64,13 @@ func TestMarkersCommandAndRenderMarkerSelection(t *testing.T) {
 	}
 	if !strings.Contains(string(output), `"marker":"STEP_START line 1"`) || !strings.Contains(string(output), "before") {
 		t.Fatalf("rendered marker output = %s", output)
+	}
+
+	output, err = exec.Command(binary, "render", "--last-marker", "--output-format", "jsonl", cast).CombinedOutput()
+	if err != nil {
+		t.Fatalf("render last-marker: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), `"marker":"STEP_FAILED line 1"`) || !strings.Contains(string(output), "after") {
+		t.Fatalf("rendered last-marker output = %s", output)
 	}
 }
