@@ -77,7 +77,7 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringArray("secret-file", nil, "NAME=path whose file content is redacted from the recording (repeatable)")
 	cmd.PersistentFlags().Bool("record-command", false, "store the command in the cast header (redacted by --secret-env/--secret-file)")
 	cmd.PersistentFlags().String("command-label", "", "safe label stored in the cast header instead of the full command")
-	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand(), newMarkersCommand(), newMCPCommand(), newVersionCommand(), newRenderCommand(), newScanCommand(), newVerifyCommand())
+	cmd.AddCommand(newDriveCommand(), newPlayCommand(), newHTMLCommand(), newServeCommand(), newTranscriptCommand(), newAnnotateCommand(), newMarkersCommand(), newMergeCommand(), newMCPCommand(), newVersionCommand(), newRenderCommand(), newScanCommand(), newVerifyCommand())
 	return cmd
 }
 
