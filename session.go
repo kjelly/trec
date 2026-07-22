@@ -884,12 +884,12 @@ func (ts *terminalSession) closeWithStatusFull(status, reason, disposition strin
 		return ts.finalizeErr
 	}
 	ts.closed = true
-	ts.closeIn()
 	ts.writeMu.Unlock()
 
 	if ts.cmd != nil && ts.cmd.Process != nil {
-		_ = ts.cmd.Process.Kill()
+		terminateProcessTree(ts.cmd.Process)
 	}
+	ts.closeIn()
 	<-ts.processDone
 	ts.teardown()
 	return ts.finalizeErr
