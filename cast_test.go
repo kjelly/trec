@@ -53,3 +53,18 @@ func TestCastRoundTripsUnknownExtensionEvent(t *testing.T) {
 		t.Fatalf("unknown event changed during round trip:\n%s", data)
 	}
 }
+
+func TestLoadCastFileTolerantMode(t *testing.T) {
+	const cast = "{\"version\":2,\"width\":80,\"height\":24}\n[1,\"o\",\"valid\"]\n[0.5,\"o\",\"invalid time\"]\n[2,\"o\",\"also valid\"]\n"
+	tmp := t.TempDir() + "/tolerant.cast"
+	if err := os.WriteFile(tmp, []byte(cast), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, events, err := loadCastFileWithOptions(tmp, loadCastOptions{Tolerant: true})
+	if err != nil {
+		t.Fatalf("tolerant mode failed: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2", len(events))
+	}
+}

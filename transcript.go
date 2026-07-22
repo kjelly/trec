@@ -134,17 +134,19 @@ func newTranscriptCommand() *cobra.Command {
 		Run:   runTranscript,
 	}
 	cmd.Flags().String("format", "text", "output format (text, json, jsonl)")
+	cmd.Flags().Bool("tolerant", false, "skip invalid events with a warning instead of failing")
 	return cmd
 }
 
 func runTranscript(cmd *cobra.Command, files []string) {
 	format, _ := cmd.Flags().GetString("format")
+	tolerant, _ := cmd.Flags().GetBool("tolerant")
 	if len(files) != 1 {
 		cmd.Usage()
 		os.Exit(1)
 	}
 
-	hdr, events, err := loadCastFile(files[0])
+	hdr, events, err := loadCastFileWithOptions(files[0], loadCastOptions{Tolerant: tolerant})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

@@ -19,8 +19,10 @@ func newRenderCommand() *cobra.Command {
 	cmd.Flags().Bool("markers", false, "Print the screen state at every marker event")
 	cmd.Flags().String("marker-regex", "", "only render markers whose label matches this regexp (implies --markers)")
 	cmd.Flags().Int("marker-index", -1, "render one zero-based marker after filtering (implies --markers)")
+	cmd.Flags().Bool("last-marker", false, "render only the last marker after filtering (implies --markers)")
 	cmd.Flags().Float64("at", -1, "Stop rendering and print the screen at this timestamp (seconds)")
 	cmd.Flags().String("output-format", "", "Output format (e.g. jsonl)")
+	cmd.Flags().Bool("tolerant", false, "skip invalid events with a warning instead of failing")
 	return cmd
 }
 
@@ -43,8 +45,10 @@ func runRender(cmd *cobra.Command, args []string) error {
 	markersOnly, _ := cmd.Flags().GetBool("markers")
 	markerPattern, _ := cmd.Flags().GetString("marker-regex")
 	markerIndex, _ := cmd.Flags().GetInt("marker-index")
+	lastMarker, _ := cmd.Flags().GetBool("last-marker")
 	atTime, _ := cmd.Flags().GetFloat64("at")
 	apiFormat, _ := cmd.Flags().GetString("output-format")
+	tolerant, _ := cmd.Flags().GetBool("tolerant")
 	if apiFormat != "" && apiFormat != "jsonl" {
 		return fmt.Errorf("invalid --output-format %q; must be \"\" or \"jsonl\"", apiFormat)
 	}
@@ -52,11 +56,14 @@ func runRender(cmd *cobra.Command, args []string) error {
 	if markerIndex < -1 {
 		return fmt.Errorf("--marker-index must be non-negative")
 	}
-	if markerPattern != "" || markerIndex >= 0 {
+	if markerIndex >= 0 && lastMarker {
+		return fmt.Errorf("cannot specify both --marker-index and --last-marker")
+	}
+	if markerPattern != "" || markerIndex >= 0 || lastMarker {
 		markersOnly = true
 	}
 
-	hdr, events, err := loadCastFile(args[0])
+	hdr, events, err := loadCastFileWithOptions(args[0], loadCastOptions{Tolerant: tolerant})
 	if err != nil {
 		return fmt.Errorf("trec render: %w", err)
 	}
@@ -70,9 +77,15 @@ func runRender(cmd *cobra.Command, args []string) error {
 	if markerIndex >= len(markers) {
 		return fmt.Errorf("trec render: --marker-index %d is out of range (matched markers: %d)", markerIndex, len(markers))
 	}
+	if lastMarker && len(markers) == 0 {
+		return fmt.Errorf("trec render: --last-marker specified but no matching markers were found")
+	}
 	selectedMarkers := make(map[int]markerRef, len(markers))
 	if markerIndex >= 0 {
 		selectedMarkers[markers[markerIndex].eventIndex] = markers[markerIndex]
+	} else if lastMarker {
+		last := markers[len(markers)-1]
+		selectedMarkers[last.eventIndex] = last
 	} else {
 		for _, marker := range markers {
 			selectedMarkers[marker.eventIndex] = marker

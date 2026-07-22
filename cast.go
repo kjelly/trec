@@ -10,10 +10,18 @@ import (
 	"strings"
 )
 
+type loadCastOptions struct {
+	Tolerant bool
+}
+
 // loadCastFile reads an asciicast v2 file and returns its header plus every
 // event line, unfiltered. Callers decide which event types are relevant to
 // them (playback cares about "o"/"i"/"m"; annotate must preserve everything).
 func loadCastFile(path string) (castHeader, []castEvent, error) {
+	return loadCastFileWithOptions(path, loadCastOptions{})
+}
+
+func loadCastFileWithOptions(path string, opts loadCastOptions) (castHeader, []castEvent, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return castHeader{}, nil, fmt.Errorf("open %s: %w", path, err)
@@ -41,13 +49,25 @@ func loadCastFile(path string) (castHeader, []castEvent, error) {
 		lineNo++
 		line := sc.Bytes()
 		if len(line) == 0 {
+			if opts.Tolerant {
+				fmt.Fprintf(os.Stderr, "warning: invalid event at line %d: empty line\n", lineNo)
+				continue
+			}
 			return hdr, nil, fmt.Errorf("invalid event at line %d: empty line", lineNo)
 		}
 		event, err := parseCastEvent(line)
 		if err != nil {
+			if opts.Tolerant {
+				fmt.Fprintf(os.Stderr, "warning: invalid event at line %d: %v\n", lineNo, err)
+				continue
+			}
 			return hdr, nil, fmt.Errorf("invalid event at line %d: %w", lineNo, err)
 		}
 		if event.sec < lastTime {
+			if opts.Tolerant {
+				fmt.Fprintf(os.Stderr, "warning: invalid event at line %d: timestamp %.9f is earlier than %.9f\n", lineNo, event.sec, lastTime)
+				continue
+			}
 			return hdr, nil, fmt.Errorf("invalid event at line %d: timestamp %.9f is earlier than %.9f", lineNo, event.sec, lastTime)
 		}
 		lastTime = event.sec
@@ -86,6 +106,10 @@ func parseCastEvent(line []byte) (castEvent, error) {
 		return castEvent{}, fmt.Errorf("event type must be a non-empty string")
 	}
 	event.rawData = append(json.RawMessage(nil), raw[2]...)
+
+	if event.typ != "o" && event.typ != "i" && event.typ != "m" && event.typ != "r" {
+		fmt.Fprintf(os.Stderr, "warning: unknown event type %q\n", event.typ)
+	}
 
 	// Current asciicast v2 event types all use string payloads. Unknown events
 	// remain pass-through compatible: their original JSON is preserved for

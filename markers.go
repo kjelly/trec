@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -13,8 +14,29 @@ import (
 type markerRef struct {
 	Index      int     `json:"index"`
 	Time       float64 `json:"time"`
+	Kind       string  `json:"kind"`
 	Label      string  `json:"label"`
 	eventIndex int
+}
+
+func parseMarkerKind(label string) string {
+	upper := strings.ToUpper(label)
+	if strings.HasPrefix(upper, "SNAPSHOT") {
+		return "snapshot"
+	}
+	if strings.Contains(upper, "FAILED") || strings.Contains(upper, "ERROR") {
+		return "failure"
+	}
+	if strings.HasPrefix(upper, "ASSERT") || strings.HasPrefix(upper, "EXPECT") {
+		return "assertion"
+	}
+	if strings.HasPrefix(upper, "WAIT") {
+		return "wait"
+	}
+	if strings.HasPrefix(upper, "STEP_") {
+		return "action"
+	}
+	return "action"
 }
 
 func findMarkers(events []castEvent, pattern string, from, to float64) ([]markerRef, error) {
@@ -38,6 +60,7 @@ func findMarkers(events []castEvent, pattern string, from, to float64) ([]marker
 		markers = append(markers, markerRef{
 			Index:      len(markers),
 			Time:       event.sec,
+			Kind:       parseMarkerKind(event.data),
 			Label:      event.data,
 			eventIndex: eventIndex,
 		})
@@ -57,6 +80,7 @@ func newMarkersCommand() *cobra.Command {
 	cmd.Flags().Float64("from", 0, "only include markers at or after this time in seconds")
 	cmd.Flags().Float64("to", -1, "only include markers at or before this time in seconds")
 	cmd.Flags().String("output-format", "", "output format: text, json, or jsonl")
+	cmd.Flags().Bool("tolerant", false, "skip invalid events with a warning instead of failing")
 	return cmd
 }
 
@@ -65,6 +89,7 @@ func runMarkers(cmd *cobra.Command, args []string) error {
 	from, _ := cmd.Flags().GetFloat64("from")
 	to, _ := cmd.Flags().GetFloat64("to")
 	format, _ := cmd.Flags().GetString("output-format")
+	tolerant, _ := cmd.Flags().GetBool("tolerant")
 	if from < 0 {
 		return fmt.Errorf("--from must be non-negative")
 	}
@@ -78,7 +103,7 @@ func runMarkers(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid --output-format %q; must be text, json, or jsonl", format)
 	}
 
-	_, events, err := loadCastFile(args[0])
+	_, events, err := loadCastFileWithOptions(args[0], loadCastOptions{Tolerant: tolerant})
 	if err != nil {
 		return fmt.Errorf("trec markers: %w", err)
 	}
