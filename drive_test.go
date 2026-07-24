@@ -1004,6 +1004,87 @@ func TestDriveSignalFinalizesAbortedRecording(t *testing.T) {
 	}
 }
 
+// TestDriveSignalAbortRedactsPartiallyOverwrittenSecret reproduces a real
+// leak: an external signal interrupts a WAIT_CHILD_EXIT step while the child
+// has partially overwritten an on-screen secret in place (via "\r" plus a
+// shorter string, the common spinner/status-line pattern). The step-failure
+// diagnostic path (stderr FAILED dump, FAILED_SCREEN marker, and
+// result.final_screen) must redact the leftover fragment just like the
+// recorded cast output does, not just a literal whole-secret match.
+func TestDriveSignalAbortRedactsPartiallyOverwrittenSecret(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "trec")
+	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build trec: %v\n%s", err, output)
+	}
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "signal.drive")
+	castPath := filepath.Join(dir, "signal.cast")
+	if err := os.WriteFile(scriptPath, []byte("WAIT_CHILD_EXIT@60000\nASSERT_EXIT 0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const secret = "p4ssw0rd-super-secret-XYZ"
+	t.Setenv("DRIVE_ABORT_SECRET", secret)
+
+	cmd := exec.Command(binary, "drive", "--secret-env", "DRIVE_ABORT_SECRET", "--script", scriptPath, "-o", castPath,
+		"--", "sh", "-c", `printf "pw=%s\r" "$DRIVE_ABORT_SECRET"; printf "XXXXXXXXXX"; sleep 30`)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		data, _ := os.ReadFile(castPath)
+		if strings.Contains(string(data), "STEP_START line 1: WAIT_CHILD_EXIT@60000") {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatalf("drive did not enter WAIT_CHILD_EXIT:\n%s", data)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Give the child time to write and overwrite the secret on screen before
+	// interrupting.
+	time.Sleep(300 * time.Millisecond)
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("interrupted drive unexpectedly exited 0")
+	}
+
+	if strings.Contains(stderr.String(), secret) || strings.Contains(stderr.String(), "super-secret") {
+		t.Fatalf("secret leaked into stderr failure diagnostics:\n%s", stderr.String())
+	}
+
+	castData, err := os.ReadFile(castPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(castData), secret) || strings.Contains(string(castData), "super-secret") {
+		t.Fatalf("secret leaked into cast markers:\n%s", castData)
+	}
+
+	resultData, err := os.ReadFile(resultPath(castPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(resultData), secret) || strings.Contains(string(resultData), "super-secret") {
+		t.Fatalf("secret leaked into result.json:\n%s", resultData)
+	}
+	var result sessionResult
+	if err := json.Unmarshal(resultData, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "aborted" {
+		t.Fatalf("expected aborted status, got %#v", result)
+	}
+}
+
 func TestDriveOutcomeConsistencyAndExplicitEndSession(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "trec")
 	if output, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {

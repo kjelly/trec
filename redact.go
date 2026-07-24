@@ -450,6 +450,33 @@ func (sr *secretRedactor) redactScreen(lines []string) []string {
 		}
 	}
 
+	// 4. Check for partial-overwrite fragments. The live terminal emulator is
+	// fed raw, unredacted bytes so it can render real screen state; if a secret
+	// is later overwritten in place (e.g. "\r" plus a shorter status string, a
+	// spinner, or a masked redisplay) rather than cleared, the untouched cells
+	// keep a contiguous remainder of the original characters. That remainder
+	// never equals the full secret, so checks 1-3 above cannot see it. Treat
+	// any sufficiently long contiguous run of a declared secret as unsafe too.
+	const minFragmentLen = 6
+	for _, entry := range sr.entries {
+		secretNoSpaces := strings.ReplaceAll(entry.value, " ", "")
+		secretNoSpaces = strings.ReplaceAll(secretNoSpaces, "\t", "")
+		secretNoSpaces = strings.ReplaceAll(secretNoSpaces, "\r", "")
+		secretNoSpaces = strings.ReplaceAll(secretNoSpaces, "\n", "")
+		n := minFragmentLen
+		if len(secretNoSpaces) < n {
+			n = len(secretNoSpaces)
+		}
+		if n == 0 {
+			continue
+		}
+		for i := 0; i+n <= len(secretNoSpaces); i++ {
+			if strings.Contains(joinedNoSpaces, secretNoSpaces[i:i+n]) {
+				return []string{"<screen redacted>"}
+			}
+		}
+	}
+
 	return lines
 }
 
