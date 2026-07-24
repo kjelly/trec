@@ -8,6 +8,8 @@ import (
 	"html/template"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -21,6 +23,115 @@ var asciinemaPlayerJS []byte
 //go:embed assets/asciinema-player.css
 var asciinemaPlayerCSS []byte
 
+var annotationPanelJS = template.JS(`
+function formatAnnotationTime(seconds) {
+  const whole = Math.max(0, Math.floor(Number(seconds) || 0));
+  const minutes = Math.floor(whole / 60);
+  return String(minutes).padStart(2, "0") + ":" + String(whole % 60).padStart(2, "0");
+}
+function mountAnnotationPanel(panel, list, encoded, getPlayer) {
+  let annotations = [];
+  try {
+    const parsed = JSON.parse(b64Utf8(encoded));
+    if (Array.isArray(parsed)) annotations = parsed;
+  } catch (_) {}
+  list.replaceChildren();
+  panel.hidden = annotations.length === 0;
+  const rows = annotations.map(annotation => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "annotation-item";
+    const time = document.createElement("span");
+    time.className = "annotation-time";
+    time.textContent = formatAnnotationTime(annotation.time);
+    const label = document.createElement("span");
+    label.className = "annotation-label";
+    label.textContent = String(annotation.label ?? "");
+    row.append(time, label);
+    row.addEventListener("click", () => {
+      const player = getPlayer();
+      if (player) player.seek(Number(annotation.time) || 0);
+    });
+    list.append(row);
+    return { row, time: Number(annotation.time) || 0 };
+  });
+  if (rows.length === 0) return () => {};
+  let disposed = false;
+  const update = async () => {
+    const player = getPlayer();
+    if (!player || disposed) return;
+    const current = Number(await Promise.resolve(player.getCurrentTime()));
+    let active = -1;
+    rows.forEach((entry, index) => { if (entry.time <= current) active = index; });
+    rows.forEach((entry, index) => entry.row.classList.toggle("active", index === active));
+  };
+  const timer = setInterval(update, 100);
+  update();
+  return () => { disposed = true; clearInterval(timer); };
+}
+`)
+
+// textViewJS lets the player open everything that was ever printed to the
+// terminal as plain text in a new browser tab, without needing a server
+// round-trip - the asciicast is already embedded client-side so the
+// recording stays shareable as a single offline file. Viewing (rather than
+// forcing a download) lets the user just use the browser's own Ctrl+S if
+// they want a local copy.
+var textViewJS = template.JS(`
+const ansiStripRe = /\x1b(?:\[[0-?]*[ -\/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])/g;
+function extractPlainText(castText) {
+  let out = "";
+  for (const line of castText.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event;
+    try { event = JSON.parse(trimmed); } catch (_) { continue; }
+    if (!Array.isArray(event) || event[1] !== "o") continue;
+    out += String(event[2] ?? "");
+  }
+  out = out.replace(ansiStripRe, "");
+  out = out.replace(/\r\n?/g, "\n");
+  out = out.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+  return out;
+}
+function downloadText(text, filename) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+function viewText(text, filename) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const tab = window.open(url, "_blank");
+  if (!tab) {
+    // Popup blocked: fall back to a direct download so the content isn't lost.
+    downloadText(text, filename);
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+function mountTextViewButton(button, getCastText, filename) {
+  if (!button) return;
+  button.addEventListener("click", () => viewText(extractPlainText(getCastText()), filename));
+}
+`)
+
+var unsafeFilenameChars = regexp.MustCompile(`[\\/:*?"<>|\x00-\x1f]`)
+
+func sanitizeFilename(name string) string {
+	name = unsafeFilenameChars.ReplaceAllString(name, "_")
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "recording"
+	}
+	return name
+}
+
 var htmlPageTemplate = template.Must(template.New("player").Parse(`<!doctype html>
 <html lang="en">
 <head>
@@ -28,38 +139,79 @@ var htmlPageTemplate = template.Must(template.New("player").Parse(`<!doctype htm
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.Title}}</title>
   <style>{{.PlayerCSS}}</style>
-  <style>body { margin: 0; padding: 2rem; background: #111; } #player { max-width: 100%; margin: auto; }</style>
+  <style>
+    body { margin: 0; padding: 2rem; background: #111; color: #eee; }
+    .recording-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(16rem, 24rem); gap: 1.5rem; max-width: 90rem; margin: auto; align-items: start; }
+    #player { width: 100%; }
+    .annotation-panel { max-height: min(70vh, 42rem); overflow: auto; border: 1px solid #444; border-radius: .5rem; background: #1b1b1b; }
+    .annotation-panel[hidden] { display: none; }
+    .annotation-panel h2 { margin: 0; padding: .8rem 1rem; font-size: 1rem; border-bottom: 1px solid #444; }
+    .annotation-list { display: grid; gap: .35rem; padding: .5rem; }
+    .annotation-item { display: grid; grid-template-columns: auto 1fr; gap: .65rem; width: 100%; padding: .65rem; border: 0; border-radius: .35rem; color: #ddd; background: transparent; text-align: left; cursor: pointer; font: inherit; }
+    .annotation-item:hover, .annotation-item.active { background: #303b52; color: #fff; }
+    .annotation-time { color: #9fb8e8; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .annotation-label { overflow-wrap: anywhere; white-space: pre-wrap; }
+    .toolbar { max-width: 90rem; margin: 0 auto 1rem; }
+    .view-text-btn { padding: .5rem 1rem; border: 1px solid #444; border-radius: .35rem; background: #1b1b1b; color: #ddd; cursor: pointer; font: inherit; }
+    .view-text-btn:hover { background: #303b52; color: #fff; }
+    @media (max-width: 900px) { .recording-layout { grid-template-columns: 1fr; } .annotation-panel { max-height: 24rem; } }
+  </style>
 </head>
 <body>
   {{if .HasCompressed}}<label style="display:block;max-width:100%;margin:0 auto 1rem;color:#ddd"><input id="compress" type="checkbox"{{if .CompressedDefault}} checked{{end}}> 壓縮停頓{{if .IdleLimit}}（上限 {{.IdleLimit}} 秒）{{end}}{{if .MinInputGap}}，輸入至少間隔 {{.MinInputGap}} 秒{{end}}</label>{{end}}
-  <div id="player"></div>
+  <div class="toolbar">
+    <button type="button" id="view-text" class="view-text-btn">查看文字輸出</button>
+  </div>
+  <div class="recording-layout">
+    <div id="player"></div>
+    <aside id="annotation-panel" class="annotation-panel" hidden aria-label="Annotations">
+      <h2>Annotations</h2>
+      <div id="annotation-list" class="annotation-list"></div>
+    </aside>
+  </div>
   <script>{{.PlayerJS}}</script>
+  <script>function b64Utf8(b64) { return new TextDecoder().decode(Uint8Array.from(atob(b64), byte => byte.charCodeAt(0))); }</script>
+  <script>{{.AnnotationJS}}</script>
+  <script>{{.TextViewJS}}</script>
   <script>
     // The recording is embedded so this HTML can be deployed without its .cast file.
-    const rawCast = new TextDecoder().decode(Uint8Array.from(
-      atob("{{.CastBase64}}"), byte => byte.charCodeAt(0)
-    ));
-    {{if .HasCompressed}}const compressedCast = new TextDecoder().decode(Uint8Array.from(
-      atob("{{.CompressedCastBase64}}"), byte => byte.charCodeAt(0)
-    ));{{end}}
+    // atob() only yields a byte-per-character binary string, so every base64 payload
+    // (cast bytes AND marker JSON) must go through TextDecoder to become real UTF-8 text -
+    // otherwise multi-byte characters (e.g. non-ASCII marker labels) come out mojibake.
+    function b64Utf8(b64) {
+      return new TextDecoder().decode(Uint8Array.from(atob(b64), byte => byte.charCodeAt(0)));
+    }
+    const rawCast = b64Utf8("{{.CastBase64}}");
+    {{if .HasCompressed}}const compressedCast = b64Utf8("{{.CompressedCastBase64}}");{{end}}
+    const rawAnnotations = "{{.RawAnnotationsBase64}}";
+    {{if .HasCompressed}}const compressedAnnotations = "{{.AnnotationsBase64}}";{{end}}
+    const textFilename = b64Utf8("{{.TextFilenameBase64}}");
     const playerOptions = {
       autoPlay: false,
       preload: true,
       fit: "width",
       {{if .KeystrokeOverlay}}keystrokeOverlay: true{{else}}keystrokeOverlay: false{{end}},
-      markers: JSON.parse(atob("{{.MarkersBase64}}"))
+      markers: JSON.parse(b64Utf8("{{.MarkersBase64}}"))
     };
     const player = document.getElementById("player");
+    const annotationPanel = document.getElementById("annotation-panel");
+    const annotationList = document.getElementById("annotation-list");
     let playerInstance;
+    let annotationCleanup = () => {};
+    let activeCastText = rawCast;
     function loadCast() {
+      annotationCleanup();
       if (playerInstance) playerInstance.dispose();
       player.replaceChildren();
       const compressed = {{if .HasCompressed}}document.getElementById("compress").checked{{else}}false{{end}};
-      playerOptions.markers = JSON.parse(atob(compressed ? "{{.MarkersBase64}}" : "{{.RawMarkersBase64}}"));
-      playerInstance = AsciinemaPlayer.create({ data: compressed ? compressedCast : rawCast }, player, playerOptions);
+      activeCastText = compressed ? compressedCast : rawCast;
+      playerOptions.markers = JSON.parse(b64Utf8(compressed ? "{{.MarkersBase64}}" : "{{.RawMarkersBase64}}"));
+      playerInstance = AsciinemaPlayer.create({ data: activeCastText }, player, playerOptions);
+      annotationCleanup = mountAnnotationPanel(annotationPanel, annotationList, compressed ? compressedAnnotations : rawAnnotations, () => playerInstance);
     }
     {{if .HasCompressed}}document.getElementById("compress").addEventListener("change", loadCast);{{end}}
     loadCast();
+    mountTextViewButton(document.getElementById("view-text"), () => activeCastText, textFilename);
   </script>
 </body>
 </html>
@@ -71,8 +223,13 @@ type htmlPageData struct {
 	CompressedCastBase64 string
 	MarkersBase64        string
 	RawMarkersBase64     string
+	AnnotationsBase64    string
+	RawAnnotationsBase64 string
+	TextFilenameBase64   string
 	PlayerJS             template.JS
 	PlayerCSS            template.CSS
+	AnnotationJS         template.JS
+	TextViewJS           template.JS
 	KeystrokeOverlay     bool
 	HasCompressed        bool
 	CompressedDefault    bool
@@ -109,7 +266,12 @@ func htmlPageDataFromCastWithOptions(path, title string, keystrokeOverlay bool, 
 	if err != nil {
 		return htmlPageData{}, err
 	}
+	rawAnnotations, err := annotationJSON(events)
+	if err != nil {
+		return htmlPageData{}, err
+	}
 	compressedMarkers := rawMarkers
+	compressedAnnotations := rawAnnotations
 	if idleLimit > 0 || minInputGap > 0 {
 		adjustPlaybackTiming(events, idleLimit, false, minInputGap)
 		compressed, err = marshalCast(hdr, events)
@@ -117,6 +279,10 @@ func htmlPageDataFromCastWithOptions(path, title string, keystrokeOverlay bool, 
 			return htmlPageData{}, fmt.Errorf("encode compressed cast: %w", err)
 		}
 		compressedMarkers, err = markerJSON(events)
+		if err != nil {
+			return htmlPageData{}, err
+		}
+		compressedAnnotations, err = annotationJSON(events)
 		if err != nil {
 			return htmlPageData{}, err
 		}
@@ -133,8 +299,13 @@ func htmlPageDataFromCastWithOptions(path, title string, keystrokeOverlay bool, 
 		CompressedCastBase64: base64.StdEncoding.EncodeToString(compressed),
 		MarkersBase64:        base64.StdEncoding.EncodeToString(compressedMarkers),
 		RawMarkersBase64:     base64.StdEncoding.EncodeToString(rawMarkers),
+		AnnotationsBase64:    base64.StdEncoding.EncodeToString(compressedAnnotations),
+		RawAnnotationsBase64: base64.StdEncoding.EncodeToString(rawAnnotations),
+		TextFilenameBase64:   base64.StdEncoding.EncodeToString([]byte(sanitizeFilename(title) + ".txt")),
 		PlayerJS:             template.JS(asciinemaPlayerJS),
 		PlayerCSS:            template.CSS(asciinemaPlayerCSS),
+		AnnotationJS:         annotationPanelJS,
+		TextViewJS:           textViewJS,
 		KeystrokeOverlay:     keystrokeOverlay,
 		HasCompressed:        idleLimit > 0,
 		CompressedDefault:    idleLimit > 0,
@@ -153,6 +324,25 @@ func markerJSON(events []castEvent) ([]byte, error) {
 	data, err := json.Marshal(markers)
 	if err != nil {
 		return nil, fmt.Errorf("encode markers: %w", err)
+	}
+	return data, nil
+}
+
+type annotationData struct {
+	Time  float64 `json:"time"`
+	Label string  `json:"label"`
+}
+
+func annotationJSON(events []castEvent) ([]byte, error) {
+	annotations := make([]annotationData, 0)
+	for _, event := range events {
+		if event.typ == "m" {
+			annotations = append(annotations, annotationData{Time: event.sec, Label: event.data})
+		}
+	}
+	data, err := json.Marshal(annotations)
+	if err != nil {
+		return nil, fmt.Errorf("encode annotations: %w", err)
 	}
 	return data, nil
 }
