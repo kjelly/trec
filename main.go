@@ -181,8 +181,20 @@ func runRecord(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	// Give the child a pipe it can self-report semantic-action markers into
+	// (fd 3, via TREC_MARKER_FD), independent of its stdout/stderr — lets a
+	// program that drives its own UI in-process (not through this PTY's
+	// stdin) still land "m" events in the cast in real time.
+	markerR, markerW, err := os.Pipe()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create marker pipe: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Start the command under a PTY.
 	processCmd := exec.Command(args[0], args[1:]...)
+	processCmd.ExtraFiles = []*os.File{markerW}
+	processCmd.Env = append(os.Environ(), "TREC_MARKER_FD=3")
 	ptmx, err := pty.StartWithSize(processCmd, &pty.Winsize{
 		Rows: uint16(height),
 		Cols: uint16(width),
@@ -202,6 +214,7 @@ func runRecord(cmd *cobra.Command, args []string) {
 		fmt.Fprintf(os.Stderr, "failed to start %q: %v\n", args[0], err)
 		os.Exit(1)
 	}
+	markerW.Close()
 
 	startTime := started
 	finalVT := vt10x.New(vt10x.WithSize(width, height))
@@ -275,6 +288,24 @@ func runRecord(cmd *cobra.Command, args []string) {
 			if err != nil {
 				break
 			}
+		}
+	}()
+
+	// Read self-reported markers from the child's TREC_MARKER_FD pipe and
+	// record each line as an "m" event. Ends when the child exits and its
+	// copy of the fd closes.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer markerR.Close()
+		scanner := bufio.NewScanner(markerR)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			recorder.event(time.Since(startTime).Seconds(), "m", line)
+			recorder.flush()
 		}
 	}()
 
