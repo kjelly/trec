@@ -141,6 +141,34 @@ func TestParseDriveLifecycleSteps(t *testing.T) {
 	}
 }
 
+func TestFormWalkthroughScriptHasReadableFormChapters(t *testing.T) {
+	t.Setenv("APP_PASSWORD", "test-password")
+	steps, err := loadDriveScript("examples/form-walkthrough.steps", &secretRedactor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenPassword := false
+	chapters := 0
+	for i := 0; i+2 < len(steps); i++ {
+		if steps[i].kind == "text_env" && steps[i].text == "APP_PASSWORD" {
+			seenPassword = true
+		}
+		if steps[i].kind != "marker" || !strings.HasPrefix(steps[i].text, "FORM_") {
+			continue
+		}
+		if steps[i+1].kind != "snapshot" || steps[i+2].kind != "wait" || steps[i+2].n < 1000 || steps[i+2].n > 2000 {
+			t.Fatalf("chapter %q must be followed by SNAPSHOT then WAIT 1000-2000ms", steps[i].text)
+		}
+		chapters++
+	}
+	if !seenPassword {
+		t.Fatal("walkthrough must use TEXT_ENV APP_PASSWORD for credential entry")
+	}
+	if chapters < 3 {
+		t.Fatalf("form chapters = %d, want at least 3", chapters)
+	}
+}
+
 func TestDriveSemanticInputOperations(t *testing.T) {
 	redactor, err := newSecretRedactor(nil)
 	if err != nil {

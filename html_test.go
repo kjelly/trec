@@ -117,6 +117,12 @@ func TestPlayerAnnotationPanelRendersAndPreservesContent(t *testing.T) {
 	if !strings.Contains(page, encoded) {
 		t.Fatalf("player page does not embed annotation content payload %q", encoded)
 	}
+	if !strings.Contains(page, `id="annotation-search"`) || !strings.Contains(page, "filter") {
+		t.Fatalf("player page has no searchable chapter controls: %s", page)
+	}
+	if !strings.Contains(page, `id="marker-timeline"`) || !strings.Contains(page, "timeline-tick") {
+		t.Fatalf("player page has no marker timeline controls: %s", page)
+	}
 }
 
 func TestPlayerPageHasTextViewButton(t *testing.T) {
