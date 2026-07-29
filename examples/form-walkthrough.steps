@@ -1,0 +1,19 @@
+# Form chapters are both readable pauses and direct playback destinations.
+EXPECT Login
+TEXT demo@example.com
+ENTER
+EXPECT Password
+TEXT_ENV APP_PASSWORD
+ENTER
+MARKER FORM_PROFILE
+SNAPSHOT Profile form
+WAIT 1500
+CHOOSE Notification settings
+MARKER FORM_NOTIFICATIONS
+SNAPSHOT Notification settings form
+WAIT 1500
+CHOOSE Review and submit
+MARKER FORM_REVIEW
+SNAPSHOT Review form
+WAIT 1500
+END_SESSION
