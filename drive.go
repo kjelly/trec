@@ -29,7 +29,7 @@ import (
 type driveStep struct {
 	kind string // text, enter, down, up, space, tab, ctrlc, backspace, wait,
 	// text_env, text_file, replace_text, replace_text_env, replace_text_file,
-	// *_and_enter, expect, expect_quiet, assert, select, toggle, snapshot,
+	// *_and_enter, expect, expect_quiet, assert, select, toggle, marker, snapshot,
 	// checklist_down, text_if, expect_transition, wait_child_exit, assert_exit,
 	// end_session, quit
 	text  string
@@ -75,7 +75,7 @@ func validateStep(st *driveStep) error {
 		if st.text != "" {
 			return fmt.Errorf("line %d: %s takes no arguments", st.line, strings.ToUpper(st.kind))
 		}
-	case "snapshot":
+	case "marker", "snapshot":
 		// An optional snapshot label is allowed.
 	case "enter_if", "choose", "toggle":
 		if st.text == "" {
@@ -546,6 +546,15 @@ func parseDriveLine(raw string, lineNo int) (*driveStep, error) {
 		st.kind, st.text = "select", label
 	case "SNAPSHOT":
 		st.kind, st.text = "snapshot", arg
+	case "MARKER":
+		label, err := parseDriveQuotedArgument(arg, lineNo, op)
+		if err != nil {
+			return nil, err
+		}
+		if label == "" {
+			return nil, fmt.Errorf("line %d: MARKER needs a label", lineNo)
+		}
+		st.kind, st.text = "marker", label
 	case "WAIT_CHILD_EXIT":
 		if arg != "" {
 			return nil, fmt.Errorf("line %d: WAIT_CHILD_EXIT takes no arguments", lineNo)
@@ -1105,6 +1114,8 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 		err = e
 	case "snapshot":
 		ds.snapshot(st)
+	case "marker":
+		ds.marker(ds.redactor.RedactString(st.text))
 	case "wait_child_exit":
 		if ds.interactive {
 			return fmt.Errorf("WAIT_CHILD_EXIT is only available in --script mode")
@@ -1210,7 +1221,7 @@ ENTER, ENTER_IF, ACTIVATE <label> WITH ENTER|SPACE (CHOOSE/TOGGLE aliases), FOCU
 EXPECT, EXPECT_EVENTUALLY, EXPECT_CHANGE, EXPECT_REGEX, EXPECT_SCREEN_REGEX,
 	EXPECT_TRANSITION,
 EXPECT_QUIET, EXPECT_QUIET@<timeout-ms> <quiet-ms>, WAIT_CHILD_EXIT@<timeout-ms>,
-ASSERT, FOCUS, SNAPSHOT, and END_SESSION (QUIT alias). Use TEXT_ENV/--secret-env or
+ASSERT, FOCUS, MARKER, SNAPSHOT, and END_SESSION (QUIT alias). Use TEXT_ENV/--secret-env or
 TEXT_FILE/--secret-file for credentials. Run "trec drive --help" for flags.`,
 		Args: cobra.ArbitraryArgs,
 		Run:  runDrive,

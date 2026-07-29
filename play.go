@@ -93,7 +93,10 @@ type player struct {
 	forceSize     bool
 	tui           bool
 	smartSpeed    bool
+	minScreenGap  float64
+	maxInputGap   float64
 	minInputGap   float64
+	startMarker   string
 
 	cmdCh  chan playCmd
 	quitCh chan struct{}
@@ -217,9 +220,56 @@ func adjustTiming(events []castEvent, idleLimit float64, smart bool) {
 	}
 }
 
-func adjustPlaybackTiming(events []castEvent, idleLimit float64, smart bool, minInputGap float64) {
+func adjustPlaybackTiming(events []castEvent, idleLimit float64, smart bool, minScreenGap, maxInputGap, minInputGap float64) {
 	adjustTiming(events, idleLimit, smart)
+	capInputGap(events, maxInputGap)
+	enforceOutputGap(events, minScreenGap)
 	enforceInputGap(events, minInputGap)
+}
+
+// capInputGap speeds up text entry by reducing only the delay between two
+// consecutive input events. A wait before visible output is deliberately left
+// untouched so the destination screen still gets its own pacing policy.
+func capInputGap(events []castEvent, maxGap float64) {
+	if maxGap <= 0 {
+		return
+	}
+	shift := 0.0
+	for i := range events {
+		events[i].sec += shift
+		if i == 0 || events[i-1].typ != "i" || events[i].typ != "i" {
+			continue
+		}
+		gap := events[i].sec - events[i-1].sec
+		if gap > maxGap {
+			delta := gap - maxGap
+			shift -= delta
+			events[i].sec -= delta
+		}
+	}
+}
+
+// enforceOutputGap shifts the timeline after output events so consecutive
+// screen updates are separated by at least minGap seconds. Other event types
+// retain their position until an output event requires a shift.
+func enforceOutputGap(events []castEvent, minGap float64) {
+	if minGap <= 0 {
+		return
+	}
+	lastOutput := -1.0
+	shift := 0.0
+	for i := range events {
+		events[i].sec += shift
+		if events[i].typ != "o" {
+			continue
+		}
+		if lastOutput >= 0 && events[i].sec-lastOutput < minGap {
+			delta := minGap - (events[i].sec - lastOutput)
+			shift += delta
+			events[i].sec += delta
+		}
+		lastOutput = events[i].sec
+	}
 }
 
 // enforceInputGap shifts the timeline after input events so consecutive
@@ -441,7 +491,10 @@ func newPlayCommand() *cobra.Command {
 	cmd.Flags().BoolP("loop", "l", false, "loop playback continuously")
 	cmd.Flags().Bool("tui", false, "enable interactive playback controls")
 	cmd.Flags().Bool("smart-speed", false, "adapt pauses to output size and cap long waits")
+	cmd.Flags().Int("min-screen-gap-ms", 500, "ensure at least N milliseconds between recorded screen updates (0 = disabled)")
+	cmd.Flags().Int("max-input-gap-ms", 50, "cap gaps between consecutive recorded input events (0 = disabled)")
 	cmd.Flags().Float64("min-input-gap", 0, "ensure at least N seconds between recorded input events (0 = disabled)")
+	cmd.Flags().String("marker", "", "start at the first marker whose label contains this text")
 	cmd.Flags().Bool("pause-on-marker", false, "automatically pause playback when a marker is reached")
 	cmd.Flags().Bool("force-size", false, "play even when the terminal is smaller than the recording (may corrupt TUI layout)")
 	return cmd
@@ -453,12 +506,23 @@ func runPlay(cmd *cobra.Command, files []string) {
 	loop, _ := cmd.Flags().GetBool("loop")
 	tui, _ := cmd.Flags().GetBool("tui")
 	smartSpeed, _ := cmd.Flags().GetBool("smart-speed")
+	minScreenGapMS, _ := cmd.Flags().GetInt("min-screen-gap-ms")
+	maxInputGapMS, _ := cmd.Flags().GetInt("max-input-gap-ms")
 	minInputGap, _ := cmd.Flags().GetFloat64("min-input-gap")
+	startMarker, _ := cmd.Flags().GetString("marker")
 	pauseOnMarker, _ := cmd.Flags().GetBool("pause-on-marker")
 	forceSize, _ := cmd.Flags().GetBool("force-size")
 	if len(files) == 0 {
 		cmd.Usage()
 		os.Exit(1)
+	}
+	if minScreenGapMS < 0 {
+		fmt.Fprintln(os.Stderr, "trec play: --min-screen-gap-ms must not be negative")
+		os.Exit(2)
+	}
+	if maxInputGapMS < 0 {
+		fmt.Fprintln(os.Stderr, "trec play: --max-input-gap-ms must not be negative")
+		os.Exit(2)
 	}
 
 	if pauseOnMarker && !tui {
@@ -493,7 +557,10 @@ func runPlay(cmd *cobra.Command, files []string) {
 	p.forceSize = forceSize
 	p.tui = tui
 	p.smartSpeed = smartSpeed
+	p.minScreenGap = float64(minScreenGapMS) / 1000
+	p.maxInputGap = float64(maxInputGapMS) / 1000
 	p.minInputGap = minInputGap
+	p.startMarker = startMarker
 
 	if p.tui {
 		go p.readKeys()
@@ -542,6 +609,19 @@ func findMarkerIndex(events []castEvent, cur, dir int) int {
 		}
 	}
 	return -1
+}
+
+// findMarkerQuery returns the first marker whose label contains query,
+// ignoring case. It is deliberately label-based so FORM_* chapters and
+// manually annotated legacy recordings behave the same way.
+func findMarkerQuery(events []castEvent, query string) (int, error) {
+	needle := strings.ToLower(strings.TrimSpace(query))
+	for i, event := range events {
+		if event.typ == "m" && strings.Contains(strings.ToLower(event.data), needle) {
+			return i, nil
+		}
+	}
+	return -1, fmt.Errorf("no marker matches %q", query)
 }
 
 // fastForwardTo replays the "o" events in events[from:to] to stdout
@@ -671,8 +751,15 @@ func playFile(p *player, path string) error {
 	if len(events) == 0 {
 		return nil
 	}
+	startIndex := 0
+	if p.startMarker != "" {
+		startIndex, err = findMarkerQuery(events, p.startMarker)
+		if err != nil {
+			return err
+		}
+	}
 
-	adjustPlaybackTiming(events, p.idleLimit, p.smartSpeed, p.minInputGap)
+	adjustPlaybackTiming(events, p.idleLimit, p.smartSpeed, p.minScreenGap, p.maxInputGap, p.minInputGap)
 
 	p.totalSec = events[len(events)-1].sec
 	p.atEnd = false
@@ -695,7 +782,11 @@ func playFile(p *player, path string) error {
 	p.clk.paused = false
 	p.clk.anchor = time.Now()
 
-	i := 0
+	i := startIndex
+	if i > 0 {
+		fastForwardTo(events, 0, i)
+		p.clk.seek(events[i].sec)
+	}
 	for {
 		select {
 		case <-p.quitCh:

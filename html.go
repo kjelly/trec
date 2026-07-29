@@ -29,7 +29,17 @@ function formatAnnotationTime(seconds) {
   const minutes = Math.floor(whole / 60);
   return String(minutes).padStart(2, "0") + ":" + String(whole % 60).padStart(2, "0");
 }
-function mountAnnotationPanel(panel, list, encoded, getPlayer) {
+function castDuration(castText) {
+  let duration = 0;
+  for (const line of castText.split("\n")) {
+    try {
+      const event = JSON.parse(line);
+      if (Array.isArray(event) && Number.isFinite(Number(event[0]))) duration = Math.max(duration, Number(event[0]));
+    } catch (_) {}
+  }
+  return duration;
+}
+function mountAnnotationPanel(panel, list, search, timeline, encoded, getPlayer, duration) {
   let annotations = [];
   try {
     const parsed = JSON.parse(b64Utf8(encoded));
@@ -37,6 +47,7 @@ function mountAnnotationPanel(panel, list, encoded, getPlayer) {
   } catch (_) {}
   list.replaceChildren();
   panel.hidden = annotations.length === 0;
+  timeline.hidden = annotations.length === 0;
   const rows = annotations.map(annotation => {
     const row = document.createElement("button");
     row.type = "button";
@@ -53,8 +64,27 @@ function mountAnnotationPanel(panel, list, encoded, getPlayer) {
       if (player) player.seek(Number(annotation.time) || 0);
     });
     list.append(row);
-    return { row, time: Number(annotation.time) || 0 };
+    return { row, time: Number(annotation.time) || 0, label: String(annotation.label ?? "") };
   });
+  const seek = time => {
+    const player = getPlayer();
+    if (player) player.seek(time);
+  };
+  for (const entry of rows) {
+    const tick = document.createElement("button");
+    tick.type = "button";
+    tick.className = "timeline-tick";
+    tick.style.left = (duration > 0 ? Math.min(100, Math.max(0, entry.time / duration * 100)) : 0) + "%";
+    tick.setAttribute("aria-label", formatAnnotationTime(entry.time) + " " + entry.label);
+    tick.title = tick.getAttribute("aria-label");
+    tick.addEventListener("click", () => seek(entry.time));
+    timeline.append(tick);
+  }
+  const filter = () => {
+    const query = String(search.value || "").trim().toLocaleLowerCase();
+    rows.forEach(entry => { entry.row.hidden = query !== "" && !entry.label.toLocaleLowerCase().includes(query); });
+  };
+  search.addEventListener("input", filter);
   if (rows.length === 0) return () => {};
   let disposed = false;
   const update = async () => {
@@ -67,7 +97,7 @@ function mountAnnotationPanel(panel, list, encoded, getPlayer) {
   };
   const timer = setInterval(update, 100);
   update();
-  return () => { disposed = true; clearInterval(timer); };
+  return () => { disposed = true; clearInterval(timer); search.removeEventListener("input", filter); };
 }
 `)
 
@@ -143,9 +173,14 @@ var htmlPageTemplate = template.Must(template.New("player").Parse(`<!doctype htm
     body { margin: 0; padding: 2rem; background: #111; color: #eee; }
     .recording-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(16rem, 24rem); gap: 1.5rem; max-width: 90rem; margin: auto; align-items: start; }
     #player { width: 100%; }
+    .marker-timeline { position: relative; height: 1.25rem; margin-top: .6rem; border-radius: .4rem; background: #303030; }
+    .marker-timeline::before { content: ""; position: absolute; left: 0; right: 0; top: .55rem; border-top: 1px solid #79849a; }
+    .timeline-tick { position: absolute; top: .22rem; width: .55rem; height: .82rem; margin-left: -.275rem; border: 1px solid #b9d1ff; border-radius: .15rem; background: #476da8; cursor: pointer; }
+    .timeline-tick:hover, .timeline-tick:focus-visible { background: #91b9ff; outline: 2px solid #fff; }
     .annotation-panel { max-height: min(70vh, 42rem); overflow: auto; border: 1px solid #444; border-radius: .5rem; background: #1b1b1b; }
     .annotation-panel[hidden] { display: none; }
     .annotation-panel h2 { margin: 0; padding: .8rem 1rem; font-size: 1rem; border-bottom: 1px solid #444; }
+    .annotation-search { box-sizing: border-box; width: calc(100% - 1rem); margin: .5rem; padding: .55rem; border: 1px solid #555; border-radius: .35rem; background: #111; color: #eee; font: inherit; }
     .annotation-list { display: grid; gap: .35rem; padding: .5rem; }
     .annotation-item { display: grid; grid-template-columns: auto 1fr; gap: .65rem; width: 100%; padding: .65rem; border: 0; border-radius: .35rem; color: #ddd; background: transparent; text-align: left; cursor: pointer; font: inherit; }
     .annotation-item:hover, .annotation-item.active { background: #303b52; color: #fff; }
@@ -163,9 +198,10 @@ var htmlPageTemplate = template.Must(template.New("player").Parse(`<!doctype htm
     <button type="button" id="view-text" class="view-text-btn">查看文字輸出</button>
   </div>
   <div class="recording-layout">
-    <div id="player"></div>
+    <div><div id="player"></div><div id="marker-timeline" class="marker-timeline" hidden aria-label="Marker timeline"></div></div>
     <aside id="annotation-panel" class="annotation-panel" hidden aria-label="Annotations">
       <h2>Annotations</h2>
+      <input id="annotation-search" class="annotation-search" type="search" placeholder="Search chapters" aria-label="Search chapters">
       <div id="annotation-list" class="annotation-list"></div>
     </aside>
   </div>
@@ -196,6 +232,8 @@ var htmlPageTemplate = template.Must(template.New("player").Parse(`<!doctype htm
     const player = document.getElementById("player");
     const annotationPanel = document.getElementById("annotation-panel");
     const annotationList = document.getElementById("annotation-list");
+    const annotationSearch = document.getElementById("annotation-search");
+    const markerTimeline = document.getElementById("marker-timeline");
     let playerInstance;
     let annotationCleanup = () => {};
     let activeCastText = rawCast;
@@ -203,11 +241,13 @@ var htmlPageTemplate = template.Must(template.New("player").Parse(`<!doctype htm
       annotationCleanup();
       if (playerInstance) playerInstance.dispose();
       player.replaceChildren();
+      markerTimeline.replaceChildren();
+      annotationSearch.value = "";
       const compressed = {{if .HasCompressed}}document.getElementById("compress").checked{{else}}false{{end}};
       activeCastText = compressed ? compressedCast : rawCast;
       playerOptions.markers = JSON.parse(b64Utf8(compressed ? "{{.MarkersBase64}}" : "{{.RawMarkersBase64}}"));
       playerInstance = AsciinemaPlayer.create({ data: activeCastText }, player, playerOptions);
-      annotationCleanup = mountAnnotationPanel(annotationPanel, annotationList, compressed ? compressedAnnotations : rawAnnotations, () => playerInstance);
+      annotationCleanup = mountAnnotationPanel(annotationPanel, annotationList, annotationSearch, markerTimeline, compressed ? compressedAnnotations : rawAnnotations, () => playerInstance, castDuration(activeCastText));
     }
     {{if .HasCompressed}}document.getElementById("compress").addEventListener("change", loadCast);{{end}}
     loadCast();
@@ -273,7 +313,7 @@ func htmlPageDataFromCastWithOptions(path, title string, keystrokeOverlay bool, 
 	compressedMarkers := rawMarkers
 	compressedAnnotations := rawAnnotations
 	if idleLimit > 0 || minInputGap > 0 {
-		adjustPlaybackTiming(events, idleLimit, false, minInputGap)
+		adjustPlaybackTiming(events, idleLimit, false, 0, 0, minInputGap)
 		compressed, err = marshalCast(hdr, events)
 		if err != nil {
 			return htmlPageData{}, fmt.Errorf("encode compressed cast: %w", err)
