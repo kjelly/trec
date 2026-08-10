@@ -19,17 +19,16 @@ type castEvent struct {
 	rawData json.RawMessage // Preserves extension-event payloads verbatim.
 }
 
-func parseCastLine(line []byte) (sec float64, typ, data string, err error) {
-	e, err := parseCastEvent(line)
-	return e.sec, e.typ, e.data, err
-}
-
 const (
 	minSpeed        = 0.125
 	maxSpeed        = 16.0
 	smartShortHold  = 750 * time.Millisecond
 	smartMediumHold = time.Second
-	smartLongHold   = 1500 * time.Millisecond
+	smartLongHold   = 3 * time.Second
+	// A full terminal repaint needs a minimum hold as well as an upper cap:
+	// a recording driven by an agent may issue the next key immediately after
+	// drawing the new screen.
+	smartScreenMinHold = 1500 * time.Millisecond
 )
 
 // playCmd is a control action decoded from a keypress.
@@ -86,17 +85,24 @@ func (c *playClock) seek(sec float64) {
 
 // player owns playback state and, when tui is enabled, keyboard controls.
 type player struct {
-	clk           playClock
-	idleLimit     float64
-	pauseOnMarker bool
-	loop          bool
-	forceSize     bool
-	tui           bool
-	smartSpeed    bool
-	minScreenGap  float64
-	maxInputGap   float64
-	minInputGap   float64
-	startMarker   string
+	clk            playClock
+	idleLimit      float64
+	pauseOnMarker  bool
+	loop           bool
+	forceSize      bool
+	resizeTerminal bool
+	tui            bool
+	smartSpeed     bool
+	minScreenGap   float64
+	maxInputGap    float64
+	minInputGap    float64
+	startMarker    string
+
+	// viewport is non-nil when the real terminal is smaller than the
+	// recording and --force-size was used to play anyway. Output is routed
+	// through a full-size virtual VT100 screen and cropped to fit instead
+	// of writing raw bytes straight to a too-small real terminal.
+	viewport *viewport
 
 	cmdCh  chan playCmd
 	quitCh chan struct{}
@@ -174,6 +180,25 @@ func visibleOutputSize(data string) (chars int, hasNewline bool) {
 	return chars, hasNewline
 }
 
+// isScreenRepaint reports whether an output chunk erases the terminal display.
+// Such chunks commonly redraw an entire TUI using cursor-addressing sequences,
+// so their printable byte count alone is not a useful measure of readability.
+func isScreenRepaint(data string) bool {
+	for i := 0; i+2 < len(data); i++ {
+		if data[i] != 0x1b || data[i+1] != '[' {
+			continue
+		}
+		j := i + 2
+		for j < len(data) && (data[j] < 0x40 || data[j] > 0x7e) {
+			j++
+		}
+		if j < len(data) && data[j] == 'J' {
+			return true
+		}
+	}
+	return false
+}
+
 // smartGap keeps output bursts responsive, caps time spent waiting for the
 // recorded operator, and gives substantial screen changes enough reading time.
 func smartGap(previous, current castEvent, gap float64) float64 {
@@ -184,6 +209,11 @@ func smartGap(previous, current castEvent, gap float64) float64 {
 	if previous.typ == "o" {
 		chars, hasNewline := visibleOutputSize(previous.data)
 		switch {
+		case isScreenRepaint(previous.data) && current.typ != "o":
+			if gap < smartScreenMinHold.Seconds() {
+				return smartScreenMinHold.Seconds()
+			}
+			maxHold = smartLongHold
 		case chars >= 160 || hasNewline:
 			maxHold = smartLongHold
 		case chars >= 40:
@@ -496,6 +526,7 @@ func newPlayCommand() *cobra.Command {
 	cmd.Flags().Float64("min-input-gap", 0, "ensure at least N seconds between recorded input events (0 = disabled)")
 	cmd.Flags().String("marker", "", "start at the first marker whose label contains this text")
 	cmd.Flags().Bool("pause-on-marker", false, "automatically pause playback when a marker is reached")
+	cmd.Flags().Bool("resize-terminal", false, "request that the terminal resize to the recording dimensions before playback")
 	cmd.Flags().Bool("force-size", false, "play even when the terminal is smaller than the recording (may corrupt TUI layout)")
 	return cmd
 }
@@ -511,6 +542,7 @@ func runPlay(cmd *cobra.Command, files []string) {
 	minInputGap, _ := cmd.Flags().GetFloat64("min-input-gap")
 	startMarker, _ := cmd.Flags().GetString("marker")
 	pauseOnMarker, _ := cmd.Flags().GetBool("pause-on-marker")
+	resizeTerminal, _ := cmd.Flags().GetBool("resize-terminal")
 	forceSize, _ := cmd.Flags().GetBool("force-size")
 	if len(files) == 0 {
 		cmd.Usage()
@@ -554,6 +586,7 @@ func runPlay(cmd *cobra.Command, files []string) {
 	p := newPlayer(speed, idleLimit)
 	p.pauseOnMarker = pauseOnMarker
 	p.loop = loop
+	p.resizeTerminal = resizeTerminal
 	p.forceSize = forceSize
 	p.tui = tui
 	p.smartSpeed = smartSpeed
@@ -627,24 +660,60 @@ func findMarkerQuery(events []castEvent, query string) (int, error) {
 // fastForwardTo replays the "o" events in events[from:to] to stdout
 // instantly, with no timing delay, to reconstruct screen state when
 // jumping backward or to a marker.
-func fastForwardTo(events []castEvent, from, to int) {
+func fastForwardTo(p *player, events []castEvent, from, to int) {
 	for k := from; k < to; k++ {
-		applyPlaybackEvent(events[k])
+		p.applyPlaybackEvent(events[k])
 	}
 }
 
-func applyPlaybackEvent(e castEvent) {
+// clearScreen resets the display to a blank frame at the origin, either the
+// real terminal directly or, in cropped playback, the virtual screen behind
+// it (which then repaints the now-blank crop).
+func (p *player) clearScreen() {
+	if p.viewport != nil {
+		p.viewport.reset(os.Stdout)
+		return
+	}
+	fmt.Fprint(os.Stdout, "\033[2J\033[H")
+}
+
+func (p *player) applyPlaybackEvent(e castEvent) {
 	switch e.typ {
 	case "o":
+		if p.viewport != nil {
+			p.viewport.write(os.Stdout, e.data)
+			return
+		}
 		os.Stdout.WriteString(e.data)
 	case "r":
 		cols, rows, err := parseResizeData(e.data)
-		if err == nil {
-			// CSI 8 requests a terminal-window resize. Terminals that do not
-			// support it safely ignore the sequence, matching asciinema's
-			// best-effort playback behavior.
-			fmt.Fprintf(os.Stdout, "\x1b[8;%d;%dt", rows, cols)
+		if err != nil {
+			return
 		}
+		if p.viewport != nil {
+			p.viewport.resizeRecording(os.Stdout, cols, rows)
+			return
+		}
+		fmt.Fprint(os.Stdout, terminalResizeSequence(cols, rows))
+	}
+}
+
+func terminalResizeSequence(cols, rows int) string {
+	return fmt.Sprintf("\x1b[8;%d;%dt", rows, cols)
+}
+
+// resizeTerminal requests a window resize and waits briefly for terminals
+// that report their new grid asynchronously. Unsupported terminals simply
+// retain their current size and are handled by the normal size guard.
+func resizeTerminal(cols, rows int) (int, int, error) {
+	fmt.Fprint(os.Stdout, terminalResizeSequence(cols, rows))
+	deadline := time.Now().Add(750 * time.Millisecond)
+	for {
+		currentCols, currentRows, err := term.GetSize(int(os.Stdin.Fd()))
+		if err != nil || (currentCols >= cols && currentRows >= rows) || time.Now().After(deadline) {
+			return currentCols, currentRows, err
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 
@@ -652,7 +721,7 @@ func applyPlaybackEvent(e castEvent) {
 // navigation metadata, but must not write to the terminal grid: a cast owns
 // every cell in that grid while it is being replayed.
 func (p *player) apply(e castEvent) {
-	applyPlaybackEvent(e)
+	p.applyPlaybackEvent(e)
 }
 
 // handleCmd executes one control command against the event list. i is the
@@ -700,8 +769,8 @@ func (p *player) handleCmd(cmd playCmd, events []castEvent, i int) int {
 		}
 		if k >= 0 {
 			i = k
-			fmt.Fprint(os.Stdout, "\033[2J\033[H")
-			fastForwardTo(events, 0, i)
+			p.clearScreen()
+			fastForwardTo(p, events, 0, i)
 			if i > 0 {
 				p.clk.seek(events[i-1].sec)
 			} else {
@@ -719,17 +788,17 @@ func (p *player) handleCmd(cmd playCmd, events []castEvent, i int) int {
 			return i
 		}
 		if dir < 0 {
-			fmt.Fprint(os.Stdout, "\033[2J\033[H")
-			fastForwardTo(events, 0, target)
+			p.clearScreen()
+			fastForwardTo(p, events, 0, target)
 		} else {
-			fastForwardTo(events, i, target)
+			fastForwardTo(p, events, i, target)
 		}
 		i = target
 		p.clk.seek(events[target].sec)
 
 	case cmdRestart:
 		i = 0
-		fmt.Fprint(os.Stdout, "\033[2J\033[H")
+		p.clearScreen()
 		p.clk.seek(0)
 		p.clk.setPaused(false)
 	}
@@ -769,22 +838,38 @@ func playFile(p *player, path string) error {
 	// faithful, so refuse by default rather than producing a corrupted TUI.
 	cw, ch, sizeErr := term.GetSize(int(os.Stdin.Fd()))
 	if sizeErr == nil && (cw < hdr.Width || ch < hdr.Height) {
-		if !p.forceSize {
-			return fmt.Errorf("recording requires at least %dx%d; current terminal is %dx%d (resize it or use --force-size)",
-				hdr.Width, hdr.Height, cw, ch)
+		if p.resizeTerminal {
+			cw, ch, sizeErr = resizeTerminal(hdr.Width, hdr.Height)
 		}
+	}
+	p.viewport = nil
+	if sizeErr == nil && (cw < hdr.Width || ch < hdr.Height) {
+		if !p.forceSize {
+			hint := "resize it or use --force-size"
+			if !p.resizeTerminal {
+				hint = "resize it, use --resize-terminal, or use --force-size"
+			}
+			return fmt.Errorf("recording requires at least %dx%d; current terminal is %dx%d (%s)",
+				hdr.Width, hdr.Height, cw, ch, hint)
+		}
+		// The real terminal cannot faithfully host cursor moves and line
+		// wrapping computed for the recording's larger grid. Route output
+		// through a full-size virtual screen and repaint only the crop that
+		// fits, rather than forwarding raw bytes that would land on the
+		// wrong cells.
+		p.viewport = newViewport(hdr.Width, hdr.Height, cw, ch)
 	}
 
 	// Start the cast at its recorded origin. Do not draw metadata or a status
 	// bar: both alter cells the recorded program may subsequently address.
-	fmt.Fprint(os.Stdout, "\033[2J\033[H")
+	p.clearScreen()
 	p.clk.seek(0)
 	p.clk.paused = false
 	p.clk.anchor = time.Now()
 
 	i := startIndex
 	if i > 0 {
-		fastForwardTo(events, 0, i)
+		fastForwardTo(p, events, 0, i)
 		p.clk.seek(events[i].sec)
 	}
 	for {

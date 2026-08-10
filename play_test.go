@@ -13,6 +13,15 @@ func TestVisibleOutputSizeIgnoresANSI(t *testing.T) {
 	}
 }
 
+func TestIsScreenRepaintDetectsEraseDisplay(t *testing.T) {
+	if !isScreenRepaint("\x1b[2J\x1b[Hhosts") {
+		t.Fatal("erase-display repaint was not detected")
+	}
+	if isScreenRepaint("\x1b[2Kline cleared") {
+		t.Fatal("line erase must not be treated as a full-screen repaint")
+	}
+}
+
 func TestSmartGapBalancesReadingAndIdleTime(t *testing.T) {
 	largeFrame := castEvent{typ: "o", data: strings.Repeat("x", 160)}
 	if got := smartGap(largeFrame, castEvent{typ: "i"}, 8); got != smartLongHold.Seconds() {
@@ -20,6 +29,9 @@ func TestSmartGapBalancesReadingAndIdleTime(t *testing.T) {
 	}
 	if got := smartGap(castEvent{typ: "i"}, castEvent{typ: "o"}, 8); got != smartShortHold.Seconds() {
 		t.Fatalf("non-visual hold = %v, want %v", got, smartShortHold.Seconds())
+	}
+	if got := smartGap(castEvent{typ: "o", data: "\x1b[2Jhosts"}, castEvent{typ: "i"}, 0.1); got != smartScreenMinHold.Seconds() {
+		t.Fatalf("screen repaint hold = %v, want %v", got, smartScreenMinHold.Seconds())
 	}
 }
 
@@ -116,6 +128,18 @@ func TestPlayCommandDefaultsTo500msScreenGap(t *testing.T) {
 	}
 	if flag.DefValue != "500" {
 		t.Fatalf("min-screen-gap-ms default = %q, want 500", flag.DefValue)
+	}
+}
+
+func TestPlayCommandHasResizeTerminalFlag(t *testing.T) {
+	if flag := newPlayCommand().Flags().Lookup("resize-terminal"); flag == nil {
+		t.Fatal("resize-terminal flag is missing")
+	}
+}
+
+func TestTerminalResizeSequence(t *testing.T) {
+	if got, want := terminalResizeSequence(220, 50), "\x1b[8;50;220t"; got != want {
+		t.Fatalf("terminalResizeSequence() = %q, want %q", got, want)
 	}
 }
 
