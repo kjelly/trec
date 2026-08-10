@@ -184,13 +184,14 @@ func findIncompleteANSIStart(s string) int {
 		case stateCSI:
 			if c >= 0x40 && c <= 0x7E {
 				state = stateNormal
-			} else if !((c >= 0x30 && c <= 0x3F) || (c >= 0x20 && c <= 0x2F)) {
+			} else if (c < 0x30 || c > 0x3F) && (c < 0x20 || c > 0x2F) {
 				state = stateNormal
 			}
 		case stateOSC:
-			if c == '\x07' {
+			switch c {
+			case '\x07':
 				state = stateNormal
-			} else if c == '\x1b' {
+			case '\x1b':
 				state = stateOSCST
 			}
 		case stateOSCST:
@@ -485,7 +486,7 @@ func validEnvName(name string) bool {
 		return false
 	}
 	for i, c := range name {
-		if !(c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || (i > 0 && c >= '0' && c <= '9')) {
+		if c != '_' && (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (i <= 0 || c < '0' || c > '9') {
 			return false
 		}
 	}

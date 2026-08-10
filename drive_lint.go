@@ -85,7 +85,7 @@ func lintDriveSteps(steps []*driveStep, strict bool) []driveLintFinding {
 			hasEndSession = true
 		}
 
-		if isUnsubmittedTextStep(step.kind) && !(step.kind == "text_env" && screenGuarded && strings.HasPrefix(step.text, "CONFIRM_")) {
+		if isUnsubmittedTextStep(step.kind) && (step.kind != "text_env" || !screenGuarded || !strings.HasPrefix(step.text, "CONFIRM_")) {
 			next := i + 1
 			for next < len(steps) && (steps[next].kind == "wait" || steps[next].kind == "snapshot" || steps[next].kind == "expect_quiet") {
 				next++
@@ -128,10 +128,6 @@ func addStaleScreenWarnings(steps []*driveStep, strict bool, add func(string, *d
 	// For each step, remember the WAITs that "reset" expectations and the
 	// expected texts seen so far. Then warn when an EXPECT inside the WAIT
 	// window repeats a text that was already in flight.
-	type expSeen struct {
-		text    string
-		stepIdx int
-	}
 	history := make(map[string]int) // text -> latest step index where it appeared
 	lastWaitIdx := -1               // step index of the most recent WAIT
 	lastWaitAt := -1
@@ -164,6 +160,7 @@ func addStaleScreenWarnings(steps []*driveStep, strict bool, add func(string, *d
 			}
 		case "expect_fresh", "expect_fresh_regex":
 			// EXPECT_FRESH is the right tool; encourage it instead of WAIT+EXPECT.
+			//nolint:staticcheck // SA9003: empty branch is intentional — silence is the desired behavior
 			if lastWaitIdx >= 0 && i-lastWaitIdx <= waitLookahead {
 				// good — author is doing WAIT then EXPECT_FRESH; we can stay silent
 				// (the WAIT is no longer load-bearing for the match, but it may

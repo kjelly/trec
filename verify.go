@@ -165,6 +165,7 @@ func verifyCast(path string) castVerification {
 						verification.Issues = append(verification.Issues, "SESSION_END is not the final cast event")
 					}
 					if observed.SessionEndStatus != result.Status &&
+						//nolint:staticcheck // QF1001: !(A && B) is clearer than !A || !B here
 						!(result.Status == "ended" && observed.SessionEndStatus == "ended") {
 						verification.Issues = append(verification.Issues, fmt.Sprintf("SESSION_END status %q does not match result status %q", observed.SessionEndStatus, result.Status))
 					}

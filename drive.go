@@ -983,11 +983,12 @@ func (ds *driveSession) applyStep(ctx context.Context, st *driveStep) error {
 		time.Sleep(ds.keyDelay)
 	case "down", "checklist_down", "up", "left", "right":
 		seq := "\x1b[B"
-		if st.kind == "up" {
+		switch st.kind {
+		case "up":
 			seq = "\x1b[A"
-		} else if st.kind == "left" {
+		case "left":
 			seq = "\x1b[D"
-		} else if st.kind == "right" {
+		case "right":
 			seq = "\x1b[C"
 		}
 		for range max1(st.n) {
@@ -1596,7 +1597,7 @@ interactiveDone:
 	failed := false
 	aborted := false
 	termination := &sessionTermination{Kind: "child_exit"}
-	exited, exitCode, processExitErr := ts.getExitState()
+	exited, _, _ := ts.getExitState()
 	disposition := ""
 	envTerminated := false
 	if scriptEndRequested || interactiveQuitRequested {
@@ -1664,7 +1665,7 @@ interactiveDone:
 		}
 	}
 
-	exited, _, processExitErr = ts.getExitState()
+	_, _, processExitErr := ts.getExitState()
 	processFailed := processExitErr != nil && !ds.exitAsserted
 	if processFailed && !aborted {
 		failed = true
@@ -1683,7 +1684,7 @@ interactiveDone:
 			finalizeErr = errClose
 		}
 	}
-	_, exitCode, processExitErr = ts.getExitState()
+	_, exitCode, processExitErr := ts.getExitState()
 	termination.Signal = processSignal(processExitErr)
 	if termination.Kind == "child_exit" && interactiveInputClosed {
 		termination.Reason = "interactive stdin closed before child exit"
@@ -1851,15 +1852,6 @@ func sha256File(path string) string {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
-}
-
-func firstMatch(s, pattern string) string {
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return ""
-	}
-	m := re.FindString(s)
-	return m
 }
 
 func reFindAll(s, pattern string) []string {
