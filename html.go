@@ -285,10 +285,6 @@ func htmlOutputPath(castPath string) string {
 	return castPath[:len(castPath)-len(ext)] + ".html"
 }
 
-func htmlPageDataFromCast(path, title string) (htmlPageData, error) {
-	return htmlPageDataFromCastWithOptions(path, title, true, 0, 0)
-}
-
 func htmlPageDataFromCastWithOptions(path, title string, keystrokeOverlay bool, idleLimit, minInputGap float64) (htmlPageData, error) {
 	hdr, events, err := loadCastFile(path)
 	if err != nil {

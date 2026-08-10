@@ -14,6 +14,17 @@ func TestNormalizeSecretFileValueTrimsOneFinalLineEnding(t *testing.T) {
 	}
 }
 
+func TestFindIncompleteANSIStartKeepsCSIParameters(t *testing.T) {
+	for input, want := range map[string]int{
+		"\x1b[31":  0,
+		"\x1b[31m": len("\x1b[31m"),
+	} {
+		if got := findIncompleteANSIStart(input); got != want {
+			t.Errorf("findIncompleteANSIStart(%q) = %d, want %d", input, got, want)
+		}
+	}
+}
+
 // TestRedactScreenCatchesInPlaceOverwriteFragment covers a diagnostic-dump
 // leak: a live terminal is fed raw bytes so it can render real screen state,
 // so a secret that gets partially overwritten in place (e.g. "\r" plus a

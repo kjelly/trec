@@ -144,10 +144,6 @@ func castPath(dir, escapedName string) (string, error) {
 	return filepath.Join(dir, name), nil
 }
 
-func overviewDataFromCasts(dir string) (castOverviewData, error) {
-	return overviewDataFromCastsWithOptions(dir, false, true, 0, 0)
-}
-
 func overviewDataFromCastsWithOptions(dir string, allowScanFindings, keystrokeOverlay bool, idleLimit, minInputGap float64) (castOverviewData, error) {
 	links, err := listCastFiles(dir)
 	if err != nil {
