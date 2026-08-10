@@ -1,0 +1,37 @@
+# golangci-lint configuration for trec
+# https://golangci-lint.run/docs/configuration/v2/syntax/
+
+version: "2"
+
+run:
+  go: "1.25.5"
+  timeout: 5m
+
+linters:
+  # Disable errcheck by default in v2 — this project accepts unchecked errors
+  # in low-value locations (defer Close, CLI Usage, recorder calls, test helpers).
+  # Real error handling is done at the top level; individual unchecked calls
+  # in terminating paths or internal helpers are intentional.
+  disable:
+    - errcheck
+
+  enable:
+    - ineffassign       # detect ineffectual assignments
+    - staticcheck       # swiss-army-knife for Go static analysis
+    - unused            # check for unused constants, variables, types
+    - govet             # report suspicious constructs
+
+  settings:
+    staticcheck:
+      checks: ["all", "-ST1000", "-ST1003", "-ST1016", "-ST1020", "-ST1021", "-ST1022"]
+
+formatters:
+  enable:
+    - gofmt             # check gofmt compliance
+
+  settings:
+    gofmt:
+      simplify: true
+
+issues:
+  max-same-issues: 10
