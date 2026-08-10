@@ -158,27 +158,27 @@ func runMCP() {
 	}
 }
 
-func runCommandWithGracefulTimeout(c *exec.Cmd, timeout time.Duration) (err error, timedOut bool, forcedKill bool) {
+func runCommandWithGracefulTimeout(c *exec.Cmd, timeout time.Duration) (timedOut bool, forcedKill bool, err error) {
 	if c.SysProcAttr == nil {
 		c.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	c.SysProcAttr.Setpgid = true
 	if err := c.Start(); err != nil {
-		return err, false, false
+		return false, false, err
 	}
 	done := make(chan error, 1)
 	go func() {
 		done <- c.Wait()
 	}()
 	if timeout <= 0 {
-		return <-done, false, false
+		return false, false, <-done
 	}
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case err := <-done:
-		return err, false, false
+		return false, false, err
 	case <-timer.C:
 		timedOut = true
 	}
@@ -190,11 +190,11 @@ func runCommandWithGracefulTimeout(c *exec.Cmd, timeout time.Duration) (err erro
 	defer grace.Stop()
 	select {
 	case err := <-done:
-		return err, true, false
+		return true, false, err
 	case <-grace.C:
 		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
 		_ = c.Process.Kill()
-		return <-done, true, true
+		return true, true, <-done
 	}
 }
 
@@ -291,7 +291,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 		var out, er bytes.Buffer
 		c.Stdout = &out
 		c.Stderr = &er
-		e, timedOut, forcedKill := runCommandWithGracefulTimeout(c, time.Duration(to)*time.Second)
+		timedOut, forcedKill, e := runCommandWithGracefulTimeout(c, time.Duration(to)*time.Second)
 		code := 0
 		if e != nil {
 			code = 1
@@ -652,11 +652,12 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 		defer cancel()
 
 		var written int
-		if name == "terminal_choose" {
+		switch name {
+		case "terminal_choose":
 			written, e = ss.chooseLabel(ctxSelect, a.Text, pointerRe, ss.keyDelay)
-		} else if name == "terminal_toggle" {
+		case "terminal_toggle":
 			written, e = ss.toggleLabel(ctxSelect, a.Text, pointerRe, ss.keyDelay)
-		} else if name == "terminal_activate" {
+		case "terminal_activate":
 			switch strings.ToUpper(a.Key) {
 			case "ENTER":
 				written, e = ss.chooseLabel(ctxSelect, a.Text, pointerRe, ss.keyDelay)
@@ -665,7 +666,7 @@ func (s *mcpServer) tool(ctx context.Context, name string, raw []byte) (any, err
 			default:
 				return nil, fmt.Errorf("key must be ENTER or SPACE")
 			}
-		} else {
+		default:
 			written, e = ss.selectLabel(ctxSelect, a.Text, pointerRe, 40*time.Millisecond)
 		}
 		if e != nil {

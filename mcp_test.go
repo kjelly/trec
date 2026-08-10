@@ -998,9 +998,10 @@ type mcpSelectWriteCloser struct {
 func (sw *mcpSelectWriteCloser) Write(p []byte) (int, error) {
 	sw.presses++
 	sw.ts.vtMu.Lock()
-	if sw.presses == 1 {
+	switch sw.presses {
+	case 1:
 		sw.ts.vt.Write([]byte("\x1b[H\x1b[2J  Option 1\r\n❯ Option 2\r\n  Option 3"))
-	} else if sw.presses == 2 {
+	case 2:
 		sw.ts.vt.Write([]byte("\x1b[H\x1b[2J  Option 1\r\n  Option 2\r\n❯ Option 3"))
 	}
 	sw.ts.vtMu.Unlock()
