@@ -29,30 +29,48 @@ var secretScanRules = []struct {
 func scanText(location string, at float64, text string) []scanFinding {
 	var findings []scanFinding
 	for _, rule := range secretScanRules {
-		if rule.re.MatchString(text) && !strings.Contains(text, "<redacted:") && !isTUIUnsetSecretStatus(rule, text) {
+		if ruleMatchesUnredactedSecret(rule, text) {
 			findings = append(findings, scanFinding{Location: location, Time: at, Rule: rule.name})
 		}
 	}
 	return findings
 }
 
-// isTUIUnsetSecretStatus excludes only pilot-style display annotations. It
-// deliberately does not suppress bracketed secret values in general.
-func isTUIUnsetSecretStatus(rule struct {
+func ruleMatchesUnredactedSecret(rule struct {
 	name string
 	re   *regexp.Regexp
 }, text string) bool {
+	if !rule.re.MatchString(text) {
+		return false
+	}
 	if rule.name != "inline-secret-assignment" {
+		return !strings.Contains(text, "<redacted:")
+	}
+	for _, match := range rule.re.FindAllStringSubmatch(text, -1) {
+		if len(match) >= 2 && !isKnownInlineSecretPlaceholder(match[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// isKnownInlineSecretPlaceholder excludes TUI status annotations and
+// redaction/placeholders, but only when they use a complete known token. This
+// keeps values such as "[已設定]actual-value" detectable as real assignments.
+func isKnownInlineSecretPlaceholder(value string) bool {
+	if strings.HasPrefix(value, "<redacted:") || strings.HasPrefix(strings.ToUpper(value), "CHANGE-ME") {
+		return true
+	}
+	return isWrappedTUISecretStatus(value, "[", "]") || isWrappedTUISecretStatus(value, "<", ">")
+}
+
+func isWrappedTUISecretStatus(value, open, close string) bool {
+	if !strings.HasPrefix(value, open) || !strings.HasSuffix(value, close) {
 		return false
 	}
-	match := rule.re.FindStringSubmatch(text)
-	if len(match) < 2 {
-		return false
-	}
-	value := match[1]
-	return strings.HasPrefix(value, "[未設定") ||
-		strings.HasPrefix(value, "[已設定") ||
-		strings.HasPrefix(strings.ToUpper(value), "CHANGE-ME")
+	status := strings.TrimSuffix(strings.TrimPrefix(value, open), close)
+	return status == "已設定" || status == "未設定" ||
+		strings.HasPrefix(status, "已設定，") || strings.HasPrefix(status, "未設定，")
 }
 
 func scanCast(path string) ([]scanFinding, error) {
