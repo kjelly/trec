@@ -41,6 +41,39 @@ func TestVerifyPathsAcceptsValidCastAndDirectory(t *testing.T) {
 	}
 }
 
+func TestVerifyCastTUISecretStatusesWithANSI(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		text string
+		safe bool
+	}{
+		{"angle set", "password = <已設定>\x1b[49G\r\n", true},
+		{"angle unset", "password = <未設定>\x1b[49G\r\n", true},
+		{"bracket set", "password = [已設定]\x1b[49G\r\n", true},
+		{"real value", "password = hunter2\x1b[49G\r\n", false},
+		{"real suffix", "password = <已設定>\x1b[0mactual-secret", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeVerifiableCast(t, t.TempDir(), "ansi.cast", tt.text)
+			data, err := os.ReadFile(resultPath(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var sidecar sessionResult
+			if err := json.Unmarshal(data, &sidecar); err != nil {
+				t.Fatal(err)
+			}
+			if !sidecar.Scan.Complete || sidecar.Scan.SafeToShare != tt.safe {
+				t.Fatalf("sidecar scan = %#v, want completed scan with safe_to_share=%t", sidecar.Scan, tt.safe)
+			}
+			result := verifyCast(path)
+			if result.Valid != tt.safe || !result.Scan.Complete || result.Scan.SafeToShare != tt.safe {
+				t.Fatalf("verification = %#v, want valid and safe_to_share=%t", result, tt.safe)
+			}
+		})
+	}
+}
+
 func TestVerifyCastRejectsMissingStaleAndUnsafeResults(t *testing.T) {
 	t.Run("missing result", func(t *testing.T) {
 		dir := t.TempDir()
