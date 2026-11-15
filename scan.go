@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/cobra"
 )
@@ -25,6 +26,8 @@ var secretScanRules = []struct {
 	// TUI's status suffix such as "secret = [未設定，使用內建預設]".
 	{"inline-secret-assignment", regexp.MustCompile(`(?i)(?:password|token|secret|api[_-]?key)\s*[=:]\s*([^\s"']+)`)},
 }
+
+var tuiSecretStatusCSIRe = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
 
 func scanText(location string, at float64, text string) []scanFinding {
 	var findings []scanFinding
@@ -60,6 +63,14 @@ func ruleMatchesUnredactedSecret(rule struct {
 func isKnownInlineSecretPlaceholder(value string) bool {
 	if strings.HasPrefix(value, "<redacted:") || strings.HasPrefix(strings.ToUpper(value), "CHANGE-ME") {
 		return true
+	}
+	// Cursor movement and styling can surround or follow a TUI status. Remove
+	// only complete CSI sequences, preserving appended text and OSC payloads
+	// that may contain secrets. Incomplete escapes must not become trusted
+	// placeholders, including inside a status's free-form detail suffix.
+	value = tuiSecretStatusCSIRe.ReplaceAllString(value, "")
+	if strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return false
 	}
 	return isWrappedTUISecretStatus(value, "[", "]") || isWrappedTUISecretStatus(value, "<", ">")
 }
