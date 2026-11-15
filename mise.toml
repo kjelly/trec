@@ -1,0 +1,22 @@
+[tools]
+go = "1.27.4"
+
+[tasks.build]
+description = "Build trec"
+run = "go build -o trec ."
+
+[tasks.test]
+description = "Run the test suite"
+run = "go test ./..."
+
+[tasks."test:race"]
+description = "Run the test suite with the race detector"
+run = "go test -race ./..."
+
+[tasks.vet]
+description = "Run Go static analysis"
+run = "go vet ./..."
+
+[tasks.check]
+description = "Test, vet, and build trec"
+run = ["go test ./...", "go vet ./...", "go build -o trec ."]

@@ -1,7 +1,12 @@
 # Agent Instructions
 
 ## Package Manager
-Use **Go modules** (`go 1.25.5`):
+Use **mise** to install and select **Go 1.27.4**, with dependencies managed by Go modules:
+- `mise install` — install the pinned Go toolchain from `mise.toml`
+- `mise run check` — run tests, static analysis, and build with that toolchain
+- `mise exec -- <command>` — run any command with the project toolchain without shell activation
+
+With mise activated in your shell, the underlying commands are:
 - `go build -o trec .` — build the binary
 - `go run .` — run from source
 - `go test ./...` — run the test suite
