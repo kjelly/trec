@@ -1,6 +1,6 @@
 module github.com/kjelly/trec
 
-go 1.25.5
+go 1.27.4
 
 require (
 	github.com/creack/pty v1.1.21
