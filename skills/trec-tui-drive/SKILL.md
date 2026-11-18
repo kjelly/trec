@@ -27,7 +27,7 @@ TOGGLE <label>      相容別名：ACTIVATE <label> WITH SPACE
 DOWN [n] / UP [n]    ⚠ 僅限無法以 label 辨識的非選單場景；n 必須為正整數
 CHECKLIST_DOWN [n]   已確認在可捲動多選清單內時使用的 DOWN；strict lint 接受，但仍須以畫面或程式碼確認順序
 BACKSPACE [n]        送 DEL，清除 prompt 預填值
-CLEAR_LINE           相容別名；新腳本用 CTRLU 清除游標前的整行，覆寫欄位優先用 REPLACE_TEXT 系列
+CTRLU                送 Ctrl-U，一次清除游標前的整行（CLEAR_LINE 為相容別名）；覆寫欄位優先用 REPLACE_TEXT 系列
 WAIT <ms>            ⚠ 最後手段；先考慮 EXPECT / EXPECT_QUIET
 EXPECT <text>        等到畫面出現文字（預設 timeout 10s）
 EXPECT@<ms> <text>   單步覆寫 timeout（慢步驟：建置、網路）
@@ -49,7 +49,7 @@ QUIT                 相容別名；新腳本用 END_SESSION
 
 ## 必守規則
 
-1. **選單一律優先用 `ACTIVATE <label> WITH ENTER|SPACE`；只移動指標時才用 `FOCUS <label>`。** `FOCUS` 不會送按鍵。單選/進入頁面寫 `WITH ENTER`；多選/checklist 寫 `WITH SPACE`。禁止用 `DOWN n` 猜格數。`SELECT`、`CHOOSE`、`TOGGLE` 僅為相容別名，新的 agent 腳本不得使用。label 選畫面上該行獨有的子字串。指標不是 `❯`/`>` 系列時用 `--pointer` 自訂 regexp。
+1. **選單一律優先用 `ACTIVATE <label> WITH ENTER|SPACE`；只移動指標時才用 `FOCUS <label>`。** `FOCUS` 不會送按鍵。單選/進入頁面寫 `WITH ENTER`；多選/checklist 寫 `WITH SPACE`。禁止用 `DOWN n` 猜格數。`SELECT`、`CHOOSE`、`TOGGLE` 僅為相容別名，新的 agent 腳本不得使用。label 選畫面上該行獨有的子字串。預設 `--pointer` 是 `^\s*(?:❯|▸|›|→|»|>)\s`；指標不是這些符號、或指標前還有框線（例如 Huh v2 的 `┃ > `，用 `--pointer '^\s*┃?\s*>\s'`）時，要自訂 regexp，否則會回報 `no pointer row found`。
 1a. **Checklist 在 `WITH SPACE` 後不可自動提交。** 以畫面上的勾選符號 `ASSERT` 驗證後，才用 `ENTER_IF <角色清單的唯一提示>` 提交。目標不在目前 viewport、必須按位置移動時，改用 `CHECKLIST_DOWN n` + `SPACE`，不要用一般 `DOWN`。`CHECKLIST_DOWN` 只向 strict lint 宣告這是 checklist；n 仍須從畫面或程式碼即時算出，不可憑記憶硬編。
 2. **文字欄位優先使用 `TEXT_AND_ENTER`／`REPLACE_TEXT_AND_ENTER` 原子提交。** 需要先驗證目前提示才提交時，使用一般 TEXT 後接 `ENTER_IF <目前提示的唯一文字>`；若 `y`／`n` 本身就會提交確認頁，使用 `TEXT_IF <提示> => y`，不要再補 Enter。提交/選單轉場後、下一個動作前用 `EXPECT_TRANSITION <新畫面唯一文字>`；它同時證明本次輸入已生效，避免舊畫面的文字使普通 `EXPECT` 立即通過。`EXPECT_QUIET` 只證明沒有輸出，不是畫面狀態證據。
 2a. **多輪 / 重複出現的等待必須用 `EXPECT_FRESH`。** 同一字串在腳本裡出現兩次且中間有 `WAIT` 或螢幕變動時，`EXPECT` 可能匹配到上輪留下的 scrollback。`EXPECT_FRESH` 從上一個 mutating step 算起，要求該字串**新出現**。apply 階段等第二個 `PLAY RECAP`、loop 裡等下一次 prompt 刷新、wizard 多次回到同一個畫面——都該用 `EXPECT_FRESH`。strict lint 會把 `WAIT <ms>; EXPECT <generic>` 標成 error。
@@ -133,10 +133,12 @@ SCREEN <rows> <cols>
 ```
 
 - 子程序 raw output 不會混進 stdout，回覆可直接程式化解析（SCREEN 行數固定）。
-- `ERR` 不會結束 session，由呼叫方決定補救；`END_SESSION`／`QUIT` 會立即終止子程序並把 result 標成 `aborted`。關閉 stdin 只表示不再送操作，trec 仍會等子程序自然結束，最長至 `--timeout`。
+- `ERR` 不會結束 session，由呼叫方決定補救；`END_SESSION`／`QUIT` 會立即終止子程序，result 標成 `ended`（`termination.disposition` 為 `script_ended`／`interactive_quit`）。關閉 stdin 只表示不再送操作，trec 仍會等子程序自然結束，最長至 `--timeout`。
 - 子程序自行結束時，trec 會立即收尾錄影，即使 stdin 仍開著。
 - 長跑工作可安全讓 stdin EOF。interactive 未指定 `--timeout` 時等待子程序自然結束；script-only 未指定時保留 120 秒安全期限。
 - `SNAPSHOT` 在互動模式和任何操作一樣，回傳一組當前 SCREEN；它不是 stdout flush 指令。
+
+對可正常結束的 wizard，最後一個互動步驟必須是產品自己的「離開／退出」選項，並持續讀取直到子程序自行結束且 exit code 為 0；不要在停在頂層選單時以 `END_SESSION`／`QUIT` 替代。前者才會產生 final `SESSION_END status=success`；後者是 `ended`，`verify` 雖然接受，卻只證明腳本主動停止，不能證明產品自己完成並結束，即使先前的 save 或 bootstrap 已成功，也不能當成「流程已完成」的證據。
 
 ## 參數調校
 

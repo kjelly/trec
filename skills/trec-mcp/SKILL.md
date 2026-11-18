@@ -13,13 +13,20 @@ description: 使用內建 `trec mcp` 操作 trec 的錄影、播放、轉錄、�
 - `cast_verify`：批次驗證 cast/result 完整性、exit status 與 secret scan；接受 cast 路徑或目錄。
 - `terminal_start`：啟動需要持續 stdin 的命令；回傳 `session_id`。
 - `terminal_write`：只寫入一般文字欄位，或一整行 `drive --interactive` DSL；它不是 raw TUI 的按鍵介面。
-- `terminal_key`：送出結構化按鍵（`ENTER`、方向鍵、`TAB`、`SPACE`、`ESCAPE`、`BACKSPACE`、`CTRLC`、`CTRLU`、`CTRLW`）。直接驅動 raw-mode TUI 時優先使用，避免 MCP/JSON 將 `\r` 當成文字或 LF。
+- `terminal_key`：送出結構化按鍵（`ENTER`、方向鍵、`TAB`、`SPACE`、`ESCAPE`、`BACKSPACE`、`CTRLC`、`CTRLU`、`CTRLW`）。直接驅動 raw-mode TUI 時優先使用，避免 MCP/JSON 將 `\r` 當成文字或 LF。只接受這些名稱：`y` 這類可列印的單鍵會回 `unsupported terminal key`，單鍵即提交的確認頁改用 `terminal_write` 送 `"y"`。它沒有按鍵間隔，連續呼叫而中間不讀畫面時，按鍵可能整批被 TUI 丟掉；一鍵一讀。
 - `terminal_focus`：只移動選單指標至唯一 label；不送按鍵。
 - `terminal_activate`：推薦介面。原子地選取唯一 label 後送明確的 `ENTER` 或 `SPACE`；前者確認選單、後者勾選 checklist 而不提交。
 - `terminal_select`：`terminal_focus` 的相容別名。
 - `terminal_choose`／`terminal_toggle`：相容別名，分別等同 `terminal_activate` 的 `ENTER`／`SPACE`。
+- 上述 label 工具的參數是 `text`；預設指標 regexp 為 `^\s*(?:❯|▸|›|→|»|>)\s`。指標行另有前綴時（例如 Huh v2 的 `┃ > `），每次呼叫都要帶 `pointer`（Huh：`^\s*┃?\s*>\s`），否則會逾時（`context deadline exceeded`）。回報 `not reached after sweeping both directions` 代表 label 只出現在殘留畫面或不可選的行，改用 `terminal_key` 逐鍵走並逐次讀畫面。
 - `terminal_read`：讀取累積的 stdout、stderr、是否仍在執行與 exit code。每次讀取會取走目前累積輸出。
-- `terminal_close`：明確結束 session；工作完成後必須呼叫，避免遺留子程序。
+- `terminal_read_screen`：讀取模擬終端目前的畫面；可能落後於原始輸出，先以 `terminal_expect` 或 `terminal_wait_quiet` 等待。
+- `terminal_expect`：等到指定文字出現在畫面上。
+- `terminal_wait_quiet`：等到輸出靜止；`quiet_duration_seconds` 與 `timeout_seconds` 兩者都必填。
+- `terminal_resize`：調整終端的欄數與列數。
+- `terminal_close`：釋放已完成的 session；工作完成後必須呼叫，避免遺留子程序。若 child
+  還在執行，它是**中止**而非成功收尾：先讓 child 自行 exit、以 `terminal_read`
+  確認 `running=false` 與預期 exit code，才可關閉。
 - `session_list`：盤點尚未關閉的 session。
 
 兩個啟動工具都接受 `working_directory`。`terminal_start` 另接受 `cols`、`rows`，預設
@@ -43,6 +50,22 @@ trec 命令的 `-o <path>` 指定；相對路徑以 `working_directory` 為準�
 若 `terminal_start` 直接啟動的是 wizard/raw-mode TUI（而不是 `trec drive --interactive`），這本身就是合法、可錄影的 trec 驅動路徑，不要因為它不是 `.drive` 腳本而切換模式：啟動時給 `record_file`，重用同一個 `session_id`，最後以 `cast_verify` 驗證即可。文字欄位才用 `terminal_write`；選單使用 `terminal_activate`，只需移動焦點用 `terminal_focus`，Enter/方向/Space 一律用 `terminal_key`。每個提交動作後用 `terminal_read_screen` 或 `terminal_expect` 證實新畫面，不能只依寫入成功判定，更不可用 `\\n` 或連續換行模擬 Enter。
 
 **選擇模式，不要在同一流程中任意切換：** 畫面已知、可重跑的固定流程適合先 lint 再跑 `.drive` 腳本；分支多、首次探勘或必須看每一頁再決定時，直接使用帶 `record_file` 的 raw MCP session。兩者都符合「用 trec 驅動並錄影」；raw session 已有原子 `terminal_activate`/`terminal_key`，不需要為了原子性另開 `trec drive --interactive`。只有要使用 DSL 的 `EXPECT_TRANSITION`、`SNAPSHOT` 等 script opcode 時，才啟動 `trec drive --interactive`。
+
+### 錄影 wizard 的正常收尾
+
+「已存檔」或「bootstrap 成功」不代表 wizard process 已結束；例如 `pilot edit`
+會回到頂層選單繼續等待下一個操作。要產出可交付的錄影，依序：
+
+1. 用 wizard 自己的離開選項正常結束（`pilot edit`：回到頂層後選 `離開`），不要用
+   `CTRLC`、`END_SESSION` 或 `terminal_close` 代替。
+2. 持續呼叫 `terminal_read`，直到它回報 `running=false` 且 `exit_code=0`。
+3. 呼叫 `terminal_close` 釋放 MCP session。
+4. 對 cast 執行 `cast_verify`；只有 `status=success`、final `SESSION_END`、digest 與
+   secret scan 都通過才算完成。
+
+若第 1 步已完成卻遺漏第 2–4 步，sidecar 會停在 `in_progress`，不是可用 evidence；若在
+child 還活著時先 `terminal_close` 或 MCP transport 結束，結果會是 `aborted`。這兩種狀態
+都不能由已有的成功畫面補救，必須重新錄製。
 
 長跑工作不以 `EXPECT_QUIET` 判定完成。腳本模式先執行 `trec drive lint --strict`，用 `ENTER_IF`／`CHOOSE` 綁定畫面條件，再以明確上限的 `WAIT_CHILD_EXIT@<ms>`、`ASSERT_EXIT 0` 收尾。`run.timeout_seconds` 必須大於 drive 內層最長 timeout 加 2 秒；互動模式持續以 `terminal_read` 檢查 session 的 `running` 與 `exit_code`。
 

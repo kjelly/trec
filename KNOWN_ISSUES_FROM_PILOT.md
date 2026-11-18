@@ -91,12 +91,16 @@ found in the same sessions are tracked in the pilot repo instead.
 12. **The result's `build` block is trec's own version**, and has been mistaken
     for the driven binary's. Verify the driven binary with
     `go version -m <binary>`; a label such as `recorder_build` would help.
-13. **`skills/` and the installed copies in `~/.agents/skills/` have diverged.**
-    The repo's `trec-tui-drive`/`trec-mcp` (2026-07-22) document
-    `ACTIVATE`/`FOCUS`/`EXPECT_TRANSITION`/`EXPECT_FRESH`; the installed copies
-    (2026-08-03) lack those but add the wizard-exit lifecycle section
-    (leave via the wizard, poll `running=false`, then `terminal_close` and
-    `cast_verify`). Neither is a superset.
+13. **Fixed 2026-11-18: `skills/` and the installed copies in
+    `~/.agents/skills/` had diverged.** The repo's `trec-tui-drive`/`trec-mcp`
+    (2026-07-22) documented `ACTIVATE`/`FOCUS`/`EXPECT_TRANSITION`/`EXPECT_FRESH`;
+    the installed copies (2026-08-03) lacked those but added the wizard-exit
+    lifecycle (leave via the wizard, poll `running=false`, then `terminal_close`
+    and `cast_verify`). The repo now holds the merge, plus the MCP notes from
+    items 7–9 and a correction both copies shared (`END_SESSION`/`QUIT` ends as
+    `ended`, not `aborted`), and `~/.agents/skills/trec-mcp` and
+    `~/.agents/skills/trec-tui-drive` are symlinks to `skills/`, so there is one
+    copy to edit.
 
 ## Not filed — not `trec`'s own bug, but worth knowing if you hit the symptom
 

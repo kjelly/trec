@@ -96,6 +96,11 @@ has closed, perform one explicitly reported, read-only verification outside that
    the observed size to match `cast.byte_size`.
 3. Run `trec scan <cast>`. A finding blocks sharing, HTML export, and HTTP serving;
    re-record with declared exact-value redaction rather than editing the cast by hand.
+   Check `trec version` first: builds before `63c8866` also flag text that holds no
+   secret (a TUI status marker such as `<已設定>` followed by a cursor escape, a
+   `{{ variable }}` template reference, a `token==…` comparison in printed source).
+   On such a build, update trec and scan again before re-recording; on a current
+   build, read the flagged event before calling it a false positive.
 
 This final read-only verification cannot itself be contained in the cast being
 verified. State that distinction in the final audit report; do not claim that the cast
