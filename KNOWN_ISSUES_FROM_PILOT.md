@@ -53,7 +53,11 @@ found in the same sessions are tracked in the pilot repo instead.
    `7eb2c1a`: comparison/match operators, a string-literal prefix followed by its
    quote, and a call chain with only empty argument lists are not values.
    `token = os.environ.get("X")` (a call with a quoted argument) is still
-   reported; widen only from a real recording.
+   reported; widen only from a real recording. The same class showed up in
+   pilot's group_vars editor, which lists commented-out examples as
+   `node_exporter_basic_auth_password = {{ vault_node_exporter_basic_auth_password }}`;
+   `63c8866` exempts a Jinja reference to a single variable (reproduced by
+   recording `pilot edit` on host-monitoring's example group_vars).
 
 ## Open — not filed yet
 
