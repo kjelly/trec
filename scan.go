@@ -65,6 +65,9 @@ var (
 	// A call chain whose every call has an empty argument list, such as
 	// "line.split()[0]" or "getpass.getpass()".
 	emptyCallChain = regexp.MustCompile(`^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\(\)|\[\d+\]|\.[A-Za-z_]\w*)*$`)
+	// A Jinja reference to one variable, "{{ vault_x }}" or "{{- a.b[0] -}}",
+	// ending the token: followed by whitespace, a quote, an escape or the end.
+	templateVariableReference = regexp.MustCompile(`^\{\{-?\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*|\[\d+\])*\s*-?\}\}(?:[\s"'\x1b]|$)`)
 )
 
 // isInlineSecretNonAssignment recognises text that names a secret-like variable
@@ -79,13 +82,20 @@ var (
 //     its prefix must not be taken for one;
 //   - a call chain whose calls all have empty argument lists and that contains
 //     at least one call, as in "token = line.split()[0]": it reads a value. A
-//     bare name, a dotted name or a call with arguments is still a value.
+//     bare name, a dotted name or a call with arguments is still a value;
+//   - a template reference to a single variable, as in
+//     "password = {{ vault_password }}", which pilot's group_vars editor shows
+//     for commented-out examples. A literal, a filter or any other expression
+//     inside the braces, or text glued to the closing braces, is still a value.
 func isInlineSecretNonAssignment(operator, value, rest string) bool {
 	switch operator {
 	case "==", "===", "=~":
 		return true
 	}
 	if stringLiteralPrefix.MatchString(value) && (strings.HasPrefix(rest, "'") || strings.HasPrefix(rest, `"`)) {
+		return true
+	}
+	if strings.HasPrefix(value, "{{") && templateVariableReference.MatchString(value+rest) {
 		return true
 	}
 	return strings.Contains(value, "()") && emptyCallChain.MatchString(value)

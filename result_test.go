@@ -405,6 +405,41 @@ func TestScanCastFindsSecretAfterTUIStatusAndStatusLikeValue(t *testing.T) {
 	}
 }
 
+// A template reference names the variable that will hold the secret; it does
+// not hold one. pilot's group_vars editor lists the commented-out examples
+// this way; the first line is the exact output event recorded from it.
+func TestScanTextIgnoresTemplateVariableReferences(t *testing.T) {
+	for _, text := range []string{
+		"\x1b[K┃ > node_exporter_basic_auth_password = {{ vault_node_exporter_basic_auth_password }}  [未設定，使用內建預設]\x1b[110G\r",
+		`grafana_admin_password: "{{ vault_grafana_admin_password }}"`,
+		"restic_password={{vault_restic_password}}\r\n",
+		"keycloak_client_secret = {{- vault.keycloak.client_secret -}}\r\n",
+		"token = {{ tokens[0] }}\r\n",
+	} {
+		if findings := scanText("event.o", 1, text); len(findings) != 0 {
+			t.Errorf("scanText(%q) = %#v, want no findings", text, findings)
+		}
+	}
+}
+
+// Only a reference to a variable is exempt: a literal or an expression inside
+// the braces, or text glued to the closing braces, is still reported.
+func TestScanTextStillFindsSecretsInTemplates(t *testing.T) {
+	for _, text := range []string{
+		"password = {{ 'hunter2' }}\r\n",
+		`password = {{ "hunter2" }}` + "\r\n",
+		"password = {{ vault_x | default('hunter2') }}\r\n",
+		"password = {{ vault_x }}hunter2\r\n",
+		"password = {{ vault_x\r\n",
+		"password = {{\r\n",
+	} {
+		findings := scanText("event.o", 1, text)
+		if len(findings) != 1 || findings[0].Rule != "inline-secret-assignment" {
+			t.Errorf("scanText(%q) = %#v, want one inline-secret-assignment finding", text, findings)
+		}
+	}
+}
+
 func TestScanCastIgnoresTUISecretPlaceholder(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scan-tui-placeholder.cast")
 	if err := writeCastFile(path, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{
