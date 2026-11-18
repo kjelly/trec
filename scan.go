@@ -21,9 +21,11 @@ var secretScanRules = []struct {
 }{
 	{"sshpass-password", regexp.MustCompile(`(?i)sshpass\s+-p\s+\S+`)},
 	{"private-key", regexp.MustCompile(`-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----`)},
-	// Capturing the value lets scanText distinguish a real assignment from a
-	// TUI's status suffix such as "secret = [未設定，使用內建預設]".
-	{"inline-secret-assignment", regexp.MustCompile(`(?i)(?:password|token|secret|api[_-]?key)\s*[=:]\s*([^\s"']+)`)},
+	// Capturing the operator and the value lets the scan distinguish a real
+	// assignment from a TUI's status suffix such as
+	// "secret = [未設定，使用內建預設]" and from source code that merely names a
+	// variable (see isInlineSecretNonAssignment).
+	{"inline-secret-assignment", regexp.MustCompile(`(?i)(?:password|token|secret|api[_-]?key)\s*(===|==|=~|:=|=|:)\s*([^\s"']+)`)},
 }
 
 func scanText(location string, at float64, text string) []scanFinding {
@@ -46,12 +48,47 @@ func ruleMatchesUnredactedSecret(rule struct {
 	if rule.name != "inline-secret-assignment" {
 		return !strings.Contains(text, "<redacted:")
 	}
-	for _, match := range rule.re.FindAllStringSubmatch(text, -1) {
-		if len(match) >= 2 && !isKnownInlineSecretPlaceholder(match[1]) {
-			return true
+	for _, m := range rule.re.FindAllStringSubmatchIndex(text, -1) {
+		// m holds the whole match, the operator (group 1) and the value (group 2).
+		operator, value, rest := text[m[2]:m[3]], text[m[4]:m[5]], text[m[1]:]
+		if isInlineSecretNonAssignment(operator, value, rest) || isKnownInlineSecretPlaceholder(value) {
+			continue
 		}
+		return true
 	}
 	return false
+}
+
+var (
+	// A Python string-literal prefix (r, u, b, f, br, rb, fr, rf).
+	stringLiteralPrefix = regexp.MustCompile(`^(?i:[rubf]|br|rb|fr|rf)$`)
+	// A call chain whose every call has an empty argument list, such as
+	// "line.split()[0]" or "getpass.getpass()".
+	emptyCallChain = regexp.MustCompile(`^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\(\)|\[\d+\]|\.[A-Za-z_]\w*)*$`)
+)
+
+// isInlineSecretNonAssignment recognises text that names a secret-like variable
+// but cannot hold its value, which is what appears when a recording renders
+// repository source (a diff, a file listing). It is deliberately narrow, and
+// anything else after a "=" or ":" is still treated as a value:
+//
+//   - a comparison or match operator ("==", "===", "=~"), as in
+//     "token==str(path).encode()", is not an assignment (":=" still is);
+//   - a string-literal prefix directly followed by the opening quote, as in
+//     `token = b""`: the quoted value is not matched as a bare value either, so
+//     its prefix must not be taken for one;
+//   - a call chain whose calls all have empty argument lists and that contains
+//     at least one call, as in "token = line.split()[0]": it reads a value. A
+//     bare name, a dotted name or a call with arguments is still a value.
+func isInlineSecretNonAssignment(operator, value, rest string) bool {
+	switch operator {
+	case "==", "===", "=~":
+		return true
+	}
+	if stringLiteralPrefix.MatchString(value) && (strings.HasPrefix(rest, "'") || strings.HasPrefix(rest, `"`)) {
+		return true
+	}
+	return strings.Contains(value, "()") && emptyCallChain.MatchString(value)
 }
 
 // isKnownInlineSecretPlaceholder excludes TUI status annotations and

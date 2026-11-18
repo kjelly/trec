@@ -399,3 +399,56 @@ func TestScanCastIgnoresDriveMarkerWithoutSecretValue(t *testing.T) {
 		t.Fatalf("findings = %#v, want no drive-marker findings", findings)
 	}
 }
+
+// Source code and comparisons that name a secret-like variable but carry no
+// secret value. They appear in recordings whenever a diff or a file listing
+// renders repository source, and must not block sharing.
+func TestScanTextIgnoresSourceCodeThatIsNotASecretAssignment(t *testing.T) {
+	for _, text := range []string{
+		// Comparison and match operators are not assignments.
+		"if any(token==str(path).encode() or token.startswith(b'/') for token in argv):",
+		"if password == expected:",
+		"if (secret === other) {",
+		"[[ $token =~ ^[a-z]+$ ]]",
+		// A string-prefixed literal: the quoted value is not scanned for bare
+		// assignments either, so its prefix must not be taken for the value.
+		"    token = b''",
+		`secret = f""`,
+		// A call chain with empty argument lists reads a value; it does not hold one.
+		"    token = line.split()[0]",
+		"password = getpass.getpass()",
+	} {
+		if findings := scanText("event.o", 1, text); len(findings) != 0 {
+			t.Errorf("scanText(%q) = %#v, want no findings", text, findings)
+		}
+	}
+}
+
+// The exemptions above are narrow. Each of these still has to be reported, so
+// that they cannot grow into a way to hide a real value.
+func TestScanTextStillFindsSecretsNearTheSourceCodeExemptions(t *testing.T) {
+	for _, text := range []string{
+		"password=hunter2",
+		"token: abc123",
+		// A Makefile simple assignment: ":=" is an assignment, "==" is not.
+		"PASSWORD := hunter2",
+		"PASSWORD:=hunter2",
+		// Base64 padding after a real value is part of the value.
+		"token=abc==",
+		// A comparison does not hide an assignment elsewhere in the same text.
+		"if token==x or password=hunter2:",
+		"token = b''; password=hunter2",
+		// Not a call chain with empty argument lists.
+		"secret=Winter(2024)",
+		"secret=ab()cd",
+		"token = self.token",
+		// A one-letter value that is not followed by a quote is a value.
+		"password=b hunter2",
+		"password=b",
+	} {
+		findings := scanText("event.o", 1, text)
+		if len(findings) != 1 || findings[0].Rule != "inline-secret-assignment" {
+			t.Errorf("scanText(%q) = %#v, want one inline-secret-assignment finding", text, findings)
+		}
+	}
+}
