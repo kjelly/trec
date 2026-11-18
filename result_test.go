@@ -351,6 +351,43 @@ func TestScanCastIgnoresKnownTUISecretStatuses(t *testing.T) {
 	}
 }
 
+// A TUI writes cursor and style escapes right after a status marker, with no
+// space in between. These are the endings seen in real pilot vault-editor
+// recordings (trec issue #3), plus styling around the marker.
+func TestScanTextIgnoresTUISecretStatusesNextToEscapes(t *testing.T) {
+	for _, text := range []string{
+		"┃ > node_exporter_basic_auth_password = <已設定>\x1b[K\r\n",
+		"┃ > node_exporter_basic_auth_password = <已設定>\x1b[49G\r\n",
+		"┃ > node_exporter_basic_auth_password = <已設定>\x1b[K\x1b[49G\r\n",
+		"┃ > node_exporter_basic_auth_password = [已設定]\x1b[49G\r\n",
+		"ipa_admin_password = \x1b[2m<已設定>\x1b[0m\r\n",
+		"api_key: \x1b[1m<未設定>\x1b[0m\x1b[K\r\n",
+	} {
+		if findings := scanText("event.o", 1, text); len(findings) != 0 {
+			t.Errorf("scanText(%q) = %#v, want no findings", text, findings)
+		}
+	}
+}
+
+// Escapes are ignored only to recognise a status marker. A value hidden behind
+// or between escapes, or text after the marker's escape, is still reported.
+func TestScanTextStillFindsSecretsNextToEscapes(t *testing.T) {
+	for _, text := range []string{
+		"password=hunter2\x1b[K\r\n",
+		"password=\x1b[1mhunter2\x1b[0m\r\n",
+		"password=hun\x1b[0mter2\r\n",
+		"password = <已設定>\x1b[49Gactual-secret\r\n",
+		"password = [已設定]\x1b[0mactual-secret\r\n",
+		// Only escapes after the operator: the value may follow, so stay strict.
+		"password: \x1b[0m\r\n",
+	} {
+		findings := scanText("event.o", 1, text)
+		if len(findings) != 1 || findings[0].Rule != "inline-secret-assignment" {
+			t.Errorf("scanText(%q) = %#v, want one inline-secret-assignment finding", text, findings)
+		}
+	}
+}
+
 func TestScanCastFindsSecretAfterTUIStatusAndStatusLikeValue(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scan-tui-status-and-secret.cast")
 	if err := writeCastFile(path, castHeader{Version: 2, Width: 80, Height: 24}, []castEvent{

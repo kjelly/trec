@@ -51,7 +51,7 @@ func ruleMatchesUnredactedSecret(rule struct {
 	for _, m := range rule.re.FindAllStringSubmatchIndex(text, -1) {
 		// m holds the whole match, the operator (group 1) and the value (group 2).
 		operator, value, rest := text[m[2]:m[3]], text[m[4]:m[5]], text[m[1]:]
-		if isInlineSecretNonAssignment(operator, value, rest) || isKnownInlineSecretPlaceholder(value) {
+		if isInlineSecretNonAssignment(operator, value, rest) || isKnownInlineSecretPlaceholder(visibleValue(value)) {
 			continue
 		}
 		return true
@@ -89,6 +89,18 @@ func isInlineSecretNonAssignment(operator, value, rest string) bool {
 		return true
 	}
 	return strings.Contains(value, "()") && emptyCallChain.MatchString(value)
+}
+
+// visibleValue removes complete terminal escape sequences from a captured
+// value. A TUI writes cursor and style escapes directly after a status marker,
+// as in "= <已設定>\x1b[K" or "= <已設定>\x1b[49G", and the value pattern stops
+// only at whitespace or a quote, so the escape becomes part of the value and
+// the marker is no longer recognised (trec issue #3). It is used only to
+// recognise a placeholder: the value itself is still the raw text, so a secret
+// written behind or between escapes stays reported, and a value that is
+// nothing but escapes is not a placeholder.
+func visibleValue(value string) string {
+	return ansiRe.ReplaceAllString(value, "")
 }
 
 // isKnownInlineSecretPlaceholder excludes TUI status annotations and
